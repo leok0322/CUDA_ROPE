@@ -42,3 +42,5 @@ __global__ void ROPE_kernel_base(index_t totalRow, index_t totalCol,index_t coup
   out[row * totalCol + colGroup * 2] =   newElement1;
   out[row * totalCol + colGroup * 2 + 1] = newElement2;
 }
+
+
