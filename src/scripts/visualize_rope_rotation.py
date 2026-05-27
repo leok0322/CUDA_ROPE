@@ -11,8 +11,8 @@ from matplotlib.patches import FancyArrowPatch
 import matplotlib.gridspec as gridspec
 
 # ── Output directory ─────────────────────────────────────────────────────────
-# 路径层级：src/script/ -> src/ -> CUDA_ROPE/（项目根目录）
-_script_dir   = os.path.dirname(os.path.abspath(__file__))   # 当前脚本所在目录: src/script/
+# 路径层级：src/scripts/ -> src/ -> CUDA_ROPE/（项目根目录）
+_script_dir   = os.path.dirname(os.path.abspath(__file__))   # 当前脚本所在目录: src/scripts/
 _project_root = os.path.dirname(os.path.dirname(_script_dir))  # 上两级到项目根目录: CUDA_ROPE/
 OUTPUT_DIR    = os.path.join(_project_root, 'plot_output')   # 图片输出目录: CUDA_ROPE/plot_output/
 os.makedirs(OUTPUT_DIR, exist_ok=True)                        # 目录不存在时自动创建
