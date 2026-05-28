@@ -14,6 +14,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
+import os
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -157,9 +158,11 @@ def main() -> None:
     ax.set_ylim(bottom=0)
 
     plt.tight_layout()
-    out = ROOT / "performance_plot.png"
-    plt.savefig(out, dpi=150)
-    print(f"已保存：{out}")
+    OUTPUT_DIR   = os.path.join(ROOT, "plot_output")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)  
+    path = os.path.join(OUTPUT_DIR, "performance_plot.png")
+    plt.savefig(path, dpi=150)
+    print(f"已保存：{path}")
     plt.show()
 
 
