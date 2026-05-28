@@ -75,6 +75,7 @@ void run_kernel(const int kernel_num, const uint totalRow, const uint totalCol, 
     switch (kernel_num) {
         case 0:  run_ROPE_kernel_base(totalRow, totalCol, A, out);  break;
         case 1:  run_ROPE_kernel_naive(totalRow, totalCol, A, out); break;
+        case 2:  run_ROPE_kernel_vectorize(totalRow, totalCol, A, out); break;
         default:
             // throw：抛出异常，沿调用栈向上传播直到被 catch 捕获
             // std::invalid_argument：标准异常类，表示传入参数不合法
@@ -210,16 +211,13 @@ int main(int argc, char **argv) {
 
             // ── 性能测试（repeat_times 次取平均）────────────────────────────────
             cudaEventRecord(beg);
-            bool is_skip = false;
             for (int j = 0; j < repeat_times; j++) {
                 try {
                     run_kernel(kernel_num, m, n, dA, dout);
                 } catch (const std::exception &e) {
                     fprintf(stderr, "%s\n", e.what());
-                    is_skip = true;
                 }
             }
-            if (is_skip) {continue;}
             cudaEventRecord(end);
             cudaCheck(cudaEventSynchronize(end)); // 等待 end 事件完成，确保计时准确
             cudaEventElapsedTime(&elapsed_time, beg, end);

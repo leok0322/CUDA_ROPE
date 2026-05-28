@@ -1,18 +1,23 @@
-#include <assert.h>
-#include <stdexcept>
+#include <assert.h>        // assert()
+#include <stdexcept>       // std::invalid_argument
+#include <cstdlib>         // EXIT_FAILURE
 
-#include "error_check.cuh"
-#include "kernels.cuh"
-#include <cuda_runtime.h>
-#include <cuda/cmath>
-
+#include "error_check.cuh" // cudaCheck()
+#include "kernels.cuh"     // ROPE_kernel_base, ROPE_kernel_naive, ROPE_kernel_vectorize, BLOCK_SIZE
+#include <cuda_runtime.h>  // dim3, cudaGetLastError
+#include <cuda/cmath>      // cuda::ceil_div
 
 
 void run_ROPE_kernel_base(uint totalRow, uint totalCol, float* A, float* out) {
-    // 每一个block只处理一个维度对，进行ROPE旋转
+    // 每一个block只处理BLOCK_SIZE个维度对，进行ROPE旋转
     dim3 block(BLOCK_SIZE, 1,1);
     // 列可以完整覆盖维度对
-    assert(totalCol % 2 == 0 && "列需要完整覆盖维度对");
+    // assert在release模式下不可用
+    // assert(totalCol % 2 == 0 && "列需要完整覆盖维度对");
+    if (totalCol % 2 != 0) {
+        fprintf(stderr, "run_ROPE_kernel_vectorize: totalCol=%u, otalCol need to be the cover all the element couple.\n",totalCol);
+        exit(EXIT_FAILURE);
+    }
     uint coupleNum {totalCol / 2};
     uint gridSizeX {cuda::ceil_div(totalRow *  coupleNum,BLOCK_SIZE)};
     dim3 grid(gridSizeX, 1, 1);
@@ -22,7 +27,13 @@ void run_ROPE_kernel_base(uint totalRow, uint totalCol, float* A, float* out) {
 
 void run_ROPE_kernel_naive(uint totalRow, uint totalCol, float* A, float* out) {
     // 列可以完整覆盖维度对
-    assert(totalCol % 2 == 0 && "列需要完整覆盖维度对");
+    // assert在release模式下不可用
+    // assert(totalCol % 2 == 0 && "列需要完整覆盖维度对");
+    if (totalCol % 2 != 0) {
+        fprintf(stderr, "run_ROPE_kernel_vectorize: totalCol=%u, otalCol need to be the cover all the element couple.\n",totalCol);
+        exit(EXIT_FAILURE);
+    }
+
     uint coupleNum {totalCol / 2};
     // ── 曾遇报错：invalid configuration argument ────────────────────────────
     // 报错位置：cudaCheck(cudaGetLastError()) 处
@@ -54,5 +65,23 @@ void run_ROPE_kernel_naive(uint totalRow, uint totalCol, float* A, float* out) {
     dim3 block(coupleNum, 1,1);
     dim3 grid(totalRow, 1, 1);
     ROPE_kernel_naive<float, uint><<<grid,block>>>(totalRow,totalCol,A,out);
+    cudaCheck(cudaGetLastError());
+}
+
+void run_ROPE_kernel_vectorize(uint totalRow, uint totalCol, float* A, float* out) {
+    // 每一个block只处理BLOCK_SIZE* 2个维度对，进行ROPE旋转
+    dim3 block(BLOCK_SIZE, 1,1);
+    // 列可以完整覆盖维度对
+    // assert在release模式下不可用
+    // assert(totalCol % 2 == 0 && "列需要完整覆盖维度对");
+    if (totalCol % 4 != 0) {
+        fprintf(stderr, "run_ROPE_kernel_vectorize: totalCol=%u, otalCol need to be the cover all the double element couple.\n",totalCol);
+        exit(EXIT_FAILURE);
+    }
+    // 一个线程负责两个维度对
+    uint coupleNum {totalCol / 4};
+    uint gridSizeX { cuda::ceil_div(totalRow *  coupleNum,BLOCK_SIZE) };
+    dim3 grid(gridSizeX, 1, 1);
+    ROPE_kernel_vectorize<float, float4, uint><<<grid,block>>>(totalRow,totalCol,coupleNum,A,out);
     cudaCheck(cudaGetLastError());
 }
