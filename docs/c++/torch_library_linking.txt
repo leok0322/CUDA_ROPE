@@ -1,0 +1,182 @@
+================================================================================
+链接 PyTorch stable ABI 符号：为什么只链 torch 就够，不需要 ${TORCH_LIBRARIES}
+================================================================================
+
+背景
+--------------------------------------------------------------------------------
+validation 目标加入 src/inference/fused_qknorm_rope_kernel.cu 后，需要链接到
+torch_utils.h 用到的 stable ABI 符号 aoti_torch_get_current_cuda_stream。
+
+问题：是必须链 ${TORCH_LIBRARIES}（一长串库），还是只链 torch 一个 target 就行？
+结论：只链 torch 即可。下面给出验证依据与依赖传递关系。
+
+
+================================================================================
+一、先确认符号定义在哪个 .so
+================================================================================
+
+    用 nm -D 在 PyTorch 各 .so 中查找该符号（D = 动态符号表）：
+
+        nm -D libtorch.so      | grep aoti_torch_get_current_cuda_stream  → 0（没有）
+        nm -D libtorch_cpu.so  | grep ...                                 → 0（没有）
+        nm -D libtorch_cuda.so | grep ...                                 → 1（有！）
+        nm -D libc10.so        | grep ...                                 → 0（没有）
+        nm -D libc10_cuda.so   | grep ...                                 → 0（没有）
+
+    结论：符号只在 libtorch_cuda.so 里。
+    只要链接最终能把 libtorch_cuda.so 拉进来，就能解析这个符号。
+
+
+================================================================================
+二、torch imported target 的依赖传递
+================================================================================
+
+    Caffe2Targets.cmake 中：
+
+        add_library(torch SHARED IMPORTED)
+        set_target_properties(torch PROPERTIES
+          INTERFACE_LINK_LIBRARIES "torch_cpu_library;torch_cuda_library")
+
+    其中 torch_cuda_library 的接口链接选项（同文件）：
+
+        torch_cuda_library:
+          INTERFACE_LINK_LIBRARIES
+            "-Wl,--no-as-needed,\"$<TARGET_FILE:torch_cuda>\" -Wl,--as-needed; ..."
+
+    关键：torch_cuda（即 libtorch_cuda.so）被 -Wl,--no-as-needed 包裹，
+    表示"即使当前没有直接引用其中符号，也强制把这个 .so 链进来，不要丢弃"。
+
+    传递关系图：
+
+        target_link_libraries(validation PRIVATE torch)
+                │
+                ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │ torch (IMPORTED)                                           │
+        │ INTERFACE_LINK_LIBRARIES = torch_cpu_library;torch_cuda_library
+        └──────────┬──────────────────────────┬────────────────────┘
+                   │                           │
+                   ▼                           ▼
+        ┌────────────────────┐   ┌──────────────────────────────────┐
+        │ torch_cpu_library  │   │ torch_cuda_library               │
+        │ --no-as-needed     │   │ --no-as-needed                   │
+        │   libtorch_cpu.so  │   │   libtorch_cuda.so   ◄── 强制链入 │
+        │ --as-needed        │   │ --as-needed                      │
+        └────────────────────┘   └───────────────┬──────────────────┘
+                                                  │
+              aoti_torch_get_current_cuda_stream ─┘  符号就在这个 .so 里
+                                                  │
+                          运行时 DT_NEEDED 自动带出↓
+                  ┌────────────────────────────────────────┐
+                  │ libtorch_cuda.so 的 NEEDED:             │
+                  │   libtorch_cpu.so / libc10.so / ...     │
+                  └────────────────────────────────────────┘
+
+    所以只链 torch，CMake 解析其接口依赖时就会把 libtorch_cuda.so 强制链入，
+    符号自然能解析；libtorch_cuda.so 自身的 NEEDED 又会在运行时自动带出
+    libtorch_cpu.so / libc10.so 等，无需手动列出。
+
+
+================================================================================
+三、${TORCH_LIBRARIES} 多出来的是什么
+================================================================================
+
+    TorchConfig.cmake 里 ${TORCH_LIBRARIES} 是个超集：
+
+        set(TORCH_LIBRARIES torch ${Caffe2_MAIN_LIBS})
+        append_torchlib_if_found(c10)
+        append_wholearchive_lib_if_found(torch_cuda c10_cuda)
+        append_torchlib_if_found(fbgemm / dnnl mkldnn / cpuinfo / kineto / ...)
+        ...
+
+    它在 torch 之外又加了 c10、caffe2 主库、fbgemm、mkldnn、cpuinfo、kineto 等
+    一长串。对 validation 这个只用到 aoti_torch_get_current_cuda_stream 的场景，
+    这些大多用不上，链上去只是冗余（未引用的共享库依赖会被 --as-needed 丢弃，
+    或由 libtorch_cuda.so 的 NEEDED transitively 解析）。
+
+    因此用单个 torch target 更精简且足够。
+
+
+================================================================================
+四、编译期 vs 链接期：两个独立问题
+================================================================================
+
+    加入此 .cu 文件时实际遇到两层问题，必须分别解决，互不替代：
+
+        fused_qknorm_rope_kernel.cu
+              │
+              ├─【编译期】声明可见性
+              │     torch/.../shim.h 中该声明被 #ifdef USE_CUDA 包裹，
+              │     编译时未定义 USE_CUDA → "identifier undefined"
+              │     解决：target_compile_definitions(validation PRIVATE USE_CUDA)
+              │
+              └─【链接期】符号定义在哪个 .so
+                    符号在 libtorch_cuda.so，未链入 → "undefined reference"
+                    解决：target_link_libraries(validation PRIVATE torch)
+                          （torch ──► torch_cuda_library ──► libtorch_cuda.so）
+
+    要点：
+        - USE_CUDA 是编译期预处理开关，决定"声明是否可见"，与链哪个库无关。
+        - 链 torch 是链接期动作，决定"定义是否找得到"，与是否定义宏无关。
+        - 两者必须同时满足：缺 USE_CUDA 报 identifier undefined（编译失败，
+          根本走不到链接）；声明可见但没链 libtorch_cuda.so 则报
+          undefined reference（链接失败）。
+
+
+================================================================================
+五、最终 CMake 配置
+================================================================================
+
+    target_compile_definitions(validation PRIVATE USE_CUDA)
+
+    target_link_libraries(validation PRIVATE
+        CUDA::cudart   # validation.cu 自身的 cudaMalloc / cudaEvent 等
+        cudnn          # kernel_base 的 cuDNN 参考实现
+        torch          # 经 torch_cuda_library 强制链入 libtorch_cuda.so，
+                       # 提供 aoti_torch_get_current_cuda_stream 等 stable ABI 符号
+    )
+
+
+================================================================================
+六、include 路径也能省：torch target 同时传播头文件目录
+================================================================================
+
+    既然链接侧链 torch 就够了，那 include 路径 ${TORCH_INCLUDE_DIRS} 能否也省掉？
+
+    先看 ${TORCH_INCLUDE_DIRS} 本身（TorchConfig.cmake:56）：
+
+        set(TORCH_INCLUDE_DIRS
+          ${TORCH_INSTALL_PREFIX}/include
+          ${TORCH_INSTALL_PREFIX}/include/torch/csrc/api/include)
+
+    与 ${TORCH_LIBRARIES} 不同，它不是"全家桶"，只有两个目录：
+        - <prefix>/include                          ATen/ATen.h、torch/headeronly/... 等
+        - <prefix>/include/torch/csrc/api/include   LibTorch C++ API（torch/torch.h）的额外根
+    两个都是标准头文件布局，变量内部没有冗余项可删。
+
+    真正的精简点：整行 target_include_directories(... ${TORCH_INCLUDE_DIRS}) 可删掉。
+
+    原因与链接侧同源——torch imported target 把头文件目录也写进了接口属性
+    （TorchConfig.cmake:156）：
+
+        set_target_properties(torch PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${TORCH_INCLUDE_DIRS}"
+            CXX_STANDARD 20)
+
+    所以 target_link_libraries(validation PRIVATE torch) 会把 torch 的
+    usage requirements 一并传播给 validation 的编译命令：
+
+        target_link_libraries(validation PRIVATE torch)
+                │  CMake 传递 torch 的 usage requirements
+                ├──► INTERFACE_LINK_LIBRARIES       → 自动链入 libtorch_cuda.so（链接侧，第二节）
+                └──► INTERFACE_INCLUDE_DIRECTORIES  → 自动加入 TORCH_INCLUDE_DIRS（编译侧）
+
+    一个 torch target 同时解决"链 libtorch_cuda.so"和"加 torch 头文件路径"两件事，
+    无需再手写 target_include_directories(... ${TORCH_INCLUDE_DIRS})。
+    这正是现代 CMake imported target 的设计：链接目标即获得其全部使用要求。
+
+    注意：USE_CUDA 宏不在 torch 的接口属性里（它是 PyTorch 扩展构建体系的约定，
+    非 imported target 携带），仍需显式 target_compile_definitions 定义，
+    不能靠链 torch 自动获得（参见第四节）。
+
+================================================================================
