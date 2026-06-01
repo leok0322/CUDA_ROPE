@@ -200,8 +200,9 @@ set_target_properties(ROPE_cuda PROPERTIES
 #   validation : 有 main()，./validation <kernel_num> 直接运行
 #
 # 编译流程：
-#   nvcc src/validation.cu → validation.cu.o   （主程序：参数解析、计时、正确性验证）
-#   nvcc src/runner.cu     → runner.cu.o        （kernel 启动函数定义）
+#   nvcc src/validation.cu                          → validation.cu.o   （主程序：参数解析、计时、正确性验证）
+#   nvcc src/runner.cu                              → runner.cu.o        （kernel 启动函数定义）
+#   nvcc src/inference/fused_qknorm_rope_kernel.cu  → fused_qknorm_rope_kernel.cu.o （fused QK Norm + RoPE）
 #   ld → validation
 #
 # validation.cu 通过 #include "runner.cuh" 看到函数声明，
@@ -209,17 +210,42 @@ set_target_properties(ROPE_cuda PROPERTIES
 add_executable(validation
     src/validation.cu
     src/runner.cu
+    src/inference/fused_qknorm_rope_kernel.cu   # fused QK Norm + RoPE kernel（stable ABI）
 )
 
+target_compile_definitions(validation PRIVATE USE_CUDA)
+
 target_include_directories(validation PRIVATE
-    ${CUDAToolkit_INCLUDE_DIRS}        # cuda_runtime.h / cudaEvent_t 等
-    /usr/include/x86_64-linux-gnu      # cudnn.h：apt 安装 cuDNN 时头文件位于此路径
-                                       # /usr/local/cuda/include 不含 cudnn.h，需单独指定
+    ${CUDAToolkit_INCLUDE_DIRS}              # cuda_runtime.h / cudaEvent_t / cublas_v2.h 等
+    /usr/include/x86_64-linux-gnu            # cudnn.h：apt 安装 cuDNN 时头文件位于此路径
+                                             # /usr/local/cuda/include 不含 cudnn.h，需单独指定
+    # ${PROJECT_SOURCE_DIR}/src/inference    # 无需添加：fused_qknorm_rope_kernel.cu 本身位于 src/inference/，
+                                             # quoted include（"torch_utils.h" 等）优先搜索当前文件所在目录，
+                                             # 本地头文件自动可见
+    # ${TORCH_INCLUDE_DIRS}                  # 无需显式添加：下方 target_link_libraries 链接的
+                                             # torch imported target 已把这两个目录写入其
+                                             # INTERFACE_INCLUDE_DIRECTORIES（TorchConfig.cmake:156），
+                                             # 经 target_link_libraries(validation PRIVATE torch) 传播给
+                                             # 本目标的编译命令，torch 头文件路径自动可见：
+                                             #   torch/headeronly/util/Exception.h（STD_TORCH_CHECK）
+                                             #   torch/csrc/stable/tensor.h（torch::stable::Tensor）
+                                             #   torch/csrc/inductor/aoti_torch/c/shim.h 等 stable ABI 头文件
+                                             # 注：USE_CUDA 宏不在 torch 接口属性里，仍须上方显式
+                                             #     target_compile_definitions 定义，不能靠链 torch 获得。
 )
 
 target_link_libraries(validation PRIVATE
     CUDA::cudart   # cudaMalloc / cudaFree / cudaMemcpy / cudaEventCreate 等运行时符号
     cudnn          # cuDNN 运行时库（libcudnn.so）：kernel_base 使用 cuDNN RoPE 参考实现
+    torch          # PyTorch libtorch 核心 imported target，提供 aoti_torch_get_current_cuda_stream
+                   # 等 stable ABI 符号（torch_utils.h 中 get_current_cuda_stream 所需）。
+                   # 该符号实际定义在 libtorch_cuda.so，而非 libtorch.so：
+                   #   torch 的 INTERFACE_LINK_LIBRARIES = "torch_cpu_library;torch_cuda_library"
+                   #   torch_cuda_library 用 -Wl,--no-as-needed 强制链入 libtorch_cuda.so，
+                   #   故只链 torch 即可传递拉到该符号；libtorch_cuda.so 的 NEEDED
+                   #   又会自动带出 libtorch_cpu.so / libc10.so 等运行时依赖。
+                   # 无需用 ${TORCH_LIBRARIES}（含 c10/caffe2/kineto/fbgemm 等一长串），
+                   #   本目标用不到，链 torch 一个目标即足够且更精简。
 )
 
 set_target_properties(validation PROPERTIES
