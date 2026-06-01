@@ -1,0 +1,338 @@
+================================================================================
+QK-Norm 与 RoPE：算法、qkv 形状变化、为何只作用于 Q/K
+================================================================================
+
+  本文围绕 src/inference/fused_qknorm_rope_kernel.cu 的 fusedQKNormRopeKernel，
+  从"算法做什么"的角度梳理：
+    一、kernel 总览与并行映射
+    二、一个具体示例：qkv 的形状与就地变化
+    三、Norm 与 RoPE 都作用在 head_dim 维度上
+    四、为什么只对 Q、K 做，不对 V 做
+    五、QK-Norm 与"块级 RMSNorm"是两回事（含 pre-norm 结构）
+
+
+================================================================================
+一、kernel 总览与并行映射
+================================================================================
+
+  作用：把"每个 head 的 RMSNorm（QK-Norm）"与"RoPE 旋转位置编码"融合进一个
+        kernel，对 Q、K 两类 head 就地（in-place）改写 qkv 张量（V 不处理）。
+
+  并行映射：一个 warp（32 线程）负责一个 (token, QK-head)。
+
+      globalWarpIdx = blockIdx.x * warpsPerBlock + warpId
+      total_qk_heads = num_heads_q + num_heads_k          ← 注意不含 V
+      tokenIdx      = globalWarpIdx / total_qk_heads       ← 属于哪个 token
+      localHeadIdx  = globalWarpIdx % total_qk_heads       ← 该 token 内第几个 QK head
+      isQ           = localHeadIdx < num_heads_q           ← Q head 还是 K head
+      headIdx       = isQ ? localHeadIdx : localHeadIdx - num_heads_q
+
+  warp 内 32 个 lane 平分 head_dim 个元素，每线程持有
+  numElemsPerThread = head_dim / 32 个，全程留在寄存器 float elements[] 上。
+
+  处理四阶段（只读写一次显存）：
+      1) Load    : 向量化读入本线程元素 → float，顺带累加平方和。
+      2) RMSNorm : warp 内归约平方和 → rms_rcp = rsqrt(mean(x^2)+eps)，再乘权重。
+      3) RoPE    : 用预计算 cos/sin cache 旋转；interleave(=!neox) 相邻配对，
+                   neox 走 warp 内 __shfl_xor 跨半段配对。
+      4) Store   : float → 原类型，向量化写回 qkv 同一位置。
+
+
+================================================================================
+二、一个具体示例：qkv 的形状与就地变化
+================================================================================
+
+  核心结论：qkv 形状自始至终不变，kernel 是"就地(in-place)改写"——只重写
+            Q、K 两类 head 的数值，V 原样不动，也不分配新显存。
+
+  2.1 设定
+  --------------------------------------------------------------------------------
+
+      num_tokens   = 2
+      num_heads_q  = 4        head_dim   = 128（须为 64 的倍数）
+      num_heads_k  = 2        rotary_dim = 128（此例 = head_dim）
+      num_heads_v  = 2        dtype      = bf16
+
+      num_heads      = 4+2+2 = 8     // 含 V
+      total_qk_heads = 4+2   = 6     // 只 Q+K（kernel 处理范围）
+
+      qkv 形状 = [num_tokens, num_heads, head_dim] = [2, 8, 128]
+              等价扁平 [2, 1024]
+
+     补充：qkv 是融合(fused)张量，且为 GQA 布局
+        这里的 qkv 是【一个把 Q、K、V 打包在一起的融合(fused/packed)张量】，
+        不是三个独立张量。从形状即可看出：
+
+          qkv: [num_tokens, num_heads, head_dim] = [2, 8, 128]
+                            └─ num_heads = num_heads_q + num_heads_k + num_heads_v
+                                         = 4(Q) + 2(K) + 2(V) = 8
+
+        那个 8 不是"8 个同质 head"，而是 4 个 Q head + 2 个 K head + 2 个 V head
+        沿 head 轴拼在一起。kernel 接口也只有一个指针：
+
+          void* qkv_void,   // Combined QKV tensor ← 单个张量，Q/K/V 都在里面
+
+        (1) 它从哪来——融合的 QKV 投影
+            正常要做三次投影 Q=xWq、K=xWk、V=xWv。融合 QKV 把三个权重拼成一个大矩阵
+            W_qkv=[Wq|Wk|Wv]，一次 matmul 同时产出 Q/K/V，连续写进同一块 buffer：
+
+              x · W_qkv ──► [ Q heads … | K heads … | V heads … ]   （即本 kernel 的 qkv）
+
+            好处：一次 kernel launch、一块连续显存、更高带宽利用，优于三次独立投影。
+
+        (2) 注意：这是 GQA/MQA 风格（Q、K、V head 数不等）
+            num_heads_q=4、num_heads_k=2、num_heads_v=2——Q 的 head 比 K/V 多，
+            这是 Grouped-Query Attention(GQA)：多个 Q head 共享一组 K/V head，
+            用于压缩 KV cache。故这是 GQA 式的融合 QKV，而非各类 head 数相等的标准 MHA。
+
+        (3) 本 kernel 怎么对待它
+            就地操作这一块融合 buffer；只改写 Q 段 + K 段（QK-Norm + RoPE）；
+            V 段虽在同一张量里占位（本例 flat[768,1024)），但从不读写
+            —— 这也是布局图里 V 标"不动"的原因（见 2.2）。
+
+  2.2 qkv 显存布局
+  --------------------------------------------------------------------------------
+
+                            ← 一个 token 行 = 8 heads × 128 = 1024 元素 →
+      token 0:  [ Q0|Q1|Q2|Q3 || K0|K1 || V0|V1 ]   flat[   0 .. 1023]
+      token 1:  [ Q0|Q1|Q2|Q3 || K0|K1 || V0|V1 ]   flat[1024 .. 2047]
+                 └─── 处理(Norm+RoPE) ──┘ └─不动─┘
+
+      对应代码：
+        num_heads = num_heads_q + num_heads_k + num_heads_v;  // 8，行内偏移含 V
+        // Q: offsetWarp = token基址 + headIdx*head_dim
+        // K: offsetWarp = token基址 + num_heads_q*head_dim + headIdx*head_dim
+
+  2.3 warp → (token, head) 映射（取 globalWarpIdx = 10）
+  --------------------------------------------------------------------------------
+
+      tokenIdx     = 10 / 6 = 1          // token 1
+      localHeadIdx = 10 % 6 = 4          // 该 token 第 4 个 QK head
+      isQ          = (4 < 4) = false     // K head
+      headIdx      = 4 - 4 = 0           // K 段第 0 个 → K0
+
+      → 该 warp 负责 token 1 的 K0：
+        offsetWarp = 1*8*128 + 4*128 + 0 = 1536  → 占 flat[1536..1663]（128 个元素）
+
+  2.4 thread(lane) → 元素映射（取 lane 5）
+  --------------------------------------------------------------------------------
+
+      numElemsPerThread = 128/32 = 4
+      offsetThread = 1536 + 5*4 = 1556  → flat[1556..1559] = token1·K0 的 dim 20..23
+      向量化：vec_T = uint2（8 字节 = 4 个 bf16），一次读 / 一次写搬完。
+
+  2.5 四阶段里这 4 个元素的变化（示意数值）
+  --------------------------------------------------------------------------------
+
+      原始  qkv[1556..1559] (bf16) = [0.50, -1.00, 2.00, 0.25]
+
+      阶段1 Load（bf16→float，留寄存器，累加平方和）
+        elements = [0.50, -1.00, 2.00, 0.25]
+        本线程局部平方和 = 0.25+1.00+4.00+0.0625 = 5.3125
+
+      阶段2 RMSNorm（warp 内 32 lane 归约出整个 head 的平方和）
+        sumOfSquares = Σ(全 128 维 x²)，设 = 256.0
+        rms_rcp = 1/sqrt(256/128 + eps) = 1/sqrt(2.0) ≈ 0.7071
+        乘 K 权重(设=1)：elements = [0.3536, -0.7071, 1.4142, 0.1768]
+
+      阶段3 RoPE（position_ids[1] 处 cos/sin，interleave 相邻配对，设 cos=0.8 sin=0.6）
+        [x0,x1] → [x0·cos - x1·sin, x0·sin + x1·cos]
+        (0.3536,-0.7071) → ( 0.7071, -0.3536)
+        (1.4142, 0.1768) → ( 1.0253,  0.9899)
+        elements = [0.7071, -0.3536, 1.0253, 0.9899]
+
+      阶段4 Store（float→bf16，写回同一位置）
+        qkv[1556..1559] = [0.7071, -0.3536, 1.0253, 0.9899]   ← 覆盖原值
+
+  2.6 整体前后对比
+  --------------------------------------------------------------------------------
+
+                       进入 kernel 前        退出 kernel 后
+      qkv 形状         [2, 8, 128]           [2, 8, 128]   ← 不变
+      存储位置         同一块显存            同一块显存    ← in-place，无新分配
+      Q0..Q3 各 head   原始投影值            Norm→RoPE 后  ← 改写
+      K0..K1 各 head   原始投影值            Norm→RoPE 后  ← 改写
+      V0..V1 各 head   原始值                原始值        ← 完全不动
+
+      一句话：qkv 是 [num_tokens, num_heads, head_dim] 的合并张量，kernel 不改
+      形状、不分配新内存；把每个 warp 负责的一个 (token, QK-head) 的 head_dim 维
+      向量读进寄存器，做 per-head RMSNorm 再做 RoPE，写回原位；V 段地址从不触及。
+
+  2.8 qkv 物理上是扁平一维内存，多维只是逻辑视图
+  --------------------------------------------------------------------------------
+
+      问：qkv 逻辑形状是 [num_tokens, num_heads, head_dim] 这种多维，但实际传入
+          的是不是一块完全扁平的一维数组？
+      答：是。物理上传入的就是一块扁平连续一维内存 + 一个裸指针；多维形状只是
+          靠手算下标(行优先 stride)实现的逻辑视图，并无真正的多维数组结构。
+
+      (1) 接口拿到的是裸指针，按一维下标访问
+          __global__ void fusedQKNormRopeKernel(void* qkv_void, ...);  // 单个指针
+          T_in* qkv = reinterpret_cast<T_in*>(qkv_void);               // 当成一维数组
+          qkv[offsetThread]                                            // 一维下标访问
+          —— 不是 float**，没有二维指针解引用。
+
+      (2) “多维”靠行优先(row-major) stride 乘加换算成一维偏移
+          flat_index([t][h][d]) = t*(num_heads*head_dim) + h*head_dim + d
+                                   └ token stride ┘    └head stride┘ └elem┘
+          这正是 kernel 里 offsetWarp / offsetThread 做的事：
+            offsetWarp   = tokenIdx*num_heads*head_dim
+                         + (isQ?0:num_heads_q*head_dim) + headIdx*head_dim;
+            offsetThread = offsetWarp + laneId*numElemsPerThread;
+          全是整数下标算术，没有任何多维指针结构。
+
+      (3) 几种“形状”指的是同一块内存（reshape 零成本）
+          物理:   一维连续 buffer，长度 = num_tokens*num_heads*head_dim = 2*8*128 = 2048
+                     [ ───────────── 2048 个元素 ───────────── ]
+          逻辑(2D): [num_tokens, num_heads*head_dim] = [2, 1024]
+          逻辑(3D): [num_tokens, num_heads, head_dim] = [2, 8, 128]
+          连续张量上 reshape 只改“怎么解释下标”，底层一个字节都不动。
+          所以“逻辑 2D/3D”与“物理 1D 连续内存”并不矛盾，多维只是解释方式。
+
+      (4) 为什么 kernel 要自己算下标
+          CUDA kernel 收到的是 void* 裸指针，没有 PyTorch 的 shape/stride 元信息，
+          故维度量需通过额外标量参数(num_heads_q、head_dim、num_tokens 等)传入，
+          kernel 用它们手动重建 stride 做下标换算——这就是参数列表里那一堆
+          int const 维度量的用途。
+
+
+================================================================================
+三、Norm 与 RoPE 都作用在 head_dim 维度上
+================================================================================
+
+  RMSNorm 和 RoPE 都沿 head_dim 维度、对每个 (token, head) 独立处理。
+  (token, head) 是相互独立的"批"维度，真正参与运算的轴是 head_dim。
+
+      qkv: [num_tokens, num_heads, head_dim]
+                                  └────────┘  ← Norm 和 RoPE 都沿这个轴运算
+
+  3.1 RMSNorm：沿整个 head_dim 做归约
+  --------------------------------------------------------------------------------
+
+      对一个 head 的 head_dim 个元素 x[0..127]：
+        mean_sq = (Σ x[d]²) / head_dim          ← 归约轴 = head_dim（全部维度）
+        rms_rcp = 1 / sqrt(mean_sq + eps)        ← 该 head 所有维共享这一标量
+        x[d]    = x[d] * rms_rcp * weight[d]     ← 再逐维乘权重
+
+      归约范围是整个 head_dim（warpReduceSum 把 32 lane 局部平方和合成一个 head
+      的总和，再 / head_dim）。每个 head 各算各的，不跨 head、不跨 token。
+
+  3.2 RoPE：在 head_dim 内部按"维度配对"旋转
+  --------------------------------------------------------------------------------
+
+      作用在 rotary_dim 范围内（rotary_dim ≤ head_dim）：
+        把维度两两配对 (x_a, x_b) 旋转：
+          [x_a, x_b] → [x_a·cos - x_b·sin, x_a·sin + x_b·cos]
+
+      配对方式取决于 interleave：
+        - interleave(=!neox)：相邻维 (2i, 2i+1) 配对（同一 lane 内完成）。
+        - neox：相隔 rotary_dim/2 的维配对（落在 warp 另一半 lane，需 __shfl_xor）。
+      若 rotary_dim < head_dim，则超出部分的高维不旋转。
+
+  3.3 对比
+  --------------------------------------------------------------------------------
+
+      | 操作    | 作用轴             | 在 head_dim 上怎么用       | 跨 head/token |
+      |---------|--------------------|----------------------------|---------------|
+      | RMSNorm | head_dim           | 整轴归约→共享因子→逐维缩放 | 否，每 head 独立 |
+      | RoPE    | head_dim 的 rotary | 维度两两配对旋转           | 否，每 head 独立 |
+
+
+================================================================================
+四、为什么只对 Q、K 做，不对 V 做
+================================================================================
+
+  这个 kernel 叫 fusedQK-NormRope —— "QK Norm"，V 自始至终不被触碰：
+
+      | 操作          | Q  | K  | V        |
+      |---------------|----|----|----------|
+      | RMSNorm(per-head)| 做 | 做 | 不做     |
+      | RoPE          | 做 | 做 | 不做     |
+      | 是否读写      | 读+写 | 读+写 | 完全不碰 |
+
+  代码依据：
+    1) 只给 Q、K 分配 warp：total_qk_heads = num_heads_q + num_heads_k（不含 V），
+       grid 只发 num_tokens × total_qk_heads 个 warp，V 的 head 分不到 warp。
+    2) RMSNorm 权重只有 q_weight / k_weight，没有 v_weight：
+         float weight = isQ ? convert(q_weight[dim]) : convert(k_weight[dim]);
+       isQ 把 head 分成 Q、K 两路，没有第三路 V。
+    3) num_heads（含 V）只用于算行内偏移、跳过 V 段定位 Q/K，绝不作为读写目标。
+
+
+================================================================================
+五、QK-Norm 与"块级 RMSNorm"是两回事
+================================================================================
+
+  常见疑问：RMSNorm 不是为了防止梯度爆炸/消失吗？为何不对 V 也做？
+  答：把"transformer 块里的主 RMSNorm"和"这里的 QK-Norm"混了——它们是两个不同
+      位置、不同目的的归一化。本 kernel 做的是 QK-Norm，不是负责整体梯度稳定的主 RMSNorm。
+
+  5.1 模型里其实有两类归一化（以 pre-norm，如 LLaMA 为例，含残差）
+  --------------------------------------------------------------------------------
+
+      x ──────────────────────────┐  (残差 1，原样保留)
+      │                            │
+   [RMSNorm-1]  ←(A) 块级主归一化：作用于整个 hidden state，Q/K/V 投影之前；
+      │              配合残差，负责"稳定残差流/梯度"。V 早已经过它。
+    Wq,Wk,Wv 投影 → Q, K, V        │
+      │                            │
+   [QK-Norm]    ←(B) 本 kernel：只对 Q、K 的 per-head 向量，紧贴算分数之前；
+      │              目的是"限制注意力 logits"。
+      │                            │
+      └────────► (+) ◄─────────────┘
+                 │
+                 h = x + attention(RMSNorm-1(x))    ← 注意力子块后的"残差流"
+                 │
+      ┌──────────┴────────────────┐  (残差 2，原样保留)
+      │                            │
+   [RMSNorm-2]  ←归一化 h（残差相加后的值），结果只喂给 MLP；
+      │              残差主干 h 本身不被改写（pre-norm 特点）。
+     MLP                           │
+      └────────► (+) ◄─────────────┘
+                 │
+                 y = h + MLP(RMSNorm-2(h))          ← 块的最终输出
+
+      要点（pre-norm）：归一化只作用在"进入子层的那份拷贝"上，残差主干始终保持
+      未归一化——这对稳定深层训练、梯度流很关键。
+      （post-norm：h = RMSNorm(x + attention(x))，归一化放在残差之后，主干被反复
+        归一化，深层更易失稳，故现代大模型多用 pre-norm。）
+
+  5.2 QK-Norm 要解决的具体问题：注意力 logits 爆炸
+  --------------------------------------------------------------------------------
+
+      注意力：scores = Q·Kᵀ / √d ;  A = softmax(scores) ;  out = A·V
+
+      关键在 softmax：
+        ‖Q‖、‖K‖ 随训练变大 → Q·Kᵀ 很大 → softmax 进入饱和区（趋近 one-hot）
+        → softmax 梯度趋近 0 → 梯度无法回传（attention entropy collapse / logit 爆炸）
+        → 训练失稳。
+      QK-Norm 把 Q、K 范数限制住 → scores 有界 → softmax 不饱和 → 梯度健康。
+
+      这确实是"防止梯度问题"，但发生在 softmax 这个特定非线性上，
+      而 softmax 的输入只有 Q 和 K，没有 V。
+
+  5.3 为什么 V 不受这个问题影响
+  --------------------------------------------------------------------------------
+
+      out = A · V   ← V 是被 softmax 权重线性加权的"值"，不进入 softmax
+
+      - V 不参与 Q·Kᵀ、不进 softmax → V 再大也不会让 softmax 饱和，对 logit 爆炸免疫。
+      - V 的尺度只是线性放大 out，由下游输出投影 + 块级 RMSNorm(A) + 残差来管理，
+        不需要在这里专门归一化。
+      - 即：QK-Norm 针对"非线性饱和"（只 Q、K 触发）；V 走"线性缩放"路径，交给常规归一化。
+
+  5.4 对照总结
+  --------------------------------------------------------------------------------
+
+      |                         | Q、K                  | V                    |
+      |-------------------------|-----------------------|----------------------|
+      | 注意力中的角色          | 进 Q·Kᵀ → softmax(非线性) | 被 softmax 权重线性加权 |
+      | 会否致 softmax 饱和/logit爆炸 | 会                | 不会（不进 softmax）  |
+      | 是否需要 QK-Norm        | 需要                  | 不需要               |
+      | 整体梯度/残差稳定靠什么 | 上游块级 RMSNorm(A)+残差 | 同左，V 同样享有    |
+
+  一句话：块级主 RMSNorm 负责整体梯度稳定（Q/K/V 都经过）；本 kernel 的 QK-Norm
+  是额外、专为"注意力 logits 经 softmax 不饱和"而设——只有 Q、K 进 softmax，
+  V 只被线性加权，天生不触发该问题，故不需要也不应对 V 做 QK-Norm。
+
+================================================================================

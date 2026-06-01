@@ -376,3 +376,94 @@
     若不起别名，每处都得写全 vllm::_typeConvert<scalar_t_in>::hip_type，啰嗦且易错。
     所以 using Converter = ... 纯粹是给"这个 struct 类型"取个短名，
     和给 int 取别名没有本质区别。
+
+
+================================================================================
+附四、为什么 typename Converter::hip_type 要加 typename？
+================================================================================
+
+  代码（src/inference/fused_qknorm_rope_kernel.cu）：
+
+    template <typename scalar_t_in, ...>
+    __global__ void fusedQKNormRopeKernel(...) {
+      using Converter = vllm::_typeConvert<scalar_t_in>;   // 依赖模板参数
+      static_assert(Converter::exists, "...");             // 取"值"，不加 typename
+      using T_in  = typename Converter::hip_type;          // 取"类型"，必须加 typename
+      using T2_in = typename Converter::packed_hip_type;   // 同上
+      ...
+    }
+
+  疑问：T_in / T2_in 这两行为什么要在前面加 typename？
+
+
+  一、根源：依赖名（dependent name）+ 模板的两阶段解析
+  --------------------------------------------------------------------------------
+
+    Converter = vllm::_typeConvert<scalar_t_in>，它【依赖模板参数 scalar_t_in】，
+    因此是一个"依赖类型"。
+
+    编译模板【定义】时，scalar_t_in 还没确定具体类型，编译器看不到 Converter 内部
+    到底有什么——_typeConvert<float> 与其它特化的 hip_type 可能完全不同，
+    甚至某个特化里 hip_type 也可能是个静态成员（值）而非类型。
+
+    像 Converter::hip_type 这种"通过依赖类型访问的成员名"叫【依赖名】。
+    C++ 规定：
+
+        编译器遇到 T::x 这种依赖名时，默认假定 x 是一个【值】
+        （成员变量 / 静态成员 / 函数），而不是类型。
+
+    所以要把它当类型用，必须显式写 typename 来纠正这个默认假定。
+
+
+  二、不加 typename 会怎样
+  --------------------------------------------------------------------------------
+
+        using T_in = Converter::hip_type;   // ✗ 编译器把 hip_type 当"值"
+                                            //   而 using T_in = 一个值; 不合法 → 报错
+
+    典型报错：
+
+        error: need 'typename' before 'Converter::hip_type' because
+               'Converter' is a dependent scope
+
+    加上 typename 后，编译器确知它是类型，using T_in = 类型; 成立：
+
+        using T_in = typename Converter::hip_type;   // ✓
+
+
+  三、对比：什么时候【不】用加
+  --------------------------------------------------------------------------------
+
+    作用域【不依赖】模板参数时，编译器当场就能查出它是不是类型，无需 typename：
+
+        using A = std::vector<int>::value_type;          // ✓ 不用（具体类型）
+        using B = typename std::vector<U>::value_type;   // ✓ U 是模板参数 → 依赖 → 要加
+
+    | 场景                                  | 是否加 typename |
+    |---------------------------------------|-----------------|
+    | 具体类型::成员类型（不依赖模板参数）  | 不用            |
+    | 依赖类型::成员类型（依赖模板参数）    | 必须加          |
+    | 取的是值成员（如 Converter::exists）  | 不加（本就是值）|
+
+
+  四、与本项目代码的对应
+  --------------------------------------------------------------------------------
+
+        static_assert(Converter::exists, "...");        // exists 是值(静态成员) → 不加
+        using T_in  = typename Converter::hip_type;     // hip_type 是类型 → 必须加
+        using T2_in = typename Converter::packed_hip_type;
+
+    同一个依赖类型 Converter，取【值成员】exists 不加 typename，
+    取【类型成员】hip_type / packed_hip_type 必须加。这正好印证规则：
+    typename 专门用于在依赖作用域里，把"默认当作值"的成员名【纠正为类型】。
+
+
+  五、一句话
+  --------------------------------------------------------------------------------
+
+    Converter 依赖模板参数、是依赖类型；Converter::hip_type 这种依赖名编译器
+    默认当成"值"，必须用 typename 显式声明它是"类型"，using 才能成立；
+    而 exists 本就是值，故不加。
+
+    （延伸：模板里取"依赖模板"的成员模板时，对应还需 template 消歧关键字，
+      如 obj.template foo<int>()；与此处 typename 是同一类"消歧"机制。）
