@@ -1,0 +1,177 @@
+================================================================================
+   torch.library.register_fake —— 给自定义算子注册"假实现(fake/meta)"
+================================================================================
+
+例子（来自 ../fork/fused_silu_mul_compile_hook.py）：
+    @torch.library.register_fake("myops::silu_and_mul")
+    def _silu_and_mul_fake(x, y):
+        return torch.empty_like(x)    # 输出形状/类型与 x 相同（逐元素算子）
+
+一句话：register_fake 给一个自定义算子登记一段"只推断输出 shape/dtype、不真算"的
+实现。torch.compile / FakeTensor / autograd 在【不碰真实数据(不跑 GPU)】的情况下
+需要知道"这个算子吃什么、吐出什么形状"，靠的就是这段 fake 实现。
+
+  import torch
+  torch.library.register_fake(...)        # 较新 API
+  # 旧名：torch.library.impl_abstract(...)  （等价，老代码里常见）
+
+
+================================================================================
+一、为什么需要它（动机）
+================================================================================
+  自定义算子(TORCH_LIBRARY/register)默认只有"真实现"(如 CUDA kernel)。
+  但很多场景需要在【不执行真实计算】的前提下"走一遍"算子来推断元信息：
+
+    - torch.compile：编译期用 FakeTensor(只有 shape/dtype、无显存)trace 计算图，
+      要算出每个算子的输出形状来安排后续 kernel、内存。
+    - 模式匹配 pass：pattern matcher 用 fwd_only→make_fx 去 trace 替换函数，
+      也是在 FakeTensor 上跑(见 register_replacement.txt)。
+    - meta 设备 / 形状推断 / 导出。
+
+  这些时刻把 FakeTensor 喂给"只有 CUDA 实现"的算子 → 找不到能在 FakeTensor 上
+  跑的实现 → 报：
+      torch._inductor.exc.InductorError:
+        UnsupportedOperatorException: myops.silu_and_mul.default
+  注册 fake 实现就是补上"在 FakeTensor 上怎么推断输出"这一块。
+
+  对应 vLLM：等价于 csrc 里 STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd)
+  那个 fake/meta 块，以及 _custom_ops.py 里的 @register_fake("_C::xxx")。
+
+
+================================================================================
+二、参数
+================================================================================
+  torch.library.register_fake(op_name, func=None, /, *, lib=None, _stacklevel=1)
+
+    op_name (str)  : 算子全名 "<命名空间>::<算子>"，如 "myops::silu_and_mul"。
+                     命名空间与算子名要和 TORCH_LIBRARY(ns)+def 里的一致。
+                     （也可传一个用 torch.library.custom_op 定义的算子对象）
+
+    func           : fake 实现函数。常作为【装饰器】使用时此参省略：
+                       @torch.library.register_fake("myops::silu_and_mul")
+                       def _(x, y): ...
+                     也可函数式调用：register_fake("myops::silu_and_mul", _fake_fn)
+                     ★ 它的【签名必须和算子 schema 一致】(参数个数/顺序/类型对应)。
+
+    lib (可选)     : torch.library.Library 对象。把这条注册归属到某个库，
+                     便于管理/卸载(测试时常用)。一般不填。
+
+  fake 函数的写法约定：
+    - 入参就是算子的输入(可能是 FakeTensor，也可能是真 Tensor，但你不该依赖其数据)；
+    - 【不要做真实计算、不要访问 .item()/具体数值/.data_ptr() 等】；
+    - 只能用输入的【元信息】(shape/dtype/device/stride)来构造输出；
+    - 返回一个(或多个)"形状/类型正确"的张量，通常用：
+          torch.empty_like(x)                      # 形状/类型同 x
+          x.new_empty(out_shape, dtype=..., ...)   # 自定义输出形状
+      返回值只是"占位"，编译器只读它的元信息，不读数值。
+    - 原地写算子(schema 用 Tensor!)：fake 里不改输入，按返回约定返回即可。
+
+
+================================================================================
+三、举例
+================================================================================
+--------------------------------------------------------------------------------
+例 1：逐元素算子(输出与输入同形)——就是本仓库的 silu_and_mul
+--------------------------------------------------------------------------------
+    @torch.library.register_fake("myops::silu_and_mul")
+    def _silu_and_mul_fake(x, y):
+        # 逐元素：输出形状/类型与 x 相同
+        return torch.empty_like(x)
+    # 注意：必须在算子已注册(load_inline / TORCH_LIBRARY 生效)之后再 register_fake。
+
+--------------------------------------------------------------------------------
+例 2：输出形状与输入不同(用 new_empty 自定义)
+--------------------------------------------------------------------------------
+    # 设算子 schema： "myops::rowsum(Tensor x) -> Tensor"  对每行求和 [M,N]->[M]
+    @torch.library.register_fake("myops::rowsum")
+    def _rowsum_fake(x):
+        M = x.shape[0]
+        return x.new_empty(M, dtype=x.dtype)   # 只用 shape/dtype 构造输出占位
+
+--------------------------------------------------------------------------------
+例 3：多输出
+--------------------------------------------------------------------------------
+    # schema： "myops::split2(Tensor x) -> (Tensor, Tensor)"
+    @torch.library.register_fake("myops::split2")
+    def _split2_fake(x):
+        half = x.shape[-1] // 2
+        a = x.new_empty(*x.shape[:-1], half)
+        b = x.new_empty(*x.shape[:-1], x.shape[-1] - half)
+        return a, b
+
+--------------------------------------------------------------------------------
+例 4：配合 torch.library.custom_op（纯 Python 定义算子时）
+--------------------------------------------------------------------------------
+    # 若用 custom_op 直接在 Python 定义算子，也用 register_fake 补元信息：
+    @torch.library.custom_op("myops::scale", mutates_args=())
+    def scale(x: torch.Tensor, s: float) -> torch.Tensor:
+        return x * s
+    @scale.register_fake
+    def _(x, s):
+        return torch.empty_like(x)
+
+
+================================================================================
+三点五、它在 register_replacement / trace 时被怎么调用（真张量→FakeTensor→推断形状）
+================================================================================
+  以 register_replacement(search_fn, replace_fn, example_inputs, fwd_only, pm_pass)
+  为例，fake 实现是在 trace replace_fn 时被调用的：
+
+    register_replacement(..., example_inputs=[真cuda张量, 真cuda张量], fwd_only, ...)
+        │ ① fwd_only → make_fx(..., 在 FakeTensorMode 下) trace replace_fn
+        ▼
+    把 example_inputs(真张量) 包装成 FakeTensor
+        │  x, y 现在是 FakeTensor(只有 (4,8)/float32/cuda 元信息，无数据)
+        ▼
+    trace 到 torch.ops.myops.silu_and_mul(x, y)
+        │  x,y 是 FakeTensor → 走【fake 实现】，不走 CUDA 真实现
+        ▼
+    调用 _silu_and_mul_fake(x, y)：
+        return torch.empty_like(x)
+        │  在 FakeTensorMode 下，empty_like 也产出一个 FakeTensor，
+        │  shape/dtype/device = x → 推断出"输出是 (4,8) float32 cuda"，但无真实数据
+        ▼
+    得到该算子节点的输出元信息 → 子图 trace 完成 → 登记进 pm_pass
+
+  两个确认：
+    - "输入真张量 → 转 FakeTensor"：example_inputs 是真张量，但 make_fx 的 fake 模式
+      把它们包装成 FakeTensor，所以 fake 函数收到的 x,y 此刻【就是 FakeTensor】。
+    - "register_fake 做推断"：return torch.empty_like(x) 不是真分配张量，而是产出一个
+      "形状/类型/设备=x"的 FakeTensor 作为输出占位，让框架知道"吃 (4,8) 吐 (4,8)"。
+
+  ★ 用词精确化：这里是【形状/元信息推断】(shape + dtype + device)，不只是"类型推断"。
+    fake 主要回答"输出 shape 是什么"(逐元素→同形；rowsum→[M]；split→两半…)，
+    dtype/device 通常跟随输入。叫"形状推断 / meta 传播 / fake 推断"更贴切。
+
+  ★ 不止 register_replacement 会触发：任何 FakeTensor trace 都会调 fake 实现——
+    Dynamo 抓图、AOT、make_fx、torch.compile 编译期皆然。所以只要算子要走
+    torch.compile 就必须有 fake 实现；register_replacement 只是会 trace 到它的场景之一。
+    （FakeTensor 是什么/怎么建，见 FakeTensor.txt）
+
+
+================================================================================
+四、与本仓库报错的对应
+================================================================================
+  ../fork/fused_silu_mul_compile_hook.py 第一版【漏了 register_fake】，
+  compile 时 pattern matcher 在 FakeTensor 上调 myops::silu_and_mul → 报
+      UnsupportedOperatorException: myops.silu_and_mul.default
+  修复就是加上本文件例 1 的 fake 实现（见 ../fork/...txt 报错七）。
+
+  口诀：任何要走 torch.compile / 被 pattern matcher trace 的自定义算子，
+        都必须配 fake 实现；CUDA 真实现负责"真算"，fake 负责"编译期推断形状"。
+
+
+================================================================================
+五、一句话总结
+================================================================================
+  torch.library.register_fake("ns::op", fn)：给自定义算子登记一段"只看输入
+  shape/dtype、返回正确形状占位、不真算"的实现，供 torch.compile / FakeTensor /
+  形状推断在【不跑 GPU】时使用。签名必须与算子 schema 一致；fake 里只能用元信息
+  构造输出(torch.empty_like / x.new_empty)，不能碰真实数值。
+  缺它 → 编译期 UnsupportedOperatorException。
+
+相关文档：
+  torch.library.register_replacement.txt   配套的模式匹配-替换(fwd_only 也在 fake 上 trace)
+  ../fork/fused_silu_mul_compile_hook.py/.txt 用到本注册的最小复刻 + 报错七
+  ../c++/TORCH_LIBRARY_vs_PYBIND11.txt       CompositeExplicitAutograd(fake)块 + 三块分工
+  ../torch/vllm自定义算子调用链路.txt         vLLM 里 fake/meta 块的位置(torch_bindings.cpp:590)

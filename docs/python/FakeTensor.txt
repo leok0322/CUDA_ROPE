@@ -1,0 +1,133 @@
+================================================================================
+   FakeTensor（假张量）—— 只有元信息、没有真实数据的张量
+================================================================================
+
+一句话：FakeTensor 是一种只有"元信息"(shape/dtype/device/stride)、没有"真实数据
+和显存"的张量。torch.compile / make_fx 在 trace 时用它"空跑"一遍计算，只为推断每步
+的输出形状，而不真的在 GPU 上算——又快又省，还不需要真显存。
+
+  来源：torch._subclasses.fake_tensor（FakeTensor / FakeTensorMode）
+
+
+================================================================================
+一、真张量 vs FakeTensor
+================================================================================
+  # 真张量：元信息 + 真实数据(占显存)
+  x = torch.randn(4, 8, device="cuda")
+      # 真的分配 4*8*4 字节 GPU 显存，有具体数值
+
+  # FakeTensor：只有元信息，没数据
+  #   它"知道"自己是 (4,8)、float32、cuda:0，但背后没有真实显存、没有数值
+  fake_x → shape=(4,8), dtype=float32, device=cuda:0, stride=(8,1)   # 仅此而已
+
+  ┌──────────────┬──────────────┬──────────────┐
+  │              │ 真张量        │ FakeTensor   │
+  ├──────────────┼──────────────┼──────────────┤
+  │ 分配显存      │ ✅ 真占      │ ❌ 不占      │
+  │ 执行计算      │ ✅ 真跑kernel│ ❌ 只推形状  │
+  │ 速度          │ 慢(要真算)   │ 快(只算元信息)│
+  │ 需要 GPU      │ 要           │ trace时不需真算│
+  │ 用途          │ 真正推理     │ trace/形状推断/编译期│
+  └──────────────┴──────────────┴──────────────┘
+
+
+================================================================================
+二、在 FakeTensor 上"算"会发生什么
+================================================================================
+  对 FakeTensor 做运算，【只计算输出的元信息，不算数值】：
+      fake_y = silu(fake_x)
+      #   不真算 silu，只推断：输出也是 (4,8) float32 cuda
+      #   → 返回另一个 FakeTensor，shape/dtype 算好，数值是"空"
+  这一步靠每个算子的 fake/meta 实现完成。→ 直接串上自定义算子必须 register_fake：
+      trace 时算子在 FakeTensor 上跑 → 需要 fake 实现来推断输出形状
+      自定义算子没注册 fake → 在 FakeTensor 上分发失败
+      → UnsupportedOperatorException（见 torch.library.register_fake.txt / ../fork 报错七）
+      → @torch.library.register_fake 就是"教它在 FakeTensor 上怎么推断输出"
+
+
+================================================================================
+三、怎么创建 FakeTensor
+================================================================================
+  一般【你不用自己创建】——torch.compile / make_fx / Dynamo 在 trace 时会自动把输入
+  转成 FakeTensor。手动创建(如测试自己的 register_fake)的核心入口是 FakeTensorMode。
+
+--------------------------------------------------------------------------------
+方式 1：在 FakeTensorMode 里创建(最常用)
+--------------------------------------------------------------------------------
+  进入这个模式后，任何张量创建都自动产出 FakeTensor：
+      import torch
+      from torch._subclasses.fake_tensor import FakeTensorMode
+
+      fake_mode = FakeTensorMode()
+      with fake_mode:
+          x = torch.randn(4, 8, device="cuda")   # ← FakeTensor！没真占 cuda 显存
+          print(type(x))      # torch._subclasses.fake_tensor.FakeTensor
+          print(x.shape, x.dtype, x.device)       # (4,8) float32 cuda:0
+          y = x + 1           # 也是 FakeTensor，只推断了输出形状，没真算
+  注意：即使写 device="cuda" 也【不会真分配 GPU 显存】，只是"假装在 cuda 上"记录
+        元信息。所以没有 GPU 也能跑这段。
+
+--------------------------------------------------------------------------------
+方式 2：把已有的真张量"转成"FakeTensor
+--------------------------------------------------------------------------------
+      real = torch.randn(4, 8, device="cuda")     # 真张量(占显存)
+      fake_mode = FakeTensorMode()
+      fake = fake_mode.from_tensor(real)           # ← 转成 FakeTensor(只取元信息，不复制数据)
+      print(type(fake), fake.shape, fake.device)   # FakeTensor (4,8) cuda:0
+  from_tensor 只取真张量的 shape/dtype/device/stride，不搬数据。
+  这正是 trace 时对 example_inputs 做的事——把真张量包装成 fake 再 trace
+  （呼应 register_replacement.txt："example_inputs 只用元信息、数值无所谓"）。
+
+--------------------------------------------------------------------------------
+方式 3：框架自动创建(实际编译时走这条)
+--------------------------------------------------------------------------------
+      from torch.fx.experimental.proxy_tensor import make_fx
+      def f(x, y): return torch.nn.functional.silu(x) * y
+      gm = make_fx(f, tracing_mode="fake")(            # ← fake 模式 trace
+          torch.randn(4, 8, device="cuda"),
+          torch.randn(4, 8, device="cuda"),
+      )
+      gm.print_readable()    # 得到 FX 图，全程没真算
+  tracing_mode="fake" 就是显式要求用 FakeTensor trace。
+  register_replacement 的 fwd_only 内部也是这个套路。
+
+
+================================================================================
+四、用它测试自定义算子的 fake 实现
+================================================================================
+  把前面几块串起来，可单独验证你的 register_fake 写对没有：
+      # 假设 torch.ops.myops.silu_and_mul 已注册了 register_fake
+      with FakeTensorMode():
+          fx = torch.randn(4, 8, device="cuda")        # FakeTensor
+          fy = torch.randn(4, 8, device="cuda")
+          out = torch.ops.myops.silu_and_mul(fx, fy)   # 在 FakeTensor 上调 → 走 fake 实现
+          print(out.shape, out.dtype, out.device)      # (4,8) float32 cuda:0 ← 推断对了
+      # 若没注册 fake → 这里就报 UnsupportedOperatorException（复现报错七）
+
+
+================================================================================
+五、几个要点
+================================================================================
+  - 入口是 FakeTensorMode：要么"在它的 with 块里建张量"，要么"from_tensor 转真张量"。
+    直接 FakeTensor(...) 构造器不建议手动调(需要 mode、meta 张量等内部参数)。
+  - 同一个 fake_mode 内，转换同一个真张量会复用同一个 FakeTensor(有缓存)，
+    保证图里同一输入是同一个 fake 对象。
+  - device 保留但不分配：device="cuda" 的 FakeTensor 不占显存，无 GPU 也能创建/推断。
+  - 区别于 meta 张量：torch.randn(4,8, device="meta") 也无数据，但 device="meta"；
+    FakeTensor 保留真实 device 名(如 cuda:0)却不分配该设备内存。torch.compile 用 FakeTensor。
+
+
+================================================================================
+六、一句话总结
+================================================================================
+  FakeTensor = 只有 shape/dtype/device 等元信息、没有真实数据和显存的"占位张量"；
+  在它上面"算"只推断输出形状、不算数值(靠算子的 fake/meta 实现)。
+  创建：用 FakeTensorMode——在 with 块里建张量，或 fake_mode.from_tensor(real)；
+        实际编译由 make_fx/Dynamo 自动完成，你通常只在手动测 register_fake 时才自己建。
+  它是"trace/编译期零成本走一遍图推断形状"的基础，也是自定义算子必须 register_fake 的原因。
+
+相关文档：
+  torch.library.register_fake.txt                 在 FakeTensor 上推断输出的 fake 实现
+  torch.PatternMatcherPass_register_replacement.txt example_inputs 被包装成 fake 来 trace
+  ../fork/fused_silu_mul_compile_hook.py/.txt       报错七(缺 fake)的现场与修复
+  torch_compile流水线.txt                          FakeTensor 在 trace/形状推断中的位置

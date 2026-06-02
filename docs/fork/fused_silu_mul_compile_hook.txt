@@ -1,0 +1,494 @@
+================================================================================
+   最小复刻 vLLM 思路：compile 时用 hook 改计算图，调用自定义 CUDA kernel
+================================================================================
+
+配套脚本： fused_silu_mul_compile_hook.py
+例子选用： silu_and_mul（SiLU 后逐元素相乘）——vLLM 里真实存在的融合算子，
+           正好是"两个算子（silu、mul）融合成一个 kernel"的最小案例。
+依赖：      CUDA GPU + nvcc。
+
+
+================================================================================
+一、核心思路（与 vLLM 完全一致的三段式）
+================================================================================
+  1) eager 里写"分步算子"          ——  F.silu(x) * y   （两步）
+  2) torch.compile 时用 hook 改图  ——  post_grad pass 把子图模式匹配后替换
+  3) 替换成一次自定义 CUDA kernel  ——  torch.ops.myops.silu_and_mul(x, y)
+
+  不开 torch.compile（直接 model(x,y)）→ 走 eager 两步，根本不碰 kernel。
+  开 torch.compile 后第一次调用 → 触发编译 → hook 改图 → 之后跑含 kernel 的产物。
+  这与 vLLM 的 QK-Norm+RoPE 融合行为一致。
+
+
+================================================================================
+二、本例 ↔ vLLM 组件 对应关系表
+================================================================================
+┌──────────────────────────────────────────┬──────────────────────────────────┐
+│ vLLM 组件                                   │ 本例对应                          │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ csrc/*.cu + TORCH_LIBRARY 注册              │ load_inline 内联编译的 CUDA      │
+│ （编进 _C.so）                              │ kernel + TORCH_LIBRARY            │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ import vllm._C （dlopen 触发注册）          │ load_inline 编译后 import        │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ torch.ops._C.fused_qk_norm_rope             │ torch.ops.myops.silu_and_mul     │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ eager 分步                                  │ eager 分步                       │
+│ (rms_norm + rms_norm + rope)                │ (F.silu(x) * y)                  │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ QkNormRopePattern 的 Unfused / Fused        │ search_fn / replace_fn           │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ QKNormRoPEFusionPass                        │ register_replacement 注册的      │
+│ （一个 VllmPatternMatcherPass）             │ 模式匹配规则                     │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ self.passes += [QKNormRoPEFusionPass]       │ register_replacement(..., pm_pass)│
+│ （pass_manager.py:189）                     │ 把规则塞进 pm_pass               │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ PostGradPassManager.__call__:               │ custom_post_grad_pass(graph):    │
+│   for pass_ in self.passes: pass_(graph)    │   pm_pass.apply(graph)           │
+│ （pass_manager.py:103-105）                 │                                  │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ inductor_config[pass_key] = pass_manager    │ inductor_config.                 │
+│ pass_key = "post_grad_custom_post_pass"     │   post_grad_custom_post_pass     │
+│ （backends.py:966）                         │   = custom_post_grad_pass        │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ @support_torch_compile 装饰模型             │ torch.compile(model)             │
+│ （decorators.py，替换 __call__）            │                                  │
+├──────────────────────────────────────────┼──────────────────────────────────┤
+│ model runner 调 self.model(...)             │ compiled(x, y)                   │
+│ （gpu_model_runner.py:3692）                │                                  │
+└──────────────────────────────────────────┴──────────────────────────────────┘
+
+
+================================================================================
+三、五个步骤逐段对照
+================================================================================
+
+--------------------------------------------------------------------------------
+① CUDA kernel + TORCH_LIBRARY —— 和 vLLM 完全一样的两层结构
+--------------------------------------------------------------------------------
+  - __global__ silu_and_mul_kernel ：在 GPU 跑（对应 fusedQKNormRopeKernel）
+  - host 函数 silu_and_mul         ：CPU 算 grid/block 并 <<<>>> 发射 kernel
+                                     （对应 host 端 fused_qk_norm_rope）
+  - TORCH_LIBRARY / _IMPL          ：注册成 torch.ops.myops.silu_and_mul
+                                     （对应 csrc/torch_bindings.cpp）
+  load_inline 把"编译 .so + import 触发注册"浓缩成一行，
+  等价于 vLLM 的 csrc 编译进 _C.so + import vllm._C。
+
+  【def / impl 在干什么 —— 名字与函数地址的绑定】
+    TORCH_LIBRARY(myops, m) {                       // myops = 算子命名空间(→ torch.ops.myops)
+        m.def("silu_and_mul(Tensor x, Tensor y) -> Tensor");  // 只声明 schema，不绑实现
+    }
+    TORCH_LIBRARY_IMPL(myops, CUDA, m) {
+        m.impl("silu_and_mul", &silu_and_mul);      // ★ 名字 → 函数地址 的绑定
+    }
+    - "silu_and_mul"  → 算子全名 myops::silu_and_mul，是 Dispatcher 查表的 key
+    - &silu_and_mul   → 该 host 函数编译进 .so 后机器码的入口地址，是 value
+    - CUDA            → 分发键：在 CUDA 张量上调用时走这个实现
+    调用 torch.ops.myops.silu_and_mul(x,y) 时，Dispatcher 按
+    "myops::silu_and_mul" + 设备(CUDA) 查表拿到这个地址，跳进 .so 执行那段机器码。
+    （这正是 ../torch/_C扩展的Python调用过程.txt 里讲的 def/impl 机制的最小版；
+      也对应 vLLM torch_bindings.cpp 的 ops.def + ops.impl("...", TORCH_BOX(&fn))。）
+
+  【name 与 命名空间 是两回事】
+    load_inline(name="myops")  → 决定 .so 文件名 / 缓存目录名
+    TORCH_LIBRARY(myops, ...)  → 决定算子命名空间 torch.ops.myops
+    两者此处同名只是巧合，可以不同：把 name 改成 "my_build"，算子仍是
+    torch.ops.myops.silu_and_mul（取决于 TORCH_LIBRARY 第一个参数，与 .so 文件名无关）。
+    同理 register_fake("myops::silu_and_mul") 里的 myops 也对应 TORCH_LIBRARY，不是 name。
+
+    name 决定的构建产物布局：
+      ~/.cache/torch_extensions/pyXXX_cuXXX/myops/   ← 子目录名 = name
+          ├── myops.so                                ← .so 文件名 = name
+          ├── cuda.cu / main.cpp                       (生成的源码)
+          └── build.ninja ...
+      （上次清缓存 rm -rf ~/.cache/torch_extensions/*/myops* 匹配的就是这个 name）
+
+    两个 myops 来源对照：
+      ┌────────────────────────────────────────────┬─────────────────┬──────────────────────┐
+      │ myops 出现处                                │ 含义             │ 由谁决定              │
+      ├────────────────────────────────────────────┼─────────────────┼──────────────────────┤
+      │ load_inline(name="myops")                  │ .so文件名/缓存目录│ name 参数            │
+      │ TORCH_LIBRARY(myops,m)→torch.ops.myops.xxx │ 算子命名空间     │ TORCH_LIBRARY 第1参数│
+      └────────────────────────────────────────────┴─────────────────┴──────────────────────┘
+
+    is_python_module=False 的影响：
+      因设了 is_python_module=False，torch 不把 myops.so 当 Python 模块去 import，
+      而用 torch.ops.load_library() 纯 dlopen 它。所以这个 name：
+        ✅ 仍决定 .so 文件名 / 缓存目录名；
+        ❌ 不是一个能 import 的 Python 模块名（无 PyInit_myops，正是「六」修复的点）。
+
+    对照 vLLM（同一个道理）：
+      .so 文件名 _C   ← 由 CMake/setup 目标名决定 → import vllm._C 找它(dlopen)
+      namespace _C    ← 由 TORCH_LIBRARY(_C,...) 决定 → torch.ops._C 查表
+      vLLM 两者也恰好都叫 _C，但走不同机制：文件名管 import/dlopen，namespace 管查表。
+
+--------------------------------------------------------------------------------
+② search/replace —— Unfused / Fused replacement 的最小版
+--------------------------------------------------------------------------------
+  search_fn(x, y)  = F.silu(x) * y                    # 要被识别的分步子图
+  replace_fn(x, y) = torch.ops.myops.silu_and_mul(x,y)# 融合后的算子
+  对应 qk_norm_rope_fusion.py 注释里的 "Unfused" / "Fused replacement"。
+
+--------------------------------------------------------------------------------
+③ PatternMatcherPass —— 对应 QKNormRoPEFusionPass
+--------------------------------------------------------------------------------
+  vLLM 的 QKNormRoPEFusionPass 继承自 VllmPatternMatcherPass，
+  内部也是用 register_replacement 把规则塞进 PatternMatcherPass。
+  本例直接用同一套 PyTorch API：
+      register_replacement(search_fn, replace_fn, example_inputs, fwd_only, pm_pass)
+  fwd_only 表示只在前向图上匹配（对应 vLLM 的 pm.fwd_only）。
+
+--------------------------------------------------------------------------------
+④ post_grad hook —— 最关键的"钩子"
+--------------------------------------------------------------------------------
+  inductor_config.post_grad_custom_post_pass = custom_post_grad_pass
+  完全对应 vLLM backends.py:966：
+      self.inductor_config[self.pass_key] = self.pass_manager
+  Inductor 在 post-grad 阶段回调它，custom_post_grad_pass(graph) 调
+  pm_pass.apply(graph) 改图，对应 PostGradPassManager.__call__ 里
+  那个  for pass_ in self.passes: pass_(graph)  循环。
+
+--------------------------------------------------------------------------------
+⑤ torch.compile —— 对应 @support_torch_compile
+--------------------------------------------------------------------------------
+  torch.compile(model) 对应 @support_torch_compile 装饰。
+  首次调 compiled(x,y) 触发编译 → Dynamo 抓图 → Inductor 走到 post-grad
+  → 回调 hook → 子图被换成 torch.ops.myops.silu_and_mul
+  → 后续调用直接跑含 kernel 的编译产物。
+
+
+================================================================================
+四、运行时会发生什么
+================================================================================
+  compiled(x, y)  第一次
+     └─ Dynamo 抓出 FX 图：  t = silu(x);  out = t * y
+     └─ Inductor post-grad 阶段 → 回调 custom_post_grad_pass(graph)
+          └─ pm_pass.apply(graph)  匹配到 silu*y
+               → 改写成  out = torch.ops.myops.silu_and_mul(x, y)
+               → 打印 "[hook] 融合发生..."
+     └─ 编译完成，图里已是 kernel 调用
+
+  compiled(x, y)  之后
+     └─ 直接跑编译产物 → host 函数 → silu_and_mul_kernel 在 GPU 执行
+
+  model(x, y)  （不经 compile）
+     └─ 走 eager 的 F.silu(x)*y 两步，根本不碰这个 kernel
+
+
+================================================================================
+四点五、实跑输出实录（TORCH_LOGS="graph_code,aot_graphs,output_code"）
+================================================================================
+运行命令（注意用 graph_code，不是 graph——本机 graph 不打印图）：
+    TORCH_LOGS="graph_code,aot_graphs,output_code" python fused_silu_mul_compile_hook.py
+结果（成功）：
+    [hook] 融合发生：替换了 1 处 silu*y → silu_and_mul kernel
+    最大误差: 0.0
+    ✓ 编译后走的是自定义 CUDA kernel，结果与 eager 一致
+
+下面把各阶段产物按流水线顺序对照(均为本机真实输出，已精简日志前缀)。
+
+--------------------------------------------------------------------------------
+① 阶段① Dynamo FX 图（graph_code）—— 高层图，silu 还没拆
+--------------------------------------------------------------------------------
+  ★ 注意：本机 torch 版本下 TORCH_LOGS="graph" 不打印任何图(只剩程序结果)，
+          要看 Dynamo 抓的图请用 graph_code：
+            TORCH_LOGS="graph_code" python fused_silu_mul_compile_hook.py
+  输出（精简）：
+    class GraphModule(torch.nn.Module):
+        def forward(self, L_x_: "f32[4, 8]cuda", L_y_: "f32[4, 8]cuda"):
+            l_x_ = L_x_
+            l_y_ = L_y_
+            # File: ...:143  return F.silu(x) * y
+            silu = torch.nn.functional.silu(l_x_);  l_x_ = None   # 还是高层 silu
+            mul  = silu * l_y_;  silu = l_y_ = None                # 直接 *
+            return (mul,)
+  说明：这是 Dynamo 从 Python 字节码抓出的图，保留高层算子(torch.nn.functional.silu)，
+        尚未 decompose。L_x_/L_y_ 是输入占位(L 前缀=local 输入)。
+        与下面 ② 的 aot 图对比即可看到"silu 被拆成 neg/exp/add/div"的变化。
+  （想看抓图全过程用 TORCH_LOGS="+dynamo"：会打印 bytecode trace、guards、
+    编译耗时等 DEBUG 细节，图夹在其中，很啰嗦，排错才用。）
+
+--------------------------------------------------------------------------------
+② 阶段② AOTAutograd 图（aot_graphs）—— silu 被拆成 neg/exp/add/div + mul
+--------------------------------------------------------------------------------
+  def forward(self, arg0_1: "f32[4, 8]cuda", arg1_1: "f32[4, 8]cuda"):
+      # 源码：return F.silu(x) * y
+      neg = torch.ops.aten.neg.default(arg0_1)        # -x
+      exp = torch.ops.aten.exp.default(neg)           # e^(-x)
+      add = torch.ops.aten.add.Tensor(exp, 1)         # 1 + e^(-x)
+      div = torch.ops.aten.div.Tensor(arg0_1, add)    # x / (1+e^(-x)) = silu(x)
+      mul = torch.ops.aten.mul.Tensor(div, arg1_1)    # silu(x) * y
+      return (mul,)
+  说明：SiLU(x)=x·sigmoid(x)=x/(1+e^(-x))，被 decompose 成 4 个基础 aten 算子，
+        加最后的 mul 共 5 个节点。这就是"待匹配子图"。
+  （对比 ① 的 graph_code：那里还是一个高层 silu，这里已拆成 neg/exp/add/div；
+    aot_graphs 这张 decompose 后的 post-grad aten 图，才是 pass 真正匹配的对象。）
+
+--------------------------------------------------------------------------------
+③ 阶段③ post_grad 钩子命中 —— 5 个节点 → 1 个自定义算子
+--------------------------------------------------------------------------------
+  终端打印：
+      [hook] 融合发生：替换了 1 处 silu*y → silu_and_mul kernel
+  即 custom_post_grad_pass 里 pm_pass.apply(graph) 返回 count=1，
+  把上面 neg/exp/add/div/mul 整段替换成 torch.ops.myops.silu_and_mul。
+
+--------------------------------------------------------------------------------
+④ 阶段④ Inductor 生成的最终代码（output_code）—— 已是自定义 kernel 调用
+--------------------------------------------------------------------------------
+  落盘路径示例：/tmp/torchinductor_liam/a2/ca2ia6...py
+  核心 call()（精简）：
+      def call(self, args):
+          arg0_1, arg1_1 = args
+          args.clear()
+          assert_size_stride(arg0_1, (4, 8), (8, 1))      # 形状/stride 校验(guard)
+          assert_size_stride(arg1_1, (4, 8), (8, 1))
+          with torch.cuda._DeviceGuard(0):
+              torch.cuda.set_device(0)
+              arg0_1 = copy_misaligned(arg0_1)            # 对齐处理
+              arg1_1 = copy_misaligned(arg1_1)
+              # Topologically Sorted Source Nodes: [mul], Original ATen: [aten.mul]
+              buf0 = torch.ops.myops.silu_and_mul.default(arg0_1, arg1_1)  # ★调自定义算子
+              del arg0_1; del arg1_1
+              buf1 = buf0
+              assert_size_stride(buf1, (4, 8), (8, 1), 'torch.ops.myops.silu_and_mul.default')
+              assert_alignment(buf1, 16, 'torch.ops.myops.silu_and_mul.default')
+              del buf0
+          return (buf1, )
+  关键观察：
+    - 生成代码里【没有任何 Triton kernel】——因为整段计算已被替换成你手写的
+      torch.ops.myops.silu_and_mul，Inductor 直接生成"调用该算子"的代码即可，
+      无需再自动生成 Triton。
+    - 若没注册这条 pass，Inductor 会把 silu*y 自己融成一个 @triton.jit kernel
+      (那才会在 output_code 里看到 Triton 代码)。
+    - assert_size_stride/assert_alignment 是编译期 guard：保证运行时输入形状/对齐
+      与编译假设一致，否则触发重新编译。
+
+--------------------------------------------------------------------------------
+四阶段一图对照（本次实跑）
+--------------------------------------------------------------------------------
+  源码 F.silu(x)*y
+      │ ①Dynamo 抓图(graph_code)
+      ▼  silu(l_x_) ; silu * l_y_           (高层，silu 未拆)
+      │ ②AOT decompose(aot_graphs)
+      ▼  neg→exp→add→div→mul               (5个aten节点)
+      │ ③post_grad: pm_pass.apply → "[hook] 融合发生：替换了 1 处"
+      ▼  torch.ops.myops.silu_and_mul       (1个自定义算子)
+      │ ④Inductor codegen(output_code，无Triton，直接调自定义算子)
+      ▼  call(): buf0 = torch.ops.myops.silu_and_mul.default(arg0_1, arg1_1)
+  最终：最大误差 0.0，编译产物走自定义 CUDA kernel，与 eager 一致。
+  （流水线四阶段总览见 ../torch/torch_compile流水线.txt）
+
+  各阶段对应的 TORCH_LOGS 开关(本机实测)：
+    ① Dynamo 图    graph_code   ✅有输出 ；  graph ❌本版本不打印 ；  +dynamo=抓图DEBUG全程
+    ② AOT 图       aot_graphs   ✅
+    ③ post_grad    （脚本里 print）；也可 post_grad_graphs
+    ④ 最终代码      output_code  ✅
+
+
+================================================================================
+五、与本目录其他文档的关系
+================================================================================
+  - _C 扩展如何被 Python 调用（TORCH_LIBRARY → torch.ops）：
+        见 ../cmake/_C扩展的Python调用过程.txt
+  - cos_sin_cache 预计算与传入 kernel（data_ptr 零拷贝）：相同 host→kernel 机制
+  - 本例聚焦的是"编译期 hook 改图"这一环，即 vLLM 的
+        QKNormRoPEFusionPass → PostGradPassManager → post_grad_custom_post_pass
+
+
+================================================================================
+六、常见报错与解决：ImportError: ... does not define PyInit_myops
+================================================================================
+--------------------------------------------------------------------------------
+报错现场
+--------------------------------------------------------------------------------
+  $ TORCH_LOGS="graph" python fused_silu_mul_compile_hook.py
+  ...
+  File ".../torch/utils/cpp_extension.py", line 2820, in _import_module_from_library
+      module = importlib.util.module_from_spec(spec)
+  ImportError: dynamic module does not define module export function (PyInit_myops)
+
+--------------------------------------------------------------------------------
+根本原因
+--------------------------------------------------------------------------------
+  CUDA_SRC 里只用了 TORCH_LIBRARY 注册算子，没有 pybind11 的模块定义：
+      TORCH_LIBRARY(myops, m)      { ... }   // 注册到 torch dispatcher
+      TORCH_LIBRARY_IMPL(myops, CUDA, m) { ... }
+
+  而 load_inline 默认按"Python 扩展模块"来构建和导入 .so。一个能被 import 的
+  Python 扩展，.so 里必须有一个 PyInit_myops 入口函数。这个入口来自两处之一：
+      1) 你传了 functions=[...]，load_inline 自动生成 PYBIND11_MODULE；
+      2) 你自己在源码里写了 PYBIND11_MODULE(myops, m)。
+  本例两者都没有（cpp_sources=""、没有 functions=），所以编译出的 .so 里
+  只有 TORCH_LIBRARY 的静态注册符号，没有 PyInit_myops。最后 load_inline 用
+  importlib 把它当 Python 模块导入 → 找不到入口 → 报 PyInit_myops 缺失。
+
+--------------------------------------------------------------------------------
+关键认识：TORCH_LIBRARY 的算子不需要"当 Python 模块导入"
+--------------------------------------------------------------------------------
+  本例的目标是 torch.ops.myops.silu_and_mul，算子是注册到 torch dispatcher 的。
+  只需要 .so 被 dlopen（加载即触发静态注册），根本不需要它是个 Python 模块。
+  load_inline 正好有个参数控制这件事：is_python_module=False。
+  设为 False 时，torch 改用 torch.ops.load_library()（纯 dlopen）来加载，
+  不再要求 PyInit_xxx。
+
+--------------------------------------------------------------------------------
+修复（已应用到 .py 第 63-70 行）
+--------------------------------------------------------------------------------
+  load_inline(
+      name="myops",
+      cpp_sources="",
+      cuda_sources=CUDA_SRC,
+      with_cuda=True,
+      is_python_module=False,   # 关键：只 dlopen 触发 TORCH_LIBRARY 注册，不当 Python 模块
+      verbose=False,            # 否则会找 PyInit_myops，而本源码只有 TORCH_LIBRARY
+  )
+
+  还要清掉旧的构建缓存（上次失败可能在缓存目录留下不匹配的 .so，重跑会被复用）：
+      rm -rf ~/.cache/torch_extensions/*/myops*
+  然后重跑：
+      TORCH_LOGS="graph" python fused_silu_mul_compile_hook.py
+
+--------------------------------------------------------------------------------
+与 vLLM `import vllm._C` 的对应关系（细微差别）
+--------------------------------------------------------------------------------
+  - vLLM 的 _C 既有 TORCH_LIBRARY 注册算子，也有 pybind11 模块定义，
+    所以它能被 import vllm._C（有 PyInit__C），import 的副作用同时触发算子注册。
+  - 本最小复刻只有 TORCH_LIBRARY、没有 pybind 层，所以走 is_python_module=False
+    的纯加载路径更贴切——也确实不需要 import myops，只用 torch.ops.myops.silu_and_mul。
+
+  另一种改法（若想更严格模仿 vLLM "import 即注册"形态）：给源码加一行空 pybind 模块
+      PYBIND11_MODULE(myops, m) {}   // 仅提供 PyInit_myops 入口；算子仍由 TORCH_LIBRARY 注册
+  这样保持默认 is_python_module=True 也能跑通。两种改法二选一，
+  is_python_module=False 更简洁。
+
+
+================================================================================
+七、常见报错与解决：UnsupportedOperatorException: myops.silu_and_mul
+================================================================================
+（解决了六之后会遇到的下一个报错——缺 fake/meta 实现）
+
+--------------------------------------------------------------------------------
+报错现场
+--------------------------------------------------------------------------------
+  $ TORCH_LOGS="graph,aot_graphs,output_code" python fused_silu_mul_compile_hook.py
+  ... (eager 那步 ref = model(x,y) 成功) ...
+  out = compiled(x, y)   # ← 编译期失败
+  ...
+  File ".../_inductor/pattern_matcher.py", in fwd_only
+      gm = make_fx(fn, get_decomp_fn(), tracing_mode="real")(*args)
+  File ".../fused_silu_mul_compile_hook.py", line 80, in replace_fn
+      return torch.ops.myops.silu_and_mul(x, y)
+  ...
+  File ".../_subclasses/fake_tensor.py", in maybe_run_unsafe_fallback
+      raise UnsupportedOperatorException(func)
+  torch._inductor.exc.InductorError:
+      UnsupportedOperatorException: myops.silu_and_mul.default
+
+--------------------------------------------------------------------------------
+根本原因：缺 fake（meta）实现
+--------------------------------------------------------------------------------
+  触发点：pattern matcher 在 fwd_only 里用 make_fx 去 trace replace_fn 时，
+          调用了 torch.ops.myops.silu_and_mul(x, y)，此时 x/y 是 FakeTensor
+          （假张量，只有 shape/dtype，没有真实显存）。
+  本算子只注册了 CUDA 真实现（TORCH_LIBRARY_IMPL(myops, CUDA)），
+  没有 fake/meta 实现 → FakeTensor 分发找不到"不真算、只推断输出形状"的实现
+  → 抛 UnsupportedOperatorException。
+
+  注意：eager 那步 ref = model(x,y) 是成功的（真张量→真跑 CUDA kernel）。
+        失败只发生在 compiled(x,y) 的编译期——torch.compile 要在不碰 GPU 的
+        情况下推断张量元信息，这就需要 fake 实现。
+
+--------------------------------------------------------------------------------
+对应 vLLM 的哪一块
+--------------------------------------------------------------------------------
+  这正是 ../torch/vllm自定义算子调用链路.txt 里讲的第三块：
+      csrc/libtorch_stable/torch_bindings.cpp:590
+        STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) { ... }
+      以及 vllm/_custom_ops.py 里的 @register_fake("_C::xxx")
+  结论：任何要走 torch.compile 的自定义算子，都必须配一个 fake 实现。
+        本最小复刻一开始漏了这块，所以补上才能编译通过。
+
+--------------------------------------------------------------------------------
+修复（已应用到 .py，load_inline 之后）
+--------------------------------------------------------------------------------
+  # fake（meta）实现：只推断输出 shape/dtype，不真算 —— torch.compile 必需
+  @torch.library.register_fake("myops::silu_and_mul")
+  def _silu_and_mul_fake(x, y):
+      return torch.empty_like(x)    # 逐元素算子：输出形状/类型与 x 相同
+
+  要点：
+    - 注册名 "myops::silu_and_mul" 与 TORCH_LIBRARY(myops) + def 的名字一致。
+    - 函数体不做真实计算，只返回一个"形状/ dtype 正确"的（fake）张量。
+    - 必须在 load_inline（算子已注册）之后再 register_fake。
+
+  补上后再跑即可看到 [hook] 融合发生 与 ✓ 结果一致。
+
+
+--------------------------------------------------------------------------------
+补充：改完 fake 后还要 rm 清缓存吗？——不用
+--------------------------------------------------------------------------------
+  这次改的是纯 Python 的 register_fake，没动 CUDA 源码，直接重跑即可。
+  涉及两个不同的缓存，都不需要清：
+
+    ┌──────────────────────┬────────────────────────────┬──────────┐
+    │ 缓存                  │ 位置                        │ 这次要清吗│
+    ├──────────────────────┼────────────────────────────┼──────────┤
+    │ CUDA 扩展编译缓存     │ ~/.cache/torch_extensions/  │ ❌ 不用  │
+    │ (myops.so)           │                            │          │
+    │   原因：register_fake 是 Python，CUDA_SRC 没改，.so 仍正确，  │
+    │         复用更快(省去重新 nvcc)。                            │
+    ├──────────────────────┼────────────────────────────┼──────────┤
+    │ Inductor 编译缓存     │ /tmp/torchinductor_<user>/  │ ❌ 不用  │
+    │   原因：上次是编译失败，失败不会被缓存(只缓存成功产物)，      │
+    │         没有"坏条目"会被复用。                              │
+    └──────────────────────┴────────────────────────────┴──────────┘
+
+  上次（六）为什么要清：第一次构建生成了一个不含 PyInit_myops 的残缺 .so
+  并被缓存，重跑会复用这个坏 .so → 仍报错。那是"缓存里留了坏产物"才需手动清。
+
+  什么时候才需要手动清：
+    - 改了 CUDA_SRC：通常不用手动清——load_inline 对源码哈希，源码一变会自动重编；
+      只有缓存进入残缺/不一致状态(像六那样)才手动 rm。
+    - 想强制重编排查：
+        rm -rf ~/.cache/torch_extensions/*/myops*    # CUDA 扩展
+        TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 python ...  # Inductor
+
+
+================================================================================
+八、附：at::Tensor 与 torch::Tensor 是同一个类型
+================================================================================
+（本例 CUDA_SRC 的 host 函数用 at::Tensor，这里解释为何与 torch::Tensor 等价）
+
+  C++ 里写张量类型时常见两种：at::Tensor 和 torch::Tensor，它们是【同一个类型】。
+  PyTorch 头文件(torch/csrc/api/include/torch/types.h 附近)里有：
+      namespace torch { using at::Tensor; /* 还有 at::Scalar 等一大批 */ }
+  即 torch::Tensor 只是 at::Tensor 的 using 别名：
+      static_assert(std::is_same_v<at::Tensor, torch::Tensor>);   // 成立
+
+  两层命名空间：
+      at::    = ATen(A Tensor library)——张量类型/算子的"本体"定义处
+      torch:: = libtorch 总命名空间，在 at:: 之上 re-export
+
+  写哪个只是风格：
+      at::Tensor    贴近底层(kernel 实现、配 at::empty_like)——PyTorch 内部源码常用
+      torch::Tensor 上层/对外 API 风格——教程、面向用户的扩展常用
+  两者混用也合法(同类型)，只是看着不统一。本例 host 函数 silu_and_mul 用 at::Tensor，
+  即贴近底层风格；换成 torch::Tensor 一字不差也能编译。
+
+  两个易混点：
+    1) torch::tensor(小写 t) 是"造张量的工厂函数"(torch::tensor({1,2,3}))，
+       不是类型；类型是大写 Tensor。
+    2) torch::stable::Tensor 是另一回事——稳定 ABI 版张量类型(跨 torch 版本兼容)，
+       专为 STABLE_TORCH_LIBRARY 设计，和 at::Tensor/torch::Tensor 不是别名关系。
+       vLLM 的 fused_qknorm_rope_kernel.cu host 函数用的就是 torch::stable::Tensor。
+
+
+================================================================================
+九、一句话总结
+================================================================================
+  这份骨架完整保留了 vLLM 的三段式：
+      eager 写分步算子  →  compile 时 hook（post_grad pass）模式匹配改图
+                        →  替换成自定义 CUDA kernel 调用。
+  hook 的落点就是 Inductor 的 post_grad_custom_post_pass，
+  与 vLLM 把 PostGradPassManager 挂到同一钩子如出一辙。

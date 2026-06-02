@@ -1,0 +1,499 @@
+================================================================================
+   把 C++/CUDA 暴露给 Python 的两条路：
+       TORCH_LIBRARY / TORCH_LIBRARY_IMPL   vs   PYBIND11_MODULE
+================================================================================
+
+两者都来自 <torch/extension.h>，都能让 Python 调到 C++/CUDA 函数，
+但走的是【两套完全不同的机制】，用途、调用方式、能力都不同：
+
+  PYBIND11_MODULE   → 造一个"Python 扩展模块"，函数挂在模块对象上
+                      Python 用  import 模块; 模块.func(x)  调用
+  TORCH_LIBRARY     → 把函数注册进"PyTorch 算子表(Dispatcher)"
+                      Python 用  torch.ops.<命名空间>.<算子>(x)  调用
+
+vLLM 的核心扩展 _C 走的是 TORCH_LIBRARY 这条；很多教学/小项目用 PYBIND11。
+本文逐个解析宏、参数、用法，并把两条路并排对比。
+
+
+================================================================================
+一、PYBIND11_MODULE —— 造一个 Python 扩展模块
+================================================================================
+用户给的例子：
+    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+    {
+      // m.def：将 C++ 函数注册为 Python 可调用对象
+      //   · "LayerNorm"      — Python 侧的函数名：模块.LayerNorm(x)
+      //   · &LayerNorm_cuda  — C++ 函数指针（不写 & 也会隐式退化为指针，效果相同）
+      //   · "LayerNorm (CUDA)" — docstring，help(模块.LayerNorm) 可见
+      // pybind11 自动处理 torch::Tensor ↔ Python tensor 的类型转换，
+      // 两侧共享同一块 GPU 内存，无数据拷贝
+      m.def("LayerNorm", &LayerNorm_cuda, "LayerNorm (CUDA)");
+    }
+
+宏与参数：
+  PYBIND11_MODULE(name, m)
+    - name : 生成的 Python 模块名。必须与编译出的 .so 文件名一致，
+             因为它展开后会生成入口函数  PyInit_<name>，
+             Python import 这个 .so 时就找这个入口。
+             常写成 TORCH_EXTENSION_NAME —— 这是构建系统(setup.py/CMake)
+             注入的宏，值等于扩展名（vLLM 里 -DTORCH_EXTENSION_NAME=_C）。
+             这样模块名永远和 .so 文件名对齐，不会写错。
+    - m    : pybind11::module_ 句柄，往它上面 def 函数/类。
+
+  m.def(py_name, func_ptr, doc)
+    - py_name  : Python 侧函数名（模块.py_name(...) 调用）
+    - func_ptr : C++ 函数指针，如 &LayerNorm_cuda；
+                 类型要匹配，如 torch::Tensor (*)(torch::Tensor)
+    - doc      : 可选 docstring
+
+调用方（Python）：
+    import mymodule                 # 触发下面 5 步，最终拿到模块对象
+    y = mymodule.LayerNorm(x)       # 直接调模块上的函数
+
+  import mymodule 到底发生了什么（5 步）：
+    ① 查找 .so：Python 在 sys.path 里找名为 mymodule 的扩展，
+       定位到 mymodule.cpython-3xx-<平台>.so（文件名主干必须 = 模块名 mymodule）。
+    ② dlopen：操作系统把这个 .so 用 dlopen 映射进当前进程的虚拟内存
+       （= 加载共享库，解析符号、跑静态初始化）。
+    ③ 找入口函数：Python 在 .so 里查找名为 PyInit_mymodule 的导出函数。
+       这个函数由 PYBIND11_MODULE(mymodule, m) 宏展开生成；
+       函数名必须是 PyInit_<模块名>，所以"模块名 = .so 文件名"是硬性对齐要求。
+       找不到 → 报 "does not define module export function (PyInit_mymodule)"。
+    ④ 执行 PyInit_：调用它，pybind11 在此创建一个 Python module 对象，
+       并把 PYBIND11_MODULE 大括号里所有 m.def(...) 注册的函数挂到该模块对象上。
+    ⑤ 绑定名字：Python 把返回的 module 对象绑定到变量 mymodule，
+       并缓存进 sys.modules（下次 import 直接复用，不再 dlopen）。
+    之后 mymodule.LayerNorm 就是 ④ 里挂上去的那个可调用对象。
+
+  对比 TORCH_LIBRARY 的 import（见三）：
+    那条路 import 的目的【不是】拿模块对象，而仅仅是借 ② dlopen 触发
+    .so 里 TORCH_LIBRARY* 的静态注册(把算子登记进 Dispatcher)；
+    它甚至不需要 ③④ 的 PyInit（可用 torch.ops.load_library() 纯 dlopen）。
+    pybind 这条路则真的要 ③④ 生成并返回模块对象，因为你要用 mymodule.func。
+
+机制要点：
+    - .so 必须含 PyInit_<name>，否则 import 报
+      "dynamic module does not define module export function (PyInit_xxx)"。
+    - 调用是普通的"模块属性 → C++ 函数"直调，pybind11 负责
+      Python对象 ↔ C++类型(torch::Tensor 等) 的双向转换。
+    - 不接入 PyTorch Dispatcher：没有按设备分发、没有 autograd 注册、
+      torch.compile 也无法把它当成图里的算子来 trace。
+
+
+================================================================================
+二、TORCH_LIBRARY —— 定义一个算子库(命名空间)并声明/实现算子
+================================================================================
+    TORCH_LIBRARY(myops, m) {
+        // def 只声明 schema：算子名 + 参数类型 + 返回类型（不绑实现）
+        m.def("silu_and_mul(Tensor x, Tensor y) -> Tensor");
+    }
+
+宏与参数：
+  TORCH_LIBRARY(ns, m)
+    - ns : 算子【命名空间】名（不是 .so 文件名！）→ 对应 torch.ops.<ns>
+           例：ns=myops → torch.ops.myops.*
+    - m  : torch::Library 句柄，往它上面 def / impl 算子
+    - 约束：同一个 ns 在一个进程里【只能 TORCH_LIBRARY 一次】
+            （要拆到多文件/多片段，用 TORCH_LIBRARY_FRAGMENT，见五）
+
+  m.def(schema_string)
+    - schema_string : 算子签名字符串，PyTorch 自定义的 schema 语法：
+        "name(Tensor x, Tensor! y, int n, float eps, bool b, Tensor? o) -> Tensor"
+        · Tensor    普通张量输入
+        · Tensor!   原地修改的张量（带感叹号）→ 影响 functionalize
+        · Tensor?   可选张量（可为 None）
+        · int/float/bool/str/Tensor[]/int[] ... 标量与列表类型
+        · -> Tensor / -> (Tensor, Tensor) / -> ()   返回类型，()=无返回
+        · 可带默认值：  int forced=-1
+    - 注意：这里只"声明有这么个算子，长这样"，不含任何 C++ 实现。
+            实现由 TORCH_LIBRARY_IMPL 的 m.impl 提供（见三）。
+
+  m.def(name, &func)  —— 另一种形态（声明+实现合一）
+    - 若直接给函数指针，PyTorch 把它注册为 CompositeImplicitAutograd 实现
+      （设备无关、可被自动微分分解）。适合纯组合、不需按设备特化的算子。
+    - 需要按设备(CPU/CUDA)分别实现时，用 def(schema) + impl(见三) 的分离写法。
+
+
+================================================================================
+三、TORCH_LIBRARY_IMPL —— 为某个"分发键"绑定实现
+================================================================================
+    TORCH_LIBRARY_IMPL(myops, CUDA, m) {
+        // impl 把【字符串名】绑定到【函数地址】，并打上分发键 CUDA
+        m.impl("silu_and_mul", &silu_and_mul);
+    }
+
+宏与参数：
+  TORCH_LIBRARY_IMPL(ns, DispatchKey, m)
+    - ns          : 命名空间（要和 TORCH_LIBRARY 的 ns 一致）
+    - DispatchKey : 分发键，决定"什么情况下走这个实现"，常见：
+        · CPU                       张量在 CPU 上时
+        · CUDA                      张量在 CUDA(GPU) 上时
+        · Meta                      只算 shape/dtype 不真算（旧式 meta）
+        · CompositeExplicitAutograd 设备无关的显式实现；常用来登记 fake/meta，
+                                    torch.compile 在 FakeTensor 上推断形状时用它
+        · CompositeImplicitAutograd 设备无关、可被 autograd 自动分解
+        · Autograd                  自定义反向
+    - m           : torch::Library 句柄
+    - 约束：同一个 ns 可以有【多个】TORCH_LIBRARY_IMPL（不同设备/键各一个）
+
+  m.impl(name, func)
+    - name : 算子名（与 def 里声明的名字一致），内部组合成全名 ns::name
+    - func : C++ 实现的函数指针，如 &silu_and_mul
+             （稳定 ABI 版用 TORCH_BOX(&fn) 包一层）
+    ★ 绑定本质：name(字符串, 查表 key) → &func(函数机器码入口地址, value)
+      运行时 torch.ops.ns.name(x) 按 [ns::name + 张量设备] 查表拿到地址，
+      跳进 .so 执行那段机器码。这就是"名字 ↔ 函数地址"的绑定。
+
+调用方（Python）：
+    import vllm._C                      # = dlopen .so，触发上面所有 TORCH_LIBRARY* 注册
+    torch.ops.myops.silu_and_mul(x, y)  # 按 "myops::silu_and_mul"+设备 查表调用
+
+机制要点：
+    - TORCH_LIBRARY* 块本质是【静态初始化对象】，.so 被 dlopen 的瞬间自动执行，
+      把算子登记进 PyTorch 全局 Dispatcher。所以"import 只是为了触发注册"。
+    - 不需要 PyInit：算子不是 Python 模块成员，是注册到 Dispatcher 的。
+      因此可用 torch.ops.load_library() 纯 dlopen（is_python_module=False）。
+    - 接入 Dispatcher，天然支持：按设备分发、autograd、functionalize、
+      以及 torch.compile（前提是注册了 fake/meta 实现）。
+
+
+================================================================================
+四、def / impl 的分工（一句话）
+================================================================================
+    m.def   声明"有这么个算子，签名长这样"（schema）—— 给类型系统/compile/autograd 看
+    m.impl  绑定"这个算子在某设备上的真实现"（name → 函数地址 + 分发键）
+  Dispatcher 调用时按【算子名 + 张量设备】两个维度查表，
+  所以同名算子能为 CPU / CUDA / Meta 各注册不同实现。
+
+
+================================================================================
+五、TORCH_LIBRARY_FRAGMENT —— 同一命名空间分多处注册
+================================================================================
+  TORCH_LIBRARY(ns,...) 一个 ns 只能写一次；但大型项目(如 vLLM)的算子分散在
+  多个文件、或要往内置命名空间(aten)里加，就用 FRAGMENT：
+      TORCH_LIBRARY_FRAGMENT(_C, ops) { ops.def(...); ... }   // 可出现多次
+  vLLM 的 csrc/libtorch_stable/torch_bindings.cpp 用的就是
+      STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops)   // 稳定 ABI + 可分片
+  含义同 TORCH_LIBRARY，只是允许同名空间多个片段。
+
+
+================================================================================
+六、两条路并排对比
+================================================================================
+  ┌────────────────────┬──────────────────────────┬──────────────────────────────┐
+  │                    │ PYBIND11_MODULE          │ TORCH_LIBRARY / _IMPL        │
+  ├────────────────────┼──────────────────────────┼──────────────────────────────┤
+  │ 产物本质           │ 一个 Python 扩展模块      │ 注册进 PyTorch 算子表        │
+  │ Python 调用        │ import mod; mod.func(x)  │ torch.ops.ns.op(x)           │
+  │ .so 入口           │ 需要 PyInit_<name>       │ 不需要(靠 dlopen 静态注册)   │
+  │ name/ns 含义       │ name=模块名=.so文件名    │ ns=命名空间(与.so文件名无关) │
+  │ 加载方式           │ 必须当 Python 模块 import│ import 或 torch.ops.         │
+  │                    │                          │   load_library() 纯 dlopen   │
+  │ 按设备分发         │ ❌ 无                    │ ✅ CPU/CUDA/Meta... 各注册    │
+  │ autograd 集成      │ ❌ 手动                  │ ✅ Autograd 键               │
+  │ functionalize      │ ❌                       │ ✅ schema 的 Tensor! 支持    │
+  │ torch.compile 可见 │ ❌ 不被当成图算子        │ ✅ 可 trace(需 fake/meta)    │
+  │ 类型转换           │ pybind11 自动            │ Dispatcher/boxing 自动       │
+  │ 返回任意 Python 对象│ ✅ 灵活                  │ 受 schema 类型约束           │
+  │ 适合               │ 工具函数/一次性调用/原型 │ 要进计算图、要编译/分发的算子│
+  └────────────────────┴──────────────────────────┴──────────────────────────────┘
+
+  关键差异一句话：
+    PYBIND11 把函数挂到"一个 Python 模块"上，是普通函数直调；
+    TORCH_LIBRARY 把函数注册到"PyTorch 全局算子表"，是按"算子名+设备"查表分发，
+    因而能融入 autograd / functionalize / torch.compile —— 这正是深度学习算子需要的。
+
+
+================================================================================
+七、为什么 vLLM 的核心算子用 TORCH_LIBRARY 而非 PYBIND11
+================================================================================
+  vLLM 的 _C 算子要：
+    1) 进入计算图，被 torch.compile 融合/优化(如 fused_qk_norm_rope)；
+    2) 按设备分发(CUDA 实现 + fake/meta 实现)；
+    3) 配合 functionalize(原地写的算子 schema 用 Tensor!)；
+    4) 跨 torch 版本稳定(STABLE_TORCH_LIBRARY)。
+  这些都依赖 Dispatcher，只有 TORCH_LIBRARY 这条路提供。PYBIND11 的直调函数
+  无法被当成图里的算子来 trace/融合，故不适合做核心计算算子。
+
+  注：vLLM 的 _C 其实两者都有——
+      pybind11 模块定义(提供 PyInit__C，使 import vllm._C 成立)
+      + TORCH_LIBRARY 注册算子(供 torch.ops._C.* 调用)。
+      import 的副作用同时触发了算子注册。
+  （对照最小复刻 ../fork/fused_silu_mul_compile_hook.py：只有 TORCH_LIBRARY、
+    没有 pybind 层，所以用 is_python_module=False 走纯 dlopen，不需要 PyInit。）
+
+
+================================================================================
+八、最小可运行对照（两种写法实现同一个 LayerNorm）
+================================================================================
+  约定：下面 .so 文件名一律叫 my_ext（构建系统决定），
+        命名空间叫 myops（TORCH_LIBRARY 决定）。二者是两根独立的轴，故意取不同名以免混淆。
+
+  -- 写法 A：PYBIND11（直调）---------------------------------------------------
+    torch::Tensor LayerNorm_cuda(torch::Tensor x) { ... }
+    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {   // 模块名=.so文件名=my_ext(对齐要求)
+        m.def("LayerNorm", &LayerNorm_cuda, "LayerNorm (CUDA)");
+    }
+    # Python:
+    import my_ext                # my_ext = .so 文件名/模块名
+    y = my_ext.LayerNorm(x)      # 调用也用 my_ext（函数挂在这个模块对象上）
+
+  -- 写法 B：TORCH_LIBRARY（进 Dispatcher）------------------------------------
+    torch::Tensor LayerNorm_cuda(torch::Tensor x) { ... }
+    TORCH_LIBRARY(myops, m) {                    // myops = 命名空间(≠ .so 文件名)
+        m.def("LayerNorm(Tensor x) -> Tensor");          // 声明 schema
+    }
+    TORCH_LIBRARY_IMPL(myops, CUDA, m) {
+        m.impl("LayerNorm", &LayerNorm_cuda);            // 绑定 CUDA 实现
+    }
+    # Python:
+    torch.ops.load_library("my_ext.so")   # 用【.so 文件名 my_ext】加载，触发注册
+    y = torch.ops.myops.LayerNorm(x)       # 用【命名空间 myops】调用(来自 TORCH_LIBRARY)
+
+  ★ 注意写法 B 的两个名字是两根独立的轴：
+      my_ext  = .so 文件名   → 决定"加载/dlopen 哪个文件"(load_library/import 用它)
+      myops   = 命名空间     → 决定"torch.ops 查哪个子表"(TORCH_LIBRARY 第1参数决定)
+    TORCH_LIBRARY 只决定 myops，【不决定 .so 文件名】；.so 文件名由构建系统
+    (setup.py/CMake/load_inline(name=)) 决定。所以不能写 import myops/load myops——
+    myops 不是文件；调用也不写 my_ext——my_ext 不是命名空间。
+
+  ★ 为什么不写 import my_ext（而用 load_library）：
+    写法 B 的 .so 只有 TORCH_LIBRARY、没有 PYBIND11_MODULE → 没有 PyInit_my_ext，
+    直接 import my_ext 会报 "does not define PyInit_my_ext"(即「六」那个错)。
+    所以纯 TORCH_LIBRARY 的库要么用 torch.ops.load_library() 纯 dlopen(推荐)，
+    要么再补一个空 pybind 模块 PYBIND11_MODULE(my_ext, m) {} 才能 import。
+    （vLLM 的 _C 正是后者：pybind 模块 + TORCH_LIBRARY 都有，故 import vllm._C 合法，
+      且 import 的副作用触发算子注册。）
+
+  对比写法 A：A 里 .so 文件名/模块名/调用名被强制绑成同一个 my_ext(一根轴)，
+    因为 pybind 把函数挂在"模块对象"上，模块名又必须=PyInit_<name>=.so文件名。
+
+  同一个 C++ 函数 LayerNorm_cuda：
+    A 把它挂到 Python 模块 my_ext 上(my_ext.LayerNorm)；
+    B 把它注册成算子 myops::LayerNorm(torch.ops.myops.LayerNorm)，可进图、可分发。
+    （A 的"加载名=调用名"是一根轴；B 的"加载名 my_ext ≠ 调用名 myops"是两根轴。）
+
+
+================================================================================
+九、一句话总结
+================================================================================
+  PYBIND11_MODULE(name, m) + m.def(pyname,&fn,doc)：
+      造一个 Python 扩展模块(需 PyInit_<name>)，函数普通直调 mod.pyname(x)。
+  TORCH_LIBRARY(ns,m)+m.def(schema) / TORCH_LIBRARY_IMPL(ns,Key,m)+m.impl(name,&fn)：
+      把算子注册进 PyTorch Dispatcher，按"ns::name + 设备"查表，
+      torch.ops.ns.name(x) 调用；天然支持设备分发/autograd/functionalize/torch.compile。
+  深度学习要进计算图、要编译/分发的算子用 TORCH_LIBRARY；
+  普通工具函数/原型/返回任意 Python 对象用 PYBIND11。
+
+
+
+================================================================================
+十一、".so 文件名"这根轴在不同构建系统里对应什么（含 lib 前缀坑）
+================================================================================
+  前面反复强调"文件名轴(加载名)"与"命名空间轴(调用名)"是两根独立的轴。
+  这里把【文件名轴】在三种构建方式里的来源列清楚——它就是前文 my_ext 那根轴。
+
+  ┌──────────────────────────────┬────────────────────┬─────────────────────────┐
+  │ 构建方式                      │ 文件名轴由谁决定    │ 实际产物 .so            │
+  ├──────────────────────────────┼────────────────────┼─────────────────────────┤
+  │ load_inline(name="myops")     │ name 参数           │ myops.so                │
+  │ add_library(ROPE_cuda SHARED)│ 目标名 ROPE_cuda    │ libROPE_cuda.so ★加lib   │
+  │ Python_add_library(_C ...)    │ 目标名 _C           │ _C.cpython-3xx-...-.so   │
+  │ (vLLM)                        │                    │                         │
+  └──────────────────────────────┴────────────────────┴─────────────────────────┘
+  三者都决定"编译出的 .so 叫什么 / dlopen 加载哪个文件"，
+  都【与 TORCH_LIBRARY 的命名空间无关】(命名空间由源码里 TORCH_LIBRARY(xxx) 定)。
+
+  ★ CMake 默认加 lib 前缀：
+      add_library(ROPE_cuda SHARED src/interface.cpp src/run_kernel.cu)
+        - 目标名(target name) = ROPE_cuda（CMake 里引用它用这个）
+        - 实际输出文件 = libROPE_cuda.so（Linux 默认加 lib 前缀 + .so 后缀，
+                          不是 ROPE_cuda.so）
+      加载时要用真实文件名：
+        torch.ops.load_library("/path/libROPE_cuda.so")   # 加载名带 lib
+        y = torch.ops.rope_ops.layernorm(x)               # 命名空间来自 interface.cpp 的
+                                                          #   TORCH_LIBRARY(rope_ops,...)
+                                                          #   ≠ ROPE_cuda
+
+  去掉 lib 前缀（让文件就叫 ROPE_cuda.so）：
+      set_target_properties(ROPE_cuda PROPERTIES PREFIX "")
+
+  想 import ROPE_cuda（当 Python 扩展模块）——光改文件名不够，还需要：
+      1) 源码里有 PYBIND11_MODULE(ROPE_cuda, m)（提供 PyInit_ROPE_cuda）；
+      2) 文件名带正确 SOABI 后缀（ROPE_cuda.cpython-3xx-...-.so）。
+      否则只能 torch.ops.load_library() 纯 dlopen（纯 TORCH_LIBRARY 的库走这条）。
+      这正是 vLLM 用 Python_add_library（自动处理空前缀 + SOABI 后缀）而非裸
+      add_library 的原因——它要让 _C 能被 import vllm._C。
+
+  三根名字串起来看：
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ 加载名(文件名轴) → 决定 dlopen 哪个文件                            │
+    │   load_inline name="myops"   → myops.so                          │
+    │   add_library  ROPE_cuda     → libROPE_cuda.so                   │
+    │   Python_add_library _C      → _C.cpython-...so                  │
+    ├──────────────────────────────────────────────────────────────────┤
+    │ 命名空间(调用轴) → 决定 torch.ops.<这里>                          │
+    │   由源码 TORCH_LIBRARY(<命名空间>) 决定，与上面文件名无关          │
+    ├──────────────────────────────────────────────────────────────────┤
+    │ (仅 pybind) 模块名 → 决定 import <这里> 和 PyInit_<这里>           │
+    │   PYBIND11_MODULE(<模块名>)，且必须 = 文件名主干                  │
+    └──────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+十二、.so 的"路径要求"——三种加载情况对比
+================================================================================
+  "路径要求"指：编译出的 .so 要放在哪、Python 才能加载到它。三种加载方式要求不同。
+  本节详述前两种(预编译 .so)，第三种(load_inline)见 ./torch.load_inline.txt。
+
+  情况 1：torch.ops.load_library(path)  —— 预编译 .so + TORCH_LIBRARY
+  --------------------------------------------------------------------------------
+    用法：
+        import torch
+        torch.ops.load_library("/任意/路径/任意名.so")   # 显式给路径
+        torch.ops.<命名空间>.<算子>(...)
+
+    .so 路径要求：
+      - 位置：【任意目录】。无需在 sys.path / PYTHONPATH 上，更【不需】放进 torch
+              安装目录；load_library() 直接收【绝对或相对路径】。
+      - 文件名：【任意】。与命名空间、算子名完全解耦（命名空间由 TORCH_LIBRARY(ns)
+                决定，见二/八）。叫 libfoo.so、bar.so 都行。
+      - 运行期依赖：加载前先 `import torch`，使 libtorch*/libc10* 等先入进程，
+                    你的 .so 被 dlopen 时符号才解析得了（否则需 RPATH 或 LD_LIBRARY_PATH）。
+      → 最灵活：位置/文件名都不限，给对路径即可。
+
+    ★ 补充 1：TORCH_LIBRARY 也可以【用 import 代替 load_library】（条件见下）
+      原理：TORCH_LIBRARY 的注册是在 .so 被【dlopen】的瞬间由静态初始化器触发的，
+            与"谁触发 dlopen"无关。而 import 本身也会 dlopen 这个 .so，故 import 会
+            "顺带"把 TORCH_LIBRARY 算子注册进 Dispatcher：
+
+            torch.ops.load_library("x.so") ─┐
+                                            ├─► dlopen x.so ─► 静态注册器运行
+            import x                        ─┘                ─► torch.ops.<ns>.<op> 可用
+
+      条件：能 import 的前提是该 .so【可被 import】——必须含 PYBIND11_MODULE 提供
+            PyInit_<name>、文件名带 SOABI、且在 sys.path 上（即同时满足情况 2）。
+        - 纯 TORCH_LIBRARY、无 pybind 的 .so：没有 PyInit → import 直接报错
+          "does not define PyInit_<name>" → 只能用 torch.ops.load_library()。
+        - 同时含 PYBIND11_MODULE 的 .so（如本项目 interface.cpp）：import 即可，
+          一句 `import ROPE_cuda` 同时①导入 pybind 模块 ②dlopen 副作用触发算子注册，
+          于是 ROPE_cuda.run_fused_QKNorm_and_ROPE() 与
+          torch.ops.ROPE_cuda.run_fused_QKNorm_and_ROPE() 两种调用都可用。
+        （这正是 import vllm._C 能让 torch.ops._C.* 生效的原因——见七、八。）
+
+    ★ 补充 2：必须【先 import torch，再加载 .so】（load_library 与 import 都适用）
+      顺序是 torch 在前，不能反。原因：
+        1) 符号解析：你的 .so 的 DT_NEEDED 依赖 libtorch*/libc10*；先 import torch
+           把它们加载进进程，你的 .so 再被 dlopen 时这些 torch 符号才解析得到。
+        2) Dispatcher 已存在：TORCH_LIBRARY 要把算子登记进 PyTorch 全局 Dispatcher，
+           而它由 libtorch 初始化时建立；torch 没加载就没有可登记的目标。
+      顺序反了的典型报错：
+           ImportError/OSError: undefined symbol: _ZN3c10... / libc10.so: cannot open...
+      正确：
+           import torch                               # ① 先让 libtorch 就位、建好 Dispatcher
+           torch.ops.load_library("x.so")             # ② 再加载（import x 同理放在 torch 之后）
+      例外（别依赖）：给 .so 烧入指向 torch/lib 的 RPATH 或设 LD_LIBRARY_PATH，
+           动态链接器能自行找到 libtorch，看似"不先 import torch 也行"；但该法不可移植，
+           且 torch 的 Python/C++ 状态(Dispatcher、CUDA context)仍以先 import torch 为稳妥。
+
+  情况 2：import 模块  —— 预编译 .so + PYBIND11_MODULE
+  --------------------------------------------------------------------------------
+    用法：
+        import torch        # 先让 libtorch 依赖就位
+        import mymod        # Python 在 sys.path 里按文件名找
+        mymod.func(...)
+
+    .so 路径要求：
+      - 位置：.so 所在目录【必须在 sys.path 上】。Python 启动时会自动往 sys.path
+              最前面(sys.path[0])塞一个目录，但【塞哪个目录取决于"怎么启动 Python"】：
+
+              ┌──────────────────┬──────────────────────────┬──────────────┐
+              │ 启动方式          │ sys.path[0] 填什么        │ 看的是        │
+              ├──────────────────┼──────────────────────────┼──────────────┤
+              │ python a.py       │ a.py 文件【所在目录】     │ 脚本住哪      │
+              │ python(REPL 交互) │ '' = cwd(当前工作目录)    │ 你站哪        │
+              │ python -c "..."   │ '' = cwd                  │ 你站哪        │
+              │ python -m mod     │ cwd                       │ 你站哪        │
+              └──────────────────┴──────────────────────────┴──────────────┘
+
+              关键区别：
+                · python a.py 看的是【脚本文件所在目录】，与你在哪敲命令(cwd)无关：
+                      cd /tmp && python /home/u/proj/a.py
+                        → sys.path[0] = /home/u/proj（a.py 所在目录，不是 /tmp）
+                        → a.py 里 import mymod 成功（.so 就在该目录）
+                · REPL / -c / -m 看的是【cwd】（''=当前工作目录，import 时动态解析）：
+                  ── -c（执行代码字符串）──
+                      cd /home/u/proj && python -c "import mymod"   → cwd=proj  → 成功
+                      cd /tmp        && python -c "import mymod"    → cwd=/tmp  → 失败
+                  ── REPL（交互式解释器）──
+                      cd /home/u/proj && python                     # cwd=proj
+                        >>> import mymod                            → 成功（cwd 在 sys.path）
+                      cd /tmp && python
+                        >>> import mymod                            → 失败（cwd=/tmp 无此 .so）
+                  ── -m（以模块方式运行）──
+                      cd /home/u/proj && python -m pkg.run          # cwd=proj 入 sys.path
+                        # pkg/run.py 里 import mymod                → 成功
+                      cd /tmp && python -m pkg.run                  → import mymod 失败
+                  （三者共同点：加入 sys.path 的是【cwd】，与脚本/模块文件实际在哪无关。）
+
+              补充：python -m <模块名> 是什么意思
+                · 含义：按【模块的导入名】(而非文件路径)在 sys.path 里找到该模块，
+                        再把它当作 __main__ 运行。对比：python a.py 是按【文件路径】跑。
+                        python -m pkg.run → 找到 pkg/run.py 执行；
+                        python -m pkg     → pkg 是包时，运行 pkg/__main__.py。
+                · 常见用途：跑已安装的包/工具，无需知道其文件位置，例如
+                        python -m pip install x / python -m pytest /
+                        python -m http.server / python -m venv .venv
+                · 三个好处：① 不用知道文件路径；② 绑定当前解释器(python -m pip 用的
+                        就是这个 python 的 pip，避免装错环境)；③ 维持正确的包上下文，
+                        相对 import(from . import x)能正常工作(直接按文件跑常会报错)。
+                · 与本节相关点：-m 启动会把【cwd】(='')加入 sys.path[0]，看"你站哪"，
+                        与 REPL/-c 同类(故上面 import mymod 在 proj 成功、/tmp 失败)。
+
+              口诀：python a.py 看"脚本住哪"；REPL / -c / -m 看"你站哪(cwd)"。
+
+              因此让 .so 被找到的办法：把 .so 放在【脚本目录】(配 python a.py)或
+              【工作目录】(配 REPL/-c/-m)，或设 PYTHONPATH、sys.path.append("目录")、
+              或装进 site-packages（在 sys.path 上，任意位置都能 import）。
+              【同样不需】放进 torch 安装目录。
+              （本项目 CMake 把 .so 输出到项目根：脚本放根、或从根目录起 REPL/-c/-m 即可。）
+      - 文件名：【必须】= 模块名 + EXT_SUFFIX(SOABI)，即 mymod.cpython-3xx-<平台>.so，
+                import 才认得出模块 mymod，并据此找 PyInit_mymod。
+                裸 libmymod.so / mymod.so(缺 SOABI) 不会被识别。
+                （CMake 用 Python3_add_library(... WITH_SOABI) 自动产出此文件名。）
+      - 运行期依赖：同情况 1，先 import torch。
+      → 受约束：位置要上 sys.path，文件名要带正确 SOABI。
+
+  情况 3：load_inline(...)  —— 运行时即时编译 + 自动加载
+  --------------------------------------------------------------------------------
+    要点（详见 ./torch.load_inline.txt）：
+      - .so 由 torch 在【缓存目录】~/.cache/torch_extensions/.../<name>/<name>.so 生成；
+      - load_inline 把"编译 + 加载"合一，加载这步它【内部自动做】：
+          is_python_module=False → 内部调 torch.ops.load_library(built_so)(纯 dlopen)
+          is_python_module=True  → 内部当 Python 模块 import
+      - 故你【无需】关心 .so 放哪、也【无需】手动 load_library/import——返回即可用。
+
+  三种情况对照表
+  --------------------------------------------------------------------------------
+  ┌──────────────────┬───────────────────┬───────────────────┬───────────────────┐
+  │                  │ 1 load_library    │ 2 import(pybind)  │ 3 load_inline     │
+  ├──────────────────┼───────────────────┼───────────────────┼───────────────────┤
+  │ .so 谁加载        │ 你手动 load_library│ 你 import          │ load_inline 自动  │
+  │ 位置要求          │ 任意路径(给路径)   │ 必须在 sys.path 上 │ 缓存目录(自动管理)│
+  │ 文件名要求        │ 任意               │ 模块名+SOABI       │ name 决定(自动)   │
+  │ 需放 torch 目录?  │ 否                 │ 否                 │ 否                │
+  │ 需手动加载?       │ 是(load_library)   │ 是(import)         │ 否(已内置)        │
+  │ 运行期依赖        │ 先 import torch    │ 先 import torch    │ 自动(torch 已在) │
+  └──────────────────┴───────────────────┴───────────────────┴───────────────────┘
+
+  共同点：三者最终都靠"dlopen .so → TORCH_LIBRARY 静态注册器运行 → 算子进 Dispatcher"；
+          区别只在【谁、在何时、用什么文件名/路径触发那次 dlopen】。
+          且三者都【不需要】把 .so 放进 torch 的安装目录。
+
+
+相关文档：
+  ./torch.load_inline.txt                    load_inline 即时编译+加载(情况 3)详解
+  ../torch/_C扩展的Python调用过程.txt        TORCH_LIBRARY→torch.ops 调用机制详解
+  ../torch/vllm自定义算子调用链路.txt         以 fused_qk_norm_rope 为例的完整链路
+  ../fork/fused_silu_mul_compile_hook.py/.txt 最小可运行复刻 + 两类报错(PyInit/fake)
+  ../cmake/python_add_library.txt            Python_add_library vs add_library 细节

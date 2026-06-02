@@ -1,0 +1,297 @@
+================================================================================
+   PatternMatcherPass + register_replacement —— 计算图"模式匹配-替换"
+================================================================================
+
+例子（来自 ../fork/fused_silu_mul_compile_hook.py）：
+    from torch._inductor.pattern_matcher import (
+        PatternMatcherPass, register_replacement, fwd_only,
+    )
+
+    pm_pass = PatternMatcherPass()
+    example_inputs = [
+        torch.randn(4, 8, device="cuda"),
+        torch.randn(4, 8, device="cuda"),
+    ]
+    register_replacement(
+        search_fn,        # 要被匹配的"分步"写法           F.silu(x)*y
+        replace_fn,       # 替换成的"融合"写法             torch.ops.myops.silu_and_mul(x,y)
+        example_inputs,   # 样例输入，用来 trace 出待匹配模式
+        fwd_only,         # 只在前向图上匹配（trace 方式）
+        pm_pass,          # 把这条规则塞进 pm_pass（一个 pass 容器）
+    )
+
+一句话：这两个东西配合，实现"在计算图里找到某个子图模式 → 整段替换成另一种写法"。
+vLLM 的 QKNormRoPEFusionPass 就是用它把 rms_norm+rms_norm+rope 换成 fused_qk_norm_rope；
+本最小复刻用它把 silu*y 换成自定义 kernel。它们运行在 torch.compile 的 post_grad 阶段。
+
+  来源：torch._inductor.pattern_matcher
+  （这是 PyTorch Inductor 内部模块，非稳定公开 API，跨版本可能微调）
+
+
+================================================================================
+一、两个角色
+================================================================================
+  PatternMatcherPass     —— 一个"规则容器 + 可调用 pass"
+      · 内部存一组"匹配-替换"规则。
+      · 本身是个可调用对象：pm_pass(graph) 或 pm_pass.apply(graph) 会把所有规则
+        施加到传入的 FX 图上，返回匹配/替换的次数。
+      · 对应 vLLM 的 VllmPatternMatcherPass（QKNormRoPEFusionPass 的基类思路）。
+
+  register_replacement —— 往某个 PatternMatcherPass 里"登记一条规则"
+      · 给定 search_fn(要匹配的写法) 和 replace_fn(替换成的写法)，
+        用样例输入把它们 trace 成 FX 子图，登记进 pass。
+      · 之后该 pass 作用到大图时，就会自动找 search 模式并换成 replace。
+      · 对应 vLLM 在 QkNormRopePattern 里调 register_replacement 的那一步。
+
+
+================================================================================
+二、PatternMatcherPass
+================================================================================
+  pm_pass = PatternMatcherPass(prevent_match_across_mutations=False,
+                               pass_name=None)
+    - prevent_match_across_mutations : 是否禁止跨"原地修改"匹配(避免把有副作用的
+                                       节点错误融合)。一般默认即可。
+    - pass_name (可选)               : 给 pass 取名，日志/调试用。
+
+  用法：
+    - 创建：       pm_pass = PatternMatcherPass()
+    - 登记规则：   register_replacement(..., pm_pass)   # 可登记多条
+    - 运行(改图)： count = pm_pass.apply(graph)         # graph 是 FX Graph
+                  # 在 torch.compile 里，把 pm_pass 挂到 post_grad 钩子由 Inductor 调用
+
+
+================================================================================
+三、register_replacement 参数
+================================================================================
+  register_replacement(
+      search_fn,        # ① 要被匹配的函数(原始/未融合写法)。用 torch 算子写成，
+                        #    trace 后得到"待匹配子图"。例：def search_fn(x,y): return F.silu(x)*y
+      replace_fn,       # ② 替换成的函数(目标/融合写法)。匹配命中后整段换成它的子图。
+                        #    例：def replace_fn(x,y): return torch.ops.myops.silu_and_mul(x,y)
+                        #    若目标算子原地写(schema Tensor!)，这里常用 auto_functionalized 包装。
+
+      example_inputs,   # ③ 样例输入列表，用来 trace search_fn/replace_fn 生成子图。
+                        #    形状/类型/设备要"代表性"(能触发出待匹配的算子序列)；
+                        #    具体数值不重要(trace 只看算子结构)。例：[randn(4,8,cuda), randn(4,8,cuda)]
+
+      trace_fn,         # ④ 用哪种方式 trace search/replace 成图。常用：
+                        #    fwd_only    —— 只 trace 前向(推理融合最常用)
+                        #    joint_fwd_bwd — trace 前向+反向(需要匹配反向时)
+                        #    ★ 它内部用 make_fx 在 FakeTensor 上跑 search/replace_fn，
+                        #      所以 replace_fn 里调的自定义算子必须有 fake 实现，
+                        #      否则报 UnsupportedOperatorException(见 register_fake.txt)。
+
+      pass_dict,        # ⑤ 把这条规则登记到哪——传一个 PatternMatcherPass(即 pm_pass)。
+                        #    （历史上也接受 pass 字典，故名 pass_dict）
+
+      extra_check=...,  # (可选) 额外校验回调 fn(match)->bool：返回 False 则放弃这次替换。
+                        #    用来加"只有满足某条件才融合"的约束(如 dtype、维度)。
+      scalar_workaround=...,  # (可选) 处理 search_fn 里的标量参数(如 eps)，
+                        #    告诉匹配器哪些是标量占位，便于泛化匹配。
+      # 还有 exclusive_arg_names 等少用参数。
+  )
+
+  匹配-替换发生的时机/层级：
+    - search/replace 都先被 trace 成 FX 子图(aten 级)；
+    - pass 作用到【post-grad aten 图】(已 decompose/functionalize)上做子图同构匹配；
+    - 命中则把那段子图替换成 replace 子图。
+    - 因为在 aten 级匹配，search_fn 用高层写法(F.silu)也没关系——会按同样规则 decompose
+      后再比对。
+
+--------------------------------------------------------------------------------
+example_inputs 详解（为什么需要、用什么、要注意什么）
+--------------------------------------------------------------------------------
+  作用：给 search_fn / replace_fn 喂一组"样例张量"，把这两个 Python 函数实际
+        【跑一遍】trace 成 FX 子图——匹配器没法直接匹配 Python 函数，需要"图"形式。
+        example_inputs 就是 trace 出这张图所需的输入(燃料)。
+        fwd_only 内部即： make_fx(search_fn, ...)(*example_inputs) → 得到待匹配子图。
+        没有输入就无法"跑"函数，也就 trace 不出图。
+
+  ★ 只用元信息(shape/dtype/device)，不用数值：
+        example_inputs = [torch.randn(4,8,device="cuda"),
+                          torch.randn(4,8,device="cuda")]
+        randn 填的随机数无所谓；真正起作用的是 shape=(4,8)/dtype=float32/device=cuda
+        ——它们决定 trace 出来的算子序列长什么样。
+
+  ★ 形状/类型必须"有代表性"——否则静默失效：
+        trace 会跟着输入的 dtype/shape 走，不同输入可能 trace 出不同的图
+        (如 F.silu 在 float32 vs float16 下 decompose 的 aten 序列可能不同；
+         维度数/广播不同也会变)。所以 example_inputs 要和真实模型场景一致：
+            用错 dtype/shape → trace 出的"待匹配模式" ≠ 真实图里的子图
+                             → 匹配 0 处，融合永不发生(静默失败，最难查)。
+        这就是 vLLM QkNormRopePattern.get_inputs() 要精心构造样例输入的原因
+        (对的 dtype bf16/fp16、对的 head_dim、对的 token 数)。
+
+  ★ 个数/顺序/类型要对齐 search_fn 签名：
+        按位置喂给 search_fn(*example_inputs)，故：
+            def search_fn(x, y): ...     # 2 个张量参数
+            example_inputs = [t1, t2]    # 就给 2 个，顺序对应 x, y
+
+  串一遍(对应本仓库实跑)：
+        example_inputs = [randn(4,8,cuda), randn(4,8,cuda)]
+            │ fwd_only → make_fx(search_fn)(*example_inputs)
+            ▼ trace F.silu(x)*y → 子图 neg→exp→add→div→mul   (待匹配模式)
+            │ 同样 trace replace_fn → 子图 myops.silu_and_mul (替换模式)
+            ▼ 登记进 pm_pass
+        之后真实图里出现 neg→exp→add→div→mul 就被换成 silu_and_mul。
+        (实跑 aot 图正是 neg→exp→add→div→mul，能匹配上正因 example_inputs 的
+         (4,8) float32 cuda 与真实输入一致——见 ../fork/...txt 四点五)
+
+
+================================================================================
+四、举例（完整最小流程，对应 ../fork 脚本）
+================================================================================
+    import torch, torch.nn.functional as F
+    from torch._inductor.pattern_matcher import (
+        PatternMatcherPass, register_replacement, fwd_only,
+    )
+    import torch._inductor.config as inductor_config
+
+    # 前提：torch.ops.myops.silu_and_mul 已注册(真实现+fake)，见 register_fake.txt
+
+    # 1) 待匹配 / 替换 写法
+    def search_fn(x, y):
+        return F.silu(x) * y                       # 原始分步
+    def replace_fn(x, y):
+        return torch.ops.myops.silu_and_mul(x, y)  # 融合算子
+
+    # 2) 建 pass 容器，登记规则
+    pm_pass = PatternMatcherPass()
+    example_inputs = [
+        torch.randn(4, 8, device="cuda"),
+        torch.randn(4, 8, device="cuda"),
+    ]
+    register_replacement(
+        search_fn, replace_fn, example_inputs,
+        fwd_only,      # 只匹配前向
+        pm_pass,       # 登记进 pm_pass
+    )
+
+    # 3) 把 pass 挂到 Inductor 的 post_grad 钩子（torch.compile 时回调）
+    def custom_post_grad_pass(graph):
+        count = pm_pass.apply(graph)               # ← 真正在图上做替换
+        if count:
+            print(f"融合发生：替换了 {count} 处")
+    inductor_config.post_grad_custom_post_pass = custom_post_grad_pass
+
+    # 4) 编译并运行 → 第一次触发编译时回调上面的 pass，把 silu*y 换成 kernel
+    @torch.compile
+    def model(x, y):
+        return F.silu(x) * y
+    model(torch.randn(4,8,device="cuda"), torch.randn(4,8,device="cuda"))
+
+  带 extra_check 的变体（只在某条件下融合）：
+    def only_2d(match):
+        # 可从 match 里取节点/元信息做判断，返回 True 才替换
+        return True
+    register_replacement(search_fn, replace_fn, example_inputs,
+                         fwd_only, pm_pass, extra_check=only_2d)
+
+
+================================================================================
+四点五、一个 PatternMatcherPass 塞入多个规则
+================================================================================
+  一个 PatternMatcherPass 是【规则容器】，可以登记任意多条"匹配-替换"规则：
+  对同一个 pm_pass 多次调用 register_replacement 即可。运行 pm_pass.apply(graph)
+  时，会把容器里【所有】规则都尝试施加到这张图上，返回总命中次数。
+
+--------------------------------------------------------------------------------
+1. 基本写法：多次 register_replacement(..., 同一个 pm_pass)
+--------------------------------------------------------------------------------
+    pm_pass = PatternMatcherPass()
+
+    # 规则 A：silu(x)*y → 自定义 silu_and_mul
+    def search_a(x, y): return F.silu(x) * y
+    def replace_a(x, y): return torch.ops.myops.silu_and_mul(x, y)
+    register_replacement(search_a, replace_a,
+                         [torch.randn(4,8,device="cuda"),
+                          torch.randn(4,8,device="cuda")],
+                         fwd_only, pm_pass)            # ← 塞进 pm_pass
+
+    # 规则 B：gelu(x)*y → 自定义 gelu_and_mul
+    def search_b(x, y): return F.gelu(x) * y
+    def replace_b(x, y): return torch.ops.myops.gelu_and_mul(x, y)
+    register_replacement(search_b, replace_b,
+                         [torch.randn(4,8,device="cuda"),
+                          torch.randn(4,8,device="cuda")],
+                         fwd_only, pm_pass)            # ← 同一个 pm_pass
+
+    # 运行：两条规则一起作用到同一张图，count = A命中数 + B命中数
+    def custom_post_grad_pass(graph):
+        count = pm_pass.apply(graph)
+        if count:
+            print(f"共替换 {count} 处")
+    inductor_config.post_grad_custom_post_pass = custom_post_grad_pass
+
+  要点：
+    - 每条规则可以有各自的 search/replace/example_inputs/extra_check；
+    - 它们共享同一个 pm_pass，apply 时统一尝试；
+    - 规则之间相互独立，命中谁就替换谁；count 是所有规则命中数之和。
+
+--------------------------------------------------------------------------------
+2. 常见用途：同一算子的"参数变体"各登记一条
+--------------------------------------------------------------------------------
+  同一个融合，因 dtype / eps / 布局(neox) / 是否 flashinfer 不同，
+  trace 出的子图也不同，需要为每种组合各登记一条规则到同一个 pass：
+
+    pm_pass = PatternMatcherPass()
+    for eps in (1e-5, 1e-6):
+        for neox in (True, False):
+            search, replace, inputs = build_pattern(eps, neox)  # 按参数造 search/replace
+            register_replacement(search, replace, inputs, fwd_only, pm_pass)
+    # → pm_pass 里现在有 4 条规则，覆盖 2×2 种组合
+
+  这正是 vLLM QKNormRoPEFusionPass 的做法（见五）：用双重循环
+  for epsilon in [1e-5,1e-6]: for neox in [True,False]: ... register_replacement(...)
+  把同一个 fused_qk_norm_rope 的多个参数变体都登记进自己的 PatternMatcherPass。
+
+--------------------------------------------------------------------------------
+3. 与"多个 pass"的区别
+--------------------------------------------------------------------------------
+  - 多个【规则】塞进一个 pass：同一类改写的若干模式，共享一个 PatternMatcherPass，
+    apply 一次全部尝试（本节）。
+  - 多个【pass】放进 PassManager：不同种类的改写(融合A、量化B、消冗C...)各是一个
+    pass，由管理器的 for 循环按顺序逐个施加(对应 vLLM PostGradPassManager.passes 列表，
+    pass_manager.py:103-105)。
+  层级关系：PassManager → 多个 pass → 每个 pass 内含多条 register_replacement 规则。
+
+
+================================================================================
+五、对应 vLLM
+================================================================================
+  vLLM compilation/passes/fusion/qk_norm_rope_fusion.py：
+    - QkNormRopePattern 定义 search(rms_norm+rms_norm+rope) / replacement(fused_qk_norm_rope)
+    - 用 get_inputs() 提供 example_inputs，调 register_replacement(..., fwd_only, pm_pass)
+    - QKNormRoPEFusionPass(VllmPatternMatcherPass) 持有该 pm_pass
+    - pass_manager.py 把它 append 进 self.passes；backends.py 把 manager 挂到
+      Inductor post_grad_custom_post_pass —— 与本例 custom_post_grad_pass 同一个钩子。
+  本最小复刻就是这套机制去掉多层封装后的骨架。
+
+
+================================================================================
+六、易错点
+================================================================================
+  1) replace_fn 里的自定义算子缺 fake 实现 → trace(fwd_only→make_fx) 在 FakeTensor 上
+     失败：UnsupportedOperatorException。先 register_fake。
+  2) example_inputs 不具代表性 → trace 不出待匹配的算子序列 → 永远匹配 0 处。
+  3) 原地写算子(schema Tensor!) → replace_fn 要用 auto_functionalized 包装，
+     否则编译图的函数式约束报错(vLLM 的 replacement 就这么做)。
+  4) torch._inductor.pattern_matcher 是内部 API，不同 torch 版本签名可能变，
+     参数顺序以本机版本为准(可 help(register_replacement) 查)。
+
+
+================================================================================
+七、一句话总结
+================================================================================
+  PatternMatcherPass 是"规则容器+可调用 pass"；register_replacement(search, replace,
+  example_inputs, trace_fn, pm_pass) 往里登记一条"把 search 子图换成 replace 子图"的规则。
+  trace_fn(如 fwd_only)用样例输入在 FakeTensor 上把两段函数 trace 成 aten 子图；
+  pm_pass.apply(graph) 在 post-grad 图上做子图匹配并替换。挂到 Inductor 的
+  post_grad_custom_post_pass 钩子，即在 torch.compile 编译期自动完成融合——
+  这正是 vLLM QKNormRoPEFusionPass 的核心机制。
+
+相关文档：
+  torch.library.register_fake.txt            replace 算子必须配的 fake 实现
+  ../fork/fused_silu_mul_compile_hook.py/.txt 完整最小复刻 + 两类报错
+  ../torch/torch_compile流水线.txt            post_grad 钩子在四阶段流水线中的位置
+  ../torch/vllm自定义算子调用链路.txt          vLLM 融合 pass 的注册与运行(行号)

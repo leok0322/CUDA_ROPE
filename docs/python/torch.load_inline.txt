@@ -1,0 +1,283 @@
+================================================================================
+   torch.utils.cpp_extension.load_inline —— 在 Python 里内联编译 C++/CUDA 扩展
+================================================================================
+
+一句话：load_inline 把"写 setup.py + 单独构建 + 安装"这一整套，浓缩成"在 Python
+脚本里给一段 C++/CUDA 源码字符串，运行时即时(JIT)编译成 .so 并加载"。适合做
+原型、教学、最小复刻(本仓库 ../fork/fused_silu_mul_compile_hook.py 就用它)。
+
+  from torch.utils.cpp_extension import load_inline
+
+来源：torch/utils/cpp_extension.py
+机制：底层调用 ninja 编译 → 产出 .so → 按 is_python_module 决定如何加载。
+依赖：本机要有编译器(g++) ；用到 CUDA 时还需 nvcc + 与 torch 匹配的 CUDA 工具链。
+缓存：默认编译到 ~/.cache/torch_extensions/pyXXX_cuYYY/<name>/ ，
+      源码哈希不变就复用，不重编。
+
+
+================================================================================
+一、它和 load 的区别
+================================================================================
+  load(name, sources=[...])       ：sources 是【文件路径】列表(.cpp/.cu 文件)
+  load_inline(name, cpp_sources=..., cuda_sources=...)
+                                  ：源码以【字符串】直接内联传入，无需单独的源文件
+  两者底层同一套 JIT 构建机制，只是源码来源不同。原型/单文件演示用 load_inline 最省事。
+
+
+================================================================================
+二、常用参数
+================================================================================
+  load_inline(
+      name,                      # ★ 必填。扩展名 → 决定 .so 文件名 / 缓存子目录名
+                                 #   也是 Python 模块名(当 is_python_module=True 时，
+                                 #   .so 里要有 PyInit_<name>)。
+                                 #   注意：它与算子命名空间(torch.ops.<ns>)无关，
+                                 #         ns 由源码里的 TORCH_LIBRARY(ns) 决定。
+
+      cpp_sources,               # C++ 源码字符串(或字符串列表)。放声明、host 函数、
+                                 #   PYBIND11_MODULE / TORCH_LIBRARY 等。可为 ""。
+
+      cuda_sources=None,         # CUDA 源码字符串(或列表)。放 __global__ kernel 等，
+                                 #   会用 nvcc 编译。给了它就自动按 CUDA 扩展构建。
+
+      functions=None,            # 便捷参数：给一个函数名列表(或 {名:docstring})，
+                                 #   load_inline 自动生成 PYBIND11_MODULE 把这些函数
+                                 #   暴露为 Python 可调用。给了它就不必自己写 pybind。
+                                 #   （若你只用 TORCH_LIBRARY，则不要用它，见“四”）
+
+      extra_cflags=None,         # 传给 C++ 编译器的额外 flag，如 ["-O3", "-std=c++17"]
+      extra_cuda_cflags=None,    # 传给 nvcc 的额外 flag，如 ["-O3","--use_fast_math",
+                                 #   "-gencode=arch=compute_86,code=sm_86"]
+      extra_ldflags=None,        # 额外链接 flag，如 ["-lcublas"]
+      extra_include_paths=None,  # 额外头文件搜索路径列表
+
+      with_cuda=None,            # 是否当 CUDA 扩展构建。None=自动(给了 cuda_sources
+                                 #   就为 True)。一般不用手动设。
+
+      build_directory=None,      # 指定构建/缓存目录(默认 ~/.cache/torch_extensions/...)
+      verbose=False,             # True 时打印编译命令和 ninja 输出，排错很有用
+
+      is_python_module=True,     # ★ 关键开关：
+                                 #   True  → 把 .so 当 Python 扩展模块 import，
+                                 #           要求 .so 里有 PyInit_<name>，返回模块对象
+                                 #   False → 用 torch.ops.load_library() 纯 dlopen，
+                                 #           不要求 PyInit，返回 None。
+                                 #           适合“只用 TORCH_LIBRARY 注册算子”的场景。
+
+      with_pytorch_error_handling=True,
+      keep_intermediates=True,
+  )
+
+  返回值：
+    is_python_module=True  → 返回编译好的【Python 模块对象】(可直接 .func 调用)
+    is_python_module=False → 返回 None(算子已注册进 dispatcher，用 torch.ops.<ns> 调)
+
+
+================================================================================
+三、举例 1：pybind 直调（is_python_module=True，默认）
+================================================================================
+  最常见的"写个 CUDA 函数给 Python 直接调"。两种写法：
+
+  -- 写法 A：用 functions=[...] 让 load_inline 自动生成 pybind ----------------
+    import torch
+    from torch.utils.cpp_extension import load_inline
+
+    cpp_src = r"""
+    #include <torch/extension.h>
+    torch::Tensor add_one(torch::Tensor x) { return x + 1; }
+    """
+    mod = load_inline(
+        name="demo_add",
+        cpp_sources=cpp_src,
+        functions=["add_one"],      # ← 自动生成 PYBIND11_MODULE，暴露 add_one
+        verbose=True,
+    )
+    print(mod.add_one(torch.ones(3)))   # tensor([2., 2., 2.])
+
+  -- 写法 B：自己写 PYBIND11_MODULE（含 CUDA kernel）-------------------------
+    cuda_src = r"""
+    #include <torch/extension.h>
+    __global__ void add_scalar_kernel(float* o,const float* x,float s,int n){
+        int i = blockIdx.x*blockDim.x + threadIdx.x;
+        if (i < n) o[i] = x[i] + s;
+    }
+    torch::Tensor add_scalar(torch::Tensor x, double s){
+        auto o = torch::empty_like(x); int n = x.numel();
+        int t=256, b=(n+t-1)/t;
+        add_scalar_kernel<<<b,t>>>(o.data_ptr<float>(), x.data_ptr<float>(),
+                                   (float)s, n);
+        return o;
+    }
+    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){      // 名字由 load_inline 的 name 注入
+        m.def("add_scalar", &add_scalar, "x + s (CUDA)");
+    }
+    """
+    mod = load_inline(
+        name="demo_adds",
+        cpp_sources="",
+        cuda_sources=cuda_src,
+        with_cuda=True,
+        verbose=True,
+    )
+    x = torch.ones(5, device="cuda")
+    print(mod.add_scalar(x, 10.0))     # tensor([11., 11., 11., 11., 11.], device='cuda:0')
+
+  ★ 不需要再单独 import！load_inline 已把"编译 + import"一步做完：
+      load_inline(name="demo_adds", ...) 内部做了三件事：
+        ① 把源码编译成 demo_adds.so（ninja + nvcc）
+        ② 用 importlib 把这个 .so import 进来（= 你想的那个 import demo_adds）
+        ③ 把得到的【模块对象】return 出来
+      所以返回值 mod 就是"已经 import 进来的模块"，直接 mod.add_scalar(...) 即可。
+      想让代码读起来像 import，把接收变量直接取名 demo_adds 即可：
+        demo_adds = load_inline(name="demo_adds", ...)
+        demo_adds.add_scalar(x, 10.0)        # 与 import demo_adds 后调用完全一样
+
+  ★ 为什么不能(也不必)再写 import demo_adds：
+      编译出的 .so 在缓存目录 ~/.cache/torch_extensions/.../demo_adds/ 里，
+      那个目录默认【不在 sys.path 上】，普通 import demo_adds 通常找不到它。
+      load_inline 是用 importlib 直接从该构建目录加载的，所以靠返回值拿模块，
+      而不是靠 import 语句。
+
+  ★ 对比 is_python_module=False：此时返回 None，没有模块对象可用，
+      算子注册在全局 dispatcher，改用 torch.ops.<ns> 调（见“四”）。
+      ┌────────────────────────────┬──────────────┬──────────────────────────────┐
+      │ 模式                        │ 返回值        │ 怎么调                       │
+      ├────────────────────────────┼──────────────┼──────────────────────────────┤
+      │ is_python_module=True(默认) │ 模块对象      │ mod.add_scalar(...)          │
+      │ is_python_module=False      │ None         │ torch.ops.myops.silu_and_mul │
+      └────────────────────────────┴──────────────┴──────────────────────────────┘
+
+
+================================================================================
+四、举例 2：只用 TORCH_LIBRARY 注册算子（is_python_module=False）
+================================================================================
+  当目标是 torch.ops.<ns>.<op>（要进 dispatcher / 能被 torch.compile），
+  源码里用 TORCH_LIBRARY，且【不需要】pybind 模块——此时必须设 is_python_module=False，
+  否则 import 会因缺 PyInit_<name> 报错。
+
+    cuda_src = r"""
+    #include <torch/extension.h>
+    __global__ void silu_and_mul_kernel(float* o,const float* x,const float* y,int n){
+        int i = blockIdx.x*blockDim.x + threadIdx.x;
+        if (i < n){ float s = x[i]/(1.f+expf(-x[i])); o[i] = s*y[i]; }
+    }
+    at::Tensor silu_and_mul(const at::Tensor& x, const at::Tensor& y){
+        auto o = at::empty_like(x); int n = x.numel();
+        int t=256, b=(n+t-1)/t;
+        silu_and_mul_kernel<<<b,t>>>(o.data_ptr<float>(), x.data_ptr<float>(),
+                                     y.data_ptr<float>(), n);
+        return o;
+    }
+    TORCH_LIBRARY(myops, m){ m.def("silu_and_mul(Tensor x, Tensor y) -> Tensor"); }
+    TORCH_LIBRARY_IMPL(myops, CUDA, m){ m.impl("silu_and_mul", &silu_and_mul); }
+    """
+    load_inline(
+        name="myops",
+        cpp_sources="",
+        cuda_sources=cuda_src,
+        with_cuda=True,
+        is_python_module=False,   # ★ 纯 dlopen 触发 TORCH_LIBRARY 注册，不当 Python 模块
+        verbose=False,
+    )
+    # 不需要 import myops；算子已在全局 dispatcher：
+    import torch
+    x = torch.randn(4, 8, device="cuda")
+    y = torch.randn(4, 8, device="cuda")
+    print(torch.ops.myops.silu_and_mul(x, y))
+
+  要走 torch.compile，还要补 fake/meta（见 ../fork 的报错七）：
+    @torch.library.register_fake("myops::silu_and_mul")
+    def _(x, y): return torch.empty_like(x)
+
+
+================================================================================
+五、两个高频报错（与本仓库 ../fork 的两类报错对应）
+================================================================================
+  1) ImportError: ... does not define module export function (PyInit_<name>)
+       原因：源码只有 TORCH_LIBRARY、没有 PYBIND11_MODULE，却用默认
+             is_python_module=True 去 import → 找不到 PyInit_<name>。
+       解决：设 is_python_module=False（纯 dlopen），或补一个 pybind 模块。
+       （上次失败可能缓存了残缺 .so，重跑前清： rm -rf ~/.cache/torch_extensions/*/<name>* ）
+
+  2) UnsupportedOperatorException: <ns>.<op>
+       原因：自定义算子只注册了 CUDA 实现，没注册 fake/meta；torch.compile 在
+             FakeTensor 上推断形状时分发失败。
+       解决：用 @torch.library.register_fake("<ns>::<op>") 注册一个只返回
+             正确 shape/dtype 的假实现。
+
+
+================================================================================
+六、name 这根轴（与命名空间区分）
+================================================================================
+  load_inline(name="X") 决定：
+    - .so 文件名 / 缓存子目录名： ~/.cache/torch_extensions/.../X/X.so
+    - is_python_module=True 时，还是 Python 模块名(需 PyInit_X，import X 用它)
+  它【不决定】算子命名空间 torch.ops.<ns>——ns 由源码 TORCH_LIBRARY(ns) 决定。
+  二者可不同：name="my_build" 而 TORCH_LIBRARY(myops) → 算子仍是 torch.ops.myops.*。
+  详见 ../c++/TORCH_LIBRARY_vs_PYBIND11.txt 第十一节"文件名轴 vs 命名空间轴"。
+
+
+================================================================================
+七、与 vLLM 的关系
+================================================================================
+  vLLM 不用 load_inline(它用 setup.py + CMake 正式构建 _C.so)，但机制相通：
+    - load_inline 的 name           ≈ CMake 目标名 / 决定 .so 文件名
+    - 源码里 TORCH_LIBRARY/_IMPL     = vLLM csrc 里的同名宏
+    - is_python_module=False 纯 dlopen ≈ vLLM 用 torch.ops.load_library 的路径之一
+  load_inline 是理解"编译 .so → 注册算子 → torch.ops 调用"链路的最小实验台。
+
+
+================================================================================
+八、.so 的"路径要求"——load_inline 与预编译 .so 的对比
+================================================================================
+  "路径要求"指：.so 放在哪、Python 才加载得到。共三种加载情况，本节详述 load_inline
+  (情况 3)，另两种(预编译 .so)详见 ./TORCH_LIBRARY_vs_PYBIND11.txt 第十二节。
+
+  情况 3：load_inline(...)  —— 运行时即时编译 + 自动加载
+  --------------------------------------------------------------------------------
+    .so 路径要求：基本【无需你操心】，因为 load_inline 把"编译 + 加载"合一：
+      - 位置：.so 由 torch 生成在【缓存目录】
+              ~/.cache/torch_extensions/pyXXX_cuYYY/<name>/<name>.so
+              （由 name 决定子目录名；可用 build_directory= 改）。
+              该目录默认【不在 sys.path 上】——所以也【不要】用 import <name> 去找它。
+      - 加载：load_inline 内部【自动完成】，无需你手动 load_library / import：
+          is_python_module=True  → 用 importlib 直接从构建目录加载，返回【模块对象】
+                                   （所以靠返回值拿模块，不靠 import 语句，见三）
+          is_python_module=False → 内部调 torch.ops.load_library(built_so) 纯 dlopen，
+                                   触发 TORCH_LIBRARY 注册，返回 None，用 torch.ops.<ns> 调
+      - 文件名：由 name 决定(<name>.so)，load_inline 自己用，无需你关心 SOABI。
+      - 运行期依赖：torch 已在当前进程(你正在用它)，libtorch* 依赖天然就位。
+      → 最省心：放哪、文件名、加载，全由 load_inline 托管；返回即可用。
+
+  与"预编译 .so"两种情况的对照
+  --------------------------------------------------------------------------------
+  ┌──────────────────┬───────────────────┬───────────────────┬───────────────────┐
+  │                  │ 1 load_library    │ 2 import(pybind)  │ 3 load_inline     │
+  ├──────────────────┼───────────────────┼───────────────────┼───────────────────┤
+  │ .so 谁加载        │ 你手动 load_library│ 你 import          │ load_inline 自动  │
+  │ 位置要求          │ 任意路径(给路径)   │ 必须在 sys.path 上 │ 缓存目录(自动管理)│
+  │ 文件名要求        │ 任意               │ 模块名+SOABI       │ name 决定(自动)   │
+  │ 需放 torch 目录?  │ 否                 │ 否                 │ 否                │
+  │ 需手动加载?       │ 是(load_library)   │ 是(import)         │ 否(已内置)        │
+  │ 运行期依赖        │ 先 import torch    │ 先 import torch    │ 自动(torch 已在) │
+  └──────────────────┴───────────────────┴───────────────────┴───────────────────┘
+
+  共同点：三者最终都靠"dlopen .so → 触发注册/绑定"；区别只在【谁、何时、用什么
+          路径/文件名触发那次 dlopen】。且三者都【不需要】把 .so 放进 torch 安装目录。
+  load_inline 特殊在：它把"编译 + 触发加载"一并做了，缓存目录不在 sys.path 上，
+  故只能靠返回值(True)或 torch.ops(False)用算子，不能 import <name>。
+
+
+================================================================================
+九、一句话总结
+================================================================================
+  load_inline(name, cpp_sources=, cuda_sources=, ...) 在 Python 里即时把源码字符串
+  编译成 .so 并加载：
+    - 要直调 mod.func   → is_python_module=True(默认) + functions= 或自写 PYBIND11_MODULE
+    - 要 torch.ops 调   → 源码用 TORCH_LIBRARY + is_python_module=False(纯 dlopen)
+  name 决定 .so 文件名/模块名，与算子命名空间(TORCH_LIBRARY 决定)是两根独立的轴。
+
+相关文档：
+  ../c++/TORCH_LIBRARY_vs_PYBIND11.txt        两条暴露路径详解 + 文件名/命名空间轴
+  ../fork/fused_silu_mul_compile_hook.py/.txt 用 load_inline 的最小复刻 + 两类报错
+  ../torch/_C扩展的Python调用过程.txt          TORCH_LIBRARY→torch.ops 调用机制

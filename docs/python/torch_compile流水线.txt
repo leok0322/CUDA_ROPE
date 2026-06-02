@@ -1,0 +1,531 @@
+================================================================================
+        torch.compile 是一条流水线 —— 用一个具体例子一步步走完
+================================================================================
+
+总览：torch.compile(model) 不是一个单体，而是四棒接力：
+    ① TorchDynamo    把 Python 抓成 FX 图
+    ② AOTAutograd    把高层算子拆成规整的 aten「post-grad 图」
+    ③ post_grad hook vLLM / 你的 pass 在此把分步子图换成自定义 kernel
+    ④ TorchInductor  把图编译成 Triton / 自定义 kernel 调用，并缓存
+第一次调用走完全程，之后直接跑缓存好的产物。
+
+
+================================================================================
+一、什么是 TorchInductor
+================================================================================
+Inductor 是 torch.compile 背后默认的"编译器后端"，负责把计算图
+编译成实际能跑的高性能 GPU/CPU 代码（生成 Triton kernel、算子融合、
+内存规划等）。它是流水线的最后一棒。
+
+三层栈里各自的角色：
+    Dynamo       —— "抓取"程序：把 Python 翻译成图
+    AOTAutograd  —— "整理"图：拆算子、配前后向、functionalize
+    Inductor     —— "编译器"：把图变成真正的 Triton / C++ 代码
+
+Inductor 具体做：
+    1) 算子融合：相邻多个算子合并，减少 kernel 启动和显存往返
+    2) 代码生成：GPU → 自动生成 Triton kernel；CPU → C++/OpenMP
+    3) 调度与内存规划：执行顺序、缓冲区复用
+    4) 缓存：编译结果落盘，避免每次重编
+
+
+================================================================================
+二、例子：一个带 SiLU 的小前向
+================================================================================
+    import torch, torch.nn.functional as F
+
+    @torch.compile
+    def forward(x, y):
+        a = F.silu(x)        # 第 1 步算子：SiLU
+        b = a * y            # 第 2 步算子：逐元素乘
+        return b
+
+    x = torch.randn(4, 8, device="cuda")
+    y = torch.randn(4, 8, device="cuda")
+    out = forward(x, y)      # ← 第一次调用，触发整条流水线
+
+下面看 forward(x, y) 这一次调用，数据/代码在四个阶段如何被层层变换。
+
+
+--------------------------------------------------------------------------------
+阶段 ① Dynamo：把 Python 代码"抓"成一张图
+--------------------------------------------------------------------------------
+Dynamo 在字节码层面逐条解释 forward，把 torch 操作记录下来，吐出一张 FX 图。
+Python 逻辑（变量名 a、b）消失，变成纯算子节点：
+
+    输入: x, y
+      silu = torch.ops.aten.silu.default(x)        # F.silu(x)
+      mul  = torch.ops.aten.mul.Tensor(silu, y)    # a * y
+    返回: mul
+
+关键变化：Python → 图。
+    若有 if/for/print 这类控制流，会被 Dynamo 切成多张图或退回 eager
+    （叫 graph break）。本例没有控制流，干净地抓成一张图。
+
+  【FX 图是什么图：有向无环图(DAG)】
+    - "FX 图"是一种【数据结构】(torch.fx.Graph)，贯穿整条流水线都用它：
+      Dynamo 抓的图、AOT 拆解后的 post-grad 图，【都是 FX 图】，只是处于不同阶段。
+      所以"post-grad 图"不是另一种图——它就是一张 FX 图，处于 AOT decompose 之后。
+    - 它是【有向图】：边=数据依赖，方向=数据流向(生产者→消费者)。
+        neg─►exp─►add─►div─►mul─►output   每个节点的 args 引用其上游节点=有向边。
+    - 它是【无环】(DAG)：直线数据流(类似 SSA)，不会 A依赖B、B又依赖A 成环。
+        控制流不在图内打环——if/for 由 graph break 切图或高阶算子封装。
+        正因是 DAG 才能【拓扑排序】成线性执行顺序(output_code 里的
+        "Topologically Sorted Source Nodes" 就是这一步)。
+    - 节点类型(node.op)：placeholder(输入)/call_function(调算子)/call_method/
+        call_module/get_attr(取参数)/output(输出)；边隐含在各节点的 args/kwargs。
+
+亲眼看到它：
+    import torch._dynamo as dynamo
+    gm, _ = dynamo.export(forward)(x, y)
+    gm.print_readable()
+
+
+--------------------------------------------------------------------------------
+阶段 ② AOTAutograd：把高层算子"拆解"成底层 aten，并 functionalize
+--------------------------------------------------------------------------------
+做两件事：
+
+(a) Decompose（拆算子）：silu 不是最底层的，拆成更基础的算子。
+    SiLU(x) = x * sigmoid(x)，于是：
+
+    拆解前:  silu = aten.silu(x)
+    拆解后:  sigmoid = aten.sigmoid.default(x)
+             mul_1   = aten.mul.Tensor(x, sigmoid)   # x*sigmoid(x) = silu(x)
+
+    整张图变成：
+    输入: x, y
+      sigmoid = aten.sigmoid.default(x)
+      mul_1   = aten.mul.Tensor(x, sigmoid)       # = silu(x)
+      mul_2   = aten.mul.Tensor(mul_1, y)         # silu(x) * y
+    返回: mul_2
+
+(b) Functionalize（去原地操作）+ 配前后向：
+    把 x.add_() 这类原地修改改写成纯函数式（本例没有，不变）；
+    需要反向传播时还会生成反向图。
+
+关键变化：少数高层算子 → 一堆规整的底层 aten 算子。
+    这一步之后的图叫 post-grad 图——"规整、稳定、好匹配"，
+    正是做模式匹配的最佳时机。
+
+  【什么是 aten】
+    ATen = "A Tensor library"，PyTorch 的底层张量算子库（C++ 写的）。
+    PyTorch 所有张量运算最终都落到 ATen 的算子上：
+      - Python 写的 x*y、F.silu(x)、torch.matmul(...) 是高层接口，
+        底下调用 ATen 算子 aten::mul、aten::sigmoid、aten::mm。
+      - 编译图里节点写成 torch.ops.aten.mul.Tensor、
+        torch.ops.aten.sigmoid.default —— aten 这个命名空间就是 ATen 算子库
+        （和自定义的 torch.ops.myops 是同一套 torch.ops.<ns> 机制，
+         只不过 aten 是 PyTorch 内置的）。
+      - 它是一组"标准化、底层、稳定"的算子。AOTAutograd 的 decompose
+        就是把高层/复合算子(如 silu)拆成若干基础 aten 算子(sigmoid + mul)，
+        拆完图里全是 aten 算子，规整统一，最适合做模式匹配。
+    一句话：aten 是 PyTorch 的底层算子集合，torch.ops.aten.* 就是它；
+            阶段②把高层算子拆成 aten 算子，得到"post-grad aten 图"。
+
+
+--------------------------------------------------------------------------------
+阶段 ③ post_grad 钩子：你（或 vLLM）在这里改图
+--------------------------------------------------------------------------------
+Inductor 拿到 post-grad 图后，正式生成代码之前，回调
+post_grad_custom_post_pass。你的 pass 在这里做模式匹配替换：
+
+    匹配到子图:                          替换成:
+      sigmoid = aten.sigmoid(x)          custom = torch.ops.myops.silu_and_mul(x,y)
+      mul_1   = aten.mul(x, sigmoid)  ─→
+      mul_2   = aten.mul(mul_1, y)
+
+    图变成:
+    输入: x, y
+      custom = torch.ops.myops.silu_and_mul.default(x, y)   # ← 自定义 CUDA kernel
+    返回: custom
+
+关键变化：三个 aten 节点 → 一个自定义 kernel 节点。
+    这就是 vLLM 的 QKNormRoPEFusionPass 干的事，
+    也是最小例子里 pm_pass.apply(graph) 干的事。
+    （详见 ../fork/fused_silu_mul_compile_hook.txt）
+
+
+--------------------------------------------------------------------------------
+阶段 ④ Inductor codegen：把图"编译"成真正的 kernel
+--------------------------------------------------------------------------------
+Inductor 遍历最终的图，为每个（还没被替换成自定义 kernel 的）算子
+自动生成 Triton kernel，并规划内存、生成调度代码。
+
+  - 没被替换的部分 → Inductor 生成 Triton
+        （如把 silu*y 这两步自己融成一个 Triton kernel——Inductor 自带融合能力）
+  - 被替换成 torch.ops.myops.silu_and_mul 的部分 → Inductor 直接生成
+        "调用你这个自定义 op"的代码，跑到你手写的 CUDA kernel
+
+产物大致是一段生成的 Python + Triton（示意）：
+    def call(x, y):
+        # 若未替换：triton_fused_silu_mul[grid](x, y, buf0, ...)
+        # 若已替换：
+        buf0 = torch.ops.myops.silu_and_mul(x, y)
+        return buf0
+
+这段产物被缓存（两层，见下"三、编译产物的两层缓存"）。
+forward(x,y) 第二次起（同进程）直接命中内存缓存，跳过 ①②③④，只跑这段 call。
+
+关键变化：图 → 可执行代码（Triton / 调用自定义 kernel）。
+
+
+--------------------------------------------------------------------------------
+四阶段并排看
+--------------------------------------------------------------------------------
+你的代码        ① Dynamo        ② AOTAutograd       ③ post_grad hook     ④ codegen
+F.silu(x)*y → aten.silu     → aten.sigmoid      → myops.silu_and_mul → 生成Triton/
+              aten.mul        aten.mul(x,sig)      (一个自定义 op)       调用自定义kernel
+                              aten.mul(.,y)
+  Python        一张 FX 图      拆细+规整的           模式匹配替换          真正能跑的代码
+  逻辑          (高层算子)       post-grad 图         成自定义 kernel       (+磁盘缓存)
+
+
+--------------------------------------------------------------------------------
+亲手观察每一阶段（TORCH_LOGS）
+--------------------------------------------------------------------------------
+    TORCH_LOGS="graph_code"  python script.py   # Dynamo 抓的图(用 graph_code，见下注)
+    TORCH_LOGS="aot_graphs"  python script.py   # AOTAutograd 拆解后的图
+    TORCH_LOGS="output_code" python script.py   # Inductor 生成的最终代码(Triton)
+    TORCH_LOGS="graph_code,aot_graphs,output_code" python script.py   # 三阶段图全开
+
+  ★★ TORCH_LOGS 的两类名字：组件(component) vs 产物(artifact) ★★
+  这是 TORCH_LOGS 的核心设计，搞清楚就能任意组合。
+
+  1) 组件 component —— 用前缀 + 把该子系统日志【级别】调到 DEBUG，
+     打出该阶段的【全部】debug 日志(图 + guards + 调度 + ……，很吵)：
+         +dynamo     ① 抓图阶段全程 DEBUG(字节码 trace/guards/graph_code/break…)
+         +aot        ② AOTAutograd 全程 DEBUG(aot_graphs/joint/decompose…)
+         +inductor   ④ Inductor 全程 DEBUG(output_code/调度/fusion/Triton…)
+     例： TORCH_LOGS="+dynamo" python script.py
+
+  2) 产物 artifact —— 单项【开/关】某个具体产物的打印(没有级别概念，干净)：
+         graph_code  ① Dynamo 图(Python 源码形式)   ← 推荐
+         graph       ① Dynamo 图(表格形式) ※某些 torch 版本不输出，见下
+         aot_graphs  ② AOT 拆解后的 aten 图
+         output_code ④ Inductor 生成的最终代码
+         其它：graph_breaks / recompiles / bytecode / schedule / fusion / guards …
+     例： TORCH_LOGS="graph_code,output_code" python script.py
+
+  3) 两类的关系与组合：
+     - artifact 隶属于某个 component；开 +component(DEBUG) 会【连带】打开它名下的
+       artifact。例：只写 +dynamo，也会看到 [__graph_code] 的图(由 +dynamo 带出)。
+     - 逗号可【任意混搭】组件与产物：
+         TORCH_LOGS="graph_code,aot_graphs,output_code"  # 三阶段干净图(最常用)
+         TORCH_LOGS="+dynamo,+aot,+inductor"             # 三组件全 DEBUG(巨量噪音)
+         TORCH_LOGS="+dynamo,output_code"                # dynamo全DEBUG + inductor干净代码
+     - 记法：想精准看某阶段的图 → 用对应 artifact；
+             想深挖某阶段出了什么问题 → 用 +组件 看全程 DEBUG。
+
+  ★ 实测注意（本机 torch 版本）：
+     - 裸 TORCH_LOGS="graph" 不打印任何图(无 [__graph] 行)；要看 Dynamo 图用
+       graph_code(输出 [__graph_code])。
+     - 加 +dynamo 时虽能看到图，但那是 +dynamo 带出的 graph_code，不是 graph
+       生效——把 graph 去掉、只留 +dynamo，图照样在。
+     - 阶段③ post_grad 没有独立"组件"，它在 inductor 内；想看 post_grad 后的图用
+       artifact  post_grad_graphs（或在自定义 pass 里自行 print）。
+
+  阶段 ↔ 组件 ↔ 干净图 artifact 对照：
+    ┌────────────┬───────────────┬─────────────────────┐
+    │ 流水线阶段  │ 组件(+ DEBUG) │ 干净图 artifact      │
+    ├────────────┼───────────────┼─────────────────────┤
+    │ ① 抓图      │ +dynamo       │ graph_code (/ graph) │
+    │ ② 拆解      │ +aot          │ aot_graphs           │
+    │ ③ post_grad │ (属 inductor) │ post_grad_graphs     │
+    │ ④ codegen   │ +inductor     │ output_code          │
+    └────────────┴───────────────┴─────────────────────┘
+
+
+--------------------------------------------------------------------------------
+分阶段"直接在脚本里"查看产出的代码（沿用 forward(x,y)=F.silu(x)*y）
+--------------------------------------------------------------------------------
+每个阶段都有"在脚本里直接拿到图/代码"的 API，不必只靠环境变量。
+
+【阶段 ① Dynamo 抓的图】
+    # 方式 A：dynamo.export
+    import torch._dynamo as dynamo
+    gm, guards = dynamo.export(forward)(x, y)
+    gm.print_readable()
+
+    # 方式 B：自定义 backend 截获（更贴近 torch.compile 真实路径）
+    def print_backend(gm, example_inputs):
+        print("=== ① Dynamo FX 图 ===")
+        gm.print_readable()
+        return gm.forward          # 原样返回，照常执行
+    torch.compile(forward, backend=print_backend)(x, y)
+
+【阶段 ② AOTAutograd 拆解后的图（aten）】
+    # 方式 A：make_fx + 解包表，直接得到"拆解成 aten"的图（手动版，快速看）
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from torch._decomp import core_aten_decompositions
+    gm = make_fx(forward, decomposition_table=core_aten_decompositions())(x, y)
+    print("=== ② 拆解后的 aten 图 ===")
+    gm.print_readable()            # 会看到 silu 被拆成 sigmoid + mul
+
+    # 方式 B：aot_module_simplified 截获 AOT 前向图（最贴近真实流水线）
+    from torch._functorch.aot_autograd import aot_module_simplified
+    def inspect_aot_backend(gm, example_inputs):
+        def fw_compiler(aten_gm, inputs):
+            print("=== ② AOTAutograd 前向图(aten, functionalized) ===")
+            aten_gm.print_readable()
+            return aten_gm.forward
+        return aot_module_simplified(gm, example_inputs, fw_compiler=fw_compiler)
+    torch.compile(forward, backend=inspect_aot_backend)(x, y)
+    # 方式 A 是"手动版"快速看拆解；方式 B 是 torch.compile 内部真正走的图
+    # （含 functionalize、前后向处理），更准确。
+
+【阶段 ③ post_grad 改图后的图】
+    # 没有专门 export API，但你的 pass 本身就在改图——在 pass 里打印即可
+    def custom_post_grad_pass(graph):
+        print("=== ③ 改图前 ===")
+        graph.print_tabular()                 # FX Graph 可用 print_tabular / 遍历 nodes
+        count = pm_pass.apply(graph)
+        print(f"=== ③ 改图后（替换 {count} 处）===")
+        graph.print_tabular()
+    import torch._inductor.config as inductor_config
+    inductor_config.post_grad_custom_post_pass = custom_post_grad_pass
+    # 加两行打印就能亲眼看到"三个 aten 节点 → 一个自定义 kernel 节点"的替换。
+
+【阶段 ④ Inductor 最终生成的代码（Triton）】
+    # 阶段④产物是字符串代码而非 FX 图，拿它有两个办法：
+    # 方式 A：开 debug，Inductor 把生成代码写到磁盘并打印路径
+    import torch._inductor.config as inductor_config
+    inductor_config.debug = True
+    forward(x, y)
+    # 终端打印一个目录路径，里面的 output_code.py 就是生成的 Triton 代码
+    # 方式 B：用下面的 set_logs(output_code=True) 直接打到终端
+
+【通用法：torch._logging.set_logs(...) —— 环境变量的"代码版"】
+    # TORCH_LOGS="..." 完全可以写进脚本，等价开关就是 set_logs：
+    import torch._logging
+    torch._logging.set_logs(
+        graph_code=True,    # ① Dynamo 图   (= TORCH_LOGS="graph_code"，比 graph 可靠)
+        aot_graphs=True,    # ② AOT aten 图  (= "aot_graphs")
+        output_code=True,   # ④ Triton 代码  (= "output_code")
+    )
+    out = forward(x, y)     # 跑一次，三个阶段日志全部打印到终端
+    # 这一句 = TORCH_LOGS="graph_code,aot_graphs,output_code" python script.py，
+    # 但写进脚本、不依赖环境变量，最省事。
+
+对照速查：
+  ┌──────────────┬────────────────────────────────────┬──────────────────────────┐
+  │ 阶段          │ 专用 API                            │ 通用日志开关              │
+  ├──────────────┼────────────────────────────────────┼──────────────────────────┤
+  │ ① Dynamo     │ dynamo.export(fn)(x,y) / 自定义backend│ set_logs(graph_code=True)│
+  │ ② AOTAutograd│ make_fx(fn, core_aten_decompositions)│ set_logs(aot_graphs=True)│
+  │              │ / aot_module_simplified             │                          │
+  │ ③ post_grad  │ 在 pass 里 graph.print_tabular()     │ set_logs(post_grad_      │
+  │              │                                      │   graphs=True)           │
+  │ ④ Inductor   │ inductor_config.debug=True (落盘)    │ set_logs(output_code=True)│
+  └──────────────┴────────────────────────────────────┴──────────────────────────┘
+
+
+================================================================================
+三、编译产物的两层缓存（内存 + 磁盘）
+================================================================================
+torch.compile 同时用内存缓存和磁盘缓存，作用不同——不是二选一。
+
+┌─────────────────────────────────────────────────────────────┐
+│ 第 ① 层：内存缓存（同一个进程内）                              │
+│   编译产物（可执行的 call 函数 + 已加载的 kernel）保存在进程   │
+│   内存里。forward(x,y) 第二次调用直接拿内存里的产物跑，        │
+│   完全不碰磁盘、不重编译。                                     │
+│   生命周期：进程结束就没了。                                   │
+└─────────────────────────────────────────────────────────────┘
+                          │ 进程重启后内存没了，但磁盘缓存仍避免重编 ↓
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 第 ② 层：磁盘缓存（跨进程持久化）                              │
+│   Inductor 把生成的代码 / 编译好的 kernel 写到磁盘             │
+│   （默认 /tmp/torchinductor_<user>/，可由                     │
+│     TORCHINDUCTOR_CACHE_DIR 改）。换个进程、甚至重启机器后再跑 │
+│   同样的模型，不必从 Triton 源码重编，直接读磁盘上编好的产物。 │
+│   生命周期：留在磁盘，直到被清理。                             │
+└─────────────────────────────────────────────────────────────┘
+
+各自解决什么问题：
+  ┌──────────┬────────────────────────┬──────────────────────────┐
+  │          │ 内存缓存                │ 磁盘缓存                  │
+  ├──────────┼────────────────────────┼──────────────────────────┤
+  │ 解决     │ 同一次运行里第2次起别重编│ 下次重启进程别重编        │
+  │ 存什么   │ 可直接调用的产物(在内存) │ 生成代码+编好的kernel(磁盘)│
+  │ 命中后   │ 直接执行，零额外开销     │ 跳过Triton→PTX→SASS编译， │
+  │          │                        │ 但仍要从磁盘加载          │
+  │ 活多久   │ 进程退出即失效          │ 持久，跨进程/重启         │
+  └──────────┴────────────────────────┴──────────────────────────┘
+
+一次推理实际怎么走：
+  forward(x,y) 第 1 次（进程内首次）
+     ├─ 内存里没有 → 走完整流水线 ①②③④
+     ├─ 但 Inductor 编译前先查【磁盘缓存】：
+     │     命中 → 直接读磁盘上编好的 kernel（省掉 Triton 编译）
+     │     未命中 → 真编译，然后把产物【写入磁盘】
+     └─ 把可执行产物放进【内存缓存】
+  forward(x,y) 第 2 次起（同进程）
+     └─ 直接命中【内存缓存】，跑产物，不碰磁盘
+  所以：磁盘缓存在"进程首次编译"时起作用（要不要从头编）；
+        内存缓存在"同进程后续调用"时起作用（要不要再走流水线）。
+
+--------------------------------------------------------------------------------
+如何启用磁盘缓存
+--------------------------------------------------------------------------------
+磁盘缓存默认就是开启的（近版本 PyTorch 的 Inductor FX graph cache 默认 True），
+通常无需手动开。下面是显式控制的几个开关。
+
+【原生 PyTorch】
+  # 1) Inductor FX 图缓存（把编译产物落盘，跨进程复用）——默认已开
+  import torch._inductor.config as inductor_config
+  inductor_config.fx_graph_cache = True            # 等价环境变量 TORCHINDUCTOR_FX_GRAPH_CACHE=1
+
+  # 2) AOTAutograd 缓存（连同②阶段的拆解图一起缓存，命中更早）
+  import torch._functorch.config as functorch_config
+  functorch_config.enable_autograd_cache = True    # 等价 TORCHINDUCTOR_AUTOGRAD_CACHE=1
+
+  # 3) 指定磁盘缓存目录（默认 /tmp/torchinductor_<user>/）
+  #    换目录便于持久保存/共享，避免 /tmp 被清
+  export TORCHINDUCTOR_CACHE_DIR=/path/to/cache     # 或 os.environ[...] = ...
+
+  # 验证命中：用 TORCH_LOGS 看缓存是否命中
+  TORCH_LOGS="+torch._inductor.codecache" python script.py   # 打印 cache hit/miss
+
+  # 关闭磁盘缓存（调试/强制重编时）
+  inductor_config.force_disable_caches = True        # 等价 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
+
+【vLLM 特有】
+  vLLM 在原生 Inductor 缓存之上又包了一层自己的编译缓存：
+    - 缓存根目录：    VLLM_CACHE_ROOT（默认 ~/.cache/vllm），
+                     编译缓存落在 VLLM_CACHE_ROOT/torch_compile_cache/...
+                     （见 vllm/compilation/decorators.py:544-545、
+                       compiler_interface.py:477 设置 TORCHINDUCTOR_CACHE_DIR）
+    - 默认开启；vLLM 内部还会显式设 current_config["fx_graph_cache"] = True
+                     （compiler_interface.py:499）
+    - 关闭开关：      VLLM_DISABLE_COMPILE_CACHE=1
+                     （envs.py:136/319，decorators.py:564/689 据此跳过缓存）
+  即：vLLM 默认就用磁盘缓存；要禁用设 VLLM_DISABLE_COMPILE_CACHE=1，
+      要换位置设 VLLM_CACHE_ROOT。
+
+
+================================================================================
+四、什么是 Triton kernel
+================================================================================
+Triton 是用 Python 语法写 GPU kernel 的语言（和编译器），OpenAI 开发。
+"Triton kernel"就是用它写出来的、跑在 GPU 上的并行计算函数——
+和 CUDA kernel 干一样的事，但写起来比 CUDA 简单得多。
+Inductor"自动生成 Triton kernel"，就是把计算图翻译成这种代码。
+
+同一个 silu*y，CUDA vs Triton：
+
+  CUDA 写法（C++，你自己管每个线程算哪个元素）：
+    __global__ void silu_and_mul_kernel(float* out, const float* x,
+                                        const float* y, int n) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;   // 手算全局索引
+        if (i < n) {                                      // 手动边界检查
+            float s = x[i] / (1.0f + expf(-x[i]));
+            out[i] = s * y[i];
+        }
+    }
+
+  Triton 写法（Python，按"块"思考，省去很多底层细节）：
+    @triton.jit
+    def silu_and_mul_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        pid  = tl.program_id(0)                   # 当前是第几个"块"
+        offs = pid * BLOCK + tl.arange(0, BLOCK)  # 这个块负责的一段下标(向量)
+        mask = offs < n                           # 边界 mask
+        x = tl.load(x_ptr + offs, mask=mask)      # 一次 load 一整段
+        y = tl.load(y_ptr + offs, mask=mask)
+        s = x * tl.sigmoid(x)                      # SiLU
+        tl.store(out_ptr + offs, s * y, mask=mask)
+
+  关键区别在编程模型：
+  ┌────────────────────┬──────────────────┬─────────────────────┐
+  │                    │ CUDA             │ Triton              │
+  ├────────────────────┼──────────────────┼─────────────────────┤
+  │ 语言               │ C/C++            │ Python(@triton.jit) │
+  │ 思考粒度           │ 单个线程算一个元素│ 一个块算一段向量     │
+  │ 内存合并/共享内存   │ 你手动优化        │ 编译器自动优化       │
+  │ threadIdx/blockIdx │ 你手算            │ program_id 抽象掉    │
+  │ 上手难度           │ 高               │ 中                  │
+  │ 极致性能           │ 上限更高(全手控)  │ 多数场景接近手写CUDA │
+  └────────────────────┴──────────────────┴─────────────────────┘
+
+为什么 Inductor 选 Triton 做生成目标：
+    1) 好生成：抽象层次高，编译器只需决定块大小/循环结构，
+       不必操心寄存器分配、内存合并（Triton 编译器自己搞定）。
+    2) 自动调优：能对 BLOCK 等参数 autotune，按 shape/GPU 自动选最优。
+    3) 可移植：同一份代码能编到 NVIDIA、AMD 等不同后端。
+
+放回 vLLM / 例子里：
+    没被替换的普通算子  → Inductor 自动生成 Triton kernel
+    被 hook 替换成的    → 跑手写的 CUDA kernel（Inductor 不生成，直接调用）
+  这解释了 vLLM 的取舍：
+    性能最关键、需极致手控的核心算子(attention、QK-Norm+RoPE) → 手写 CUDA
+    其余大量普通算子                                          → Inductor 生成 Triton
+
+
+================================================================================
+五、Triton 代码最后会编译成 CUDA 吗
+================================================================================
+不会经过 CUDA C++（不调 nvcc 编 .cu）。Triton 有自己的一条编译链，
+直接生成 GPU 底层汇编(PTX/SASS)，绕过了 CUDA C++ 这一层。
+但终点和 CUDA 一样——都是 NVIDIA GPU 上跑的机器码。
+
+关键区分："CUDA C++" vs "CUDA 平台"：
+  ┌──────────────────────────────────────────┬──────────────┐
+  │ "CUDA"指什么                               │ Triton 经过吗 │
+  ├──────────────────────────────────────────┼──────────────┤
+  │ CUDA C++ 源码(.cu, __global__, nvcc 编)    │ ❌ 不经过     │
+  │ CUDA 平台/运行时(PTX、SASS、NVIDIA GPU 跑) │ ✅ 经过       │
+  └──────────────────────────────────────────┴──────────────┘
+  准确说法：Triton 不编译成 CUDA C++，但最终产物运行在 CUDA 平台上(PTX/SASS)。
+
+两条编译链：
+
+  CUDA C++ 的链（手写 kernel 走这条）：
+    .cu 源码(__global__) ─nvcc─▶ PTX ─ptxas─▶ SASS ─▶ GPU
+
+  Triton 的链（Inductor 生成的 kernel 走这条）：
+    @triton.jit Python ─Triton前端─▶ Triton IR ─lowering─▶ LLVM IR
+        ─LLVM(NVPTX)─▶ PTX ─ptxas─▶ SASS ─▶ GPU
+
+两条链在 PTX 处"汇合"：
+    CUDA 用 nvcc 走"C++ → PTX"；
+    Triton 用"自己的前端 + LLVM"走"Python → LLVM IR → PTX"，
+    完全不碰 C++、不碰 nvcc。
+    但 Triton 仍依赖 CUDA Toolkit 的一部分——ptxas(把 PTX 汇成 SASS)
+    和 CUDA Driver(加载、发射 kernel)。
+    所以它"用到 CUDA 平台的底层工具"，但"不经过 CUDA C++ 编译器"。
+
+  都想到达"GPU 机器码 SASS"这个终点：
+    CUDA C++：  C++    ──nvcc──────────▶ PTX ──ptxas──▶ SASS
+    Triton：    Python ─Triton/LLVM────▶ PTX ──ptxas──▶ SASS
+                                          ▲
+                                 两条路在 PTX 这里合流
+
+放回 vLLM 的图（一张图里两类 kernel 的来历）：
+    Inductor 生成的 Triton kernel ──Triton/LLVM──▶ PTX ─┐
+                                                         ├─ptxas─▶ SASS ─▶ GPU
+    vLLM 手写的 CUDA kernel       ──nvcc──────────▶ PTX ─┘
+  两者源语言不同、编译前端不同，但殊途同归，最后都是 GPU 上的 SASS，
+  在同一次推理里协同执行。
+
+
+================================================================================
+六、一句话总结
+================================================================================
+torch.compile 是四棒接力：
+    ① Dynamo 把 Python 抓成 FX 图
+    ② AOTAutograd 把高层算子拆成规整的 aten「post-grad 图」
+    ③ post_grad 钩子（vLLM/你的 pass 在此把分步子图换成自定义 kernel）
+    ④ Inductor codegen 把图编译成 Triton / 自定义 kernel 调用并缓存
+第一次调用走完全程，之后直接跑缓存好的产物。
+
+Triton kernel：用 Python(@triton.jit) 写的 GPU kernel，以"块"为粒度、
+把底层优化交给编译器；Inductor 自动把图翻译成它。它不编译成 CUDA C++、
+不调 nvcc，走 Triton→LLVM→PTX→(ptxas)→SASS，最终仍跑在 CUDA 平台上，
+和手写 CUDA kernel 在 PTX/SASS 层汇合。
+
+
+相关文档：
+    ../fork/fused_silu_mul_compile_hook.py   最小可运行实现
+    ../fork/fused_silu_mul_compile_hook.txt  本例 ↔ vLLM 组件对照
+    ../cmake/_C扩展的Python调用过程.txt       TORCH_LIBRARY → torch.ops 调用机制
