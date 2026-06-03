@@ -1,0 +1,388 @@
+================================================================================
+torch.compile 子图替换：search_fn / replace_fn 设计与匹配机制
+================================================================================
+
+本文整理 register_replacement(search_fn, replace_fn, example_inputs, fwd_only, pm_pass)
+里 search_fn / replace_fn 的设计要点与 pattern 匹配机制，对应本仓库
+  src/app/replace_pass.py  (RMSNormRoPEreplacePass：定义“换什么”)
+  src/app/Installer.py     (Installer：负责“怎么装”)
+  src/app/model.py         (QKNorm_ROPE：eager 参考实现)
+  src/inference/fused_qknorm_rope_kernel.cu (真实 CUDA kernel)
+
+约定的融合算子（占位 schema 需改成此签名并实现 kernel）：
+  run_fused_QKNorm_and_ROPE(Tensor x, Tensor weight, Tensor cos, Tensor sin) -> Tensor
+
+
+================================================================================
+一、核心前提：matcher 匹配的是“图”，不是“函数/源码”
+================================================================================
+
+register_replacement 的工作流程：
+  1) 用 example_inputs（具体形状的样例张量）把 search_fn 【trace 成一张小图】(needle，针)。
+  2) 把这张针，去【model 编译后的 FX / Inductor 图】(haystack，草堆)里找【同构子图】。
+  3) 找到就把那段替换成 replace_fn（即一次自定义算子调用）。
+
+由此推出两条贯穿全文的原则：
+  - search_fn 要长得像“草堆里实际存在的那段图”，而不是像“数学公式”或“model 源码”。
+  - 可变的张量（weight / cos / sin）必须作为 search_fn 的【输入形参】，
+    matcher 才能把它们当【通配符】绑定到图里对应的节点；凡是从 self 里读的、
+    非输入的东西，会被【烤成常量/捕获张量】，导致只能匹配那一个具体实例、且更脆。
+
+
+================================================================================
+二、为什么不能直接用 model._apply_rope 当 search_fn
+================================================================================
+
+技术上可以“复用 model 的代码”，但【不能直接拿 _apply_rope 顶替 search_fn】，原因：
+
+(1) 签名 / 覆盖范围对不上（最硬的障碍）
+    - 融合算子 replace_fn(x, weight, cos, sin) 一次吃掉【RMSNorm + RoPE】整段，
+      需要 weight、cos、sin 三个张量作为输入。
+    - register_replacement 要求 search 和 replace 【输入签名一致】：matcher 匹配到
+      pattern 后，会把“绑定到的那几个节点”按位置传给 replace_fn。
+    - 而 model._apply_rope(self, x, cos, sin) 只做 RoPE 的一半：
+        * 不含 RMSNorm；
+        * 不接收 weight。
+      用它，匹配到的子图缺了 RMSNorm 那段，与算子语义对不上；签名也不符。
+
+(2) _apply_rope 里有 pattern 不想要的额外算子
+        rot = x[..., :self.rotary_dim]          # slice（在链路内部）
+        pass_through = x[..., self.rotary_dim:] # slice
+        return torch.cat([rot, pass_through], dim=-1)  # cat
+    即便 rotary_dim==head_dim 让 pass_through 为空、cat 成 no-op，这些 slice/cat
+    仍会出现在 trace 的图里。pattern 按结构精确匹配，链路内部多余节点会让匹配更脆/失败。
+
+(3) search_fn 会被 trace 成 pattern，最好是“输入清晰的纯函数”
+    - matcher 期望输入就是那几个张量参数(x,weight,cos,sin)，好把图里对应张量绑定上去。
+    - _apply_rope 是绑定方法，闭包 self；其参数表(x,cos,sin)与算子入参表(x,weight,cos,sin)
+      不是一回事。让“待匹配模板”依赖一个活的模块实例及其状态，不如自洽小函数清晰可控。
+
+(4) 职责解耦
+    - model.py：人读的、可训练的 eager 参考实现（带 pass_through、interleave 完整分支等）。
+    - search_fn：喂给 matcher 的【规范化匹配模式】，只保留要融合的核心算子序列。
+    - 让 pattern 直接依赖 model 内部方法 → 强耦合：model 内部重构可能悄悄破坏匹配。
+
+(5) 代价：另写一份有“重复/漂移”风险
+    - search_fn 必须和 model.py 的数学保持同步，否则 model 改了、pattern 没改 → 匹配不上。
+
+正确的“复用”姿势 —— 把核心数学抽成【不依赖 self 的纯函数】，两边共用：
+    def rmsnorm_rope_neox(x, weight, cos, sin, eps):
+        xf = x.float()
+        xn = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype) * weight
+        c2 = torch.cat([cos[:,None,:], cos[:,None,:]], -1)
+        s2 = torch.cat([sin[:,None,:], sin[:,None,:]], -1)
+        return xn * c2 + rotate_half(xn) * s2
+    - model.forward：自己查好 cos/sin，再调 rmsnorm_rope_neox(x, self.weight, cos, sin, self.eps)
+    - search_fn   ：return rmsnorm_rope_neox(x, weight, cos, sin, self.eps)
+      （weight/cos/sin 是形参=通配符；eps 是常量）
+    既单一实现(不漂移)、又满足 pattern 对“纯函数 + (x,weight,cos,sin) 签名”的要求。
+
+
+================================================================================
+三、“pattern 会匹配不上 _apply_rope 吗” —— 方向与多余算子的位置
+================================================================================
+
+要点：pattern 不是匹配 _apply_rope 这个【函数】，而是匹配 _apply_rope 生成的【图】。
+问题应改成：“干净的 search_fn 针，能否在 model 跑出来的(含 slice/cat 的)草堆图里找到？”
+
+匹配是“图 vs 图”。草堆比针“多东西”本身不是问题，关键看【多余节点在哪】：
+
+  多余节点的位置                              结果
+  ------------------------------------------  -----------------------------
+  夹在 pattern 节点【中间】(打断算子链)        子图不同构 → 匹配不上
+  只是被匹配区域的【下游/上游消费者】(在外面)  不影响，照样匹配并替换
+  是 no-op，被规范化 / DCE 提前消掉            匹配前就没了，等价于针
+
+_apply_rope 的 slice/cat：
+  - 开头 rot = x[..., :rotary_dim] 的 slice 若留着，夹在 RMSNorm 与旋转之间(链路内部)
+    → 针里没有它 → 匹配不上。
+  - 结尾 cat([rot, pass_through]) 把结果包一层(下游消费者)，并由 pass_through 再引一条 slice。
+
+为什么实际仍能匹配：靠 rotary_dim == head_dim + 规范化
+  - 设 rotary_dim==head_dim：
+      pass_through = x[..., head_dim:] → 空张量；
+      cat([rot, 空]) → 等于 rot，是 no-op；
+      rot = x[..., :head_dim] → 取全部，也是 no-op。
+  - 这些 no-op 很可能在 matcher 跑之前被 Inductor 的规范化 / 死代码消除折叠掉，
+    草堆那段退化成“纯 RMSNorm + 旋转”，与针一致 → 能匹配。
+  - 但这依赖“优化器恰好把 no-op 消干净”。若没消掉、而针里又没写这些 slice/cat → 匹配不上、
+    不融合(hook 里 count=0，不报错也不替换)。
+
+核心难点：针要长得像“实际 lowered 图里那段”，常需把 model 真编译出来、打印 Inductor 图，
+照着图来调 pattern，而不是凭源码猜。register_replacement 有一些规范化能抹平部分差异，但非万能。
+
+
+================================================================================
+四、为什么不能把整个 forward 体当 search_fn（“肯定能匹配”是错的）
+================================================================================
+
+设想把 search_fn 写成 model.forward 的主体：
+    x = self._rms_norm(x)
+    if positions is None:
+        positions = torch.arange(num_tokens, device=x.device)
+    cos = self.cos_sin_cache[positions, :self.half]
+    sin = self.cos_sin_cache[positions, self.half:]
+    x = self._apply_rope(x, cos.to(x.dtype), sin.to(x.dtype))
+    return x
+不仅不“肯定匹配”，反而会坏掉：
+
+(1) 硬约束：search_fn 与 replace_fn 签名必须一致
+    - 算子需要 weight/cos/sin 三个张量输入；matcher 把绑定的节点按位置传给 replace_fn。
+    - 上面这版签名是 search_fn(x)，只有一个输入 → replace_fn 也只能是 (x)，
+      那算子要的 weight/cos/sin 从哪来？对不上。
+
+(2) 从 self 读的东西变成“烤死的常量”，而不是通配符
+    - example_inputs 里给的张量 → pattern 的【占位符(通配符)】，可绑定图里任意匹配节点。
+    - search_fn 里凡是非输入、从 self 读的：
+        x = self._rms_norm(x)                       # 内部用 self.weight / self.eps
+        cos = self.cos_sin_cache[positions, :half]  # self.cos_sin_cache 是具体 buffer
+      会被当成常量/捕获张量【烤进 pattern】 → 只匹配“用了这一份 weight、这一份 cache 的图”，
+      且 matcher 无法把它们当通配符绑定到真实图的 parameter/buffer 节点。通用性、鲁棒性都崩。
+
+(3) 还引入更难匹配的节点
+    - torch.arange(num_tokens)（依赖动态 num_tokens）、按 positions 的 gather 高级索引、
+      cos.to(dtype) 等都会进 pattern。节点越多越具体，越容易匹配不上。
+
+方向再强调：针越小、越只含核心算子、把可变量暴露成输入(通配符)，越容易匹配、越通用。
+把整个 forward(含 buffer 索引、arange、self.weight)塞进针，等于把针做得又大又具体，
+还把该当通配符的 weight/cos/sin 烤成常量 —— 更难匹配，且违反 search/replace 同签名硬约束。
+
+
+================================================================================
+五、replace_fn / 算子签名里到底该带哪些参数
+================================================================================
+
+关键前提：当前匹配的子图中，cos/sin 已经是“按 position 取好的、每 token 一行”
+([num_tokens, half])，且 search_fn 假设 rotary_dim == head_dim(无 pass_through)。
+这两点决定了哪些东西【不用】进 op 签名。
+
+特别地，op 签名【不需要 position_ids，也不需要完整的 cos_sin_cache】，因为：
+  - “按 position 查表”这一步(cos_sin_cache[positions, :half] / [positions, half:])
+    已经在 model.forward 里、即【op 外面】做完了；
+  - 传进子图/op 的 cos、sin 是【已经取好的、每 token 一行】的结果([num_tokens, half])，
+    不再是“完整大表 + 位置索引”。
+  - 因此 op 只吃现成的 cos/sin 即可，position_ids 与完整 cache 都无须出现在 op 签名里。
+  - (对照：真实 kernel fused_qk_norm_rope 是把完整 cache + position_ids 一起传进去、
+    在 kernel 内部 gather —— 那是下面“方案 B”，与当前“gather 在 op 外”的方案 A 不同。)
+
+(1) rotary_dim：不用传，且子图已剔除“不旋转的维度”
+    - search_fn 写的是“整段都旋转”(rotary_dim==head_dim)，图里不存在 rot/pass_through/cat，
+      即不存在“不旋转的维度”，已隐含 rotary_dim = head_dim。
+    - rotary_dim 可由张量形状推：rotary_dim = x.shape[-1]，或 = cos.shape[-1]*2。
+    - 反之，若要支持 rotary_dim < head_dim(部分旋转)，必须：
+        a. 在 search_fn 里重新加回 slice + cat(pass_through)(否则匹配不上真实图)；
+        b. 再谈把 rotary_dim 传入(或仍从 cos 形状推)。
+
+(2) eps：需要，但它是“标量常量”，不是张量输入/通配符
+    - RMSNorm 要用 eps；在子图里 eps 是字面常量(self.eps)，出现在 rsqrt(ms + eps) 的 add 上。
+    - op schema 应带 eps：
+        run_fused_QKNorm_and_ROPE(Tensor x, Tensor weight, Tensor cos, Tensor sin, float eps) -> Tensor
+    - replace_fn 把 eps 作为【常量】喂给 op。注意：staticmethod 读不到 self.eps，
+      应改成【实例方法 / 闭包】捕获 self.eps，或让其接收 eps 形参。
+    - 一句话：eps 需要，但作为“每个模型固定的标量超参”烤成常量传给 op 即可，不必当通配符。
+
+(3) 其它 op 真正需要、但同样是“常量/编译期已知”的东西
+    对照真实 host kernel fused_qk_norm_rope，还需要：num_heads_q/k/v、head_dim、is_neox、
+    position_ids，甚至【分开的 q_weight / k_weight】。在 pattern 里：
+    - num_heads、head_dim、eps：配置常量/可从形状推，作为【常量烤进算子调用实参】。
+      ★ 关键区分：【replace_fn 的参数】不必和【它调用的算子(op)的形参】完全一致。
+        * “签名必须一致”只约束 search_fn ↔ replace_fn 互相之间(都是 (x,weight,cos,sin)，
+          因为这 4 个是 matcher 绑定的张量通配符)；
+        * replace_fn 内部调用的算子可以有【更多形参】(num_heads/head_dim/eps 等常量)，
+          这些不来自 pattern，而是 replace_fn 从 self 读出后填进去的。
+      replace_fn 签名仍是 (x, weight, cos, sin)(与 search_fn 一致)，
+      num_heads/head_dim/eps 从 self 读出后传给算子：
+          op(x, weight, cos, sin, num_heads, head_dim, eps)   # 算子 7 参 ≠ replace_fn 4 参
+      对应算子 schema：
+          <op_name>(Tensor x, Tensor weight, Tensor cos, Tensor sin,
+                    int num_heads, int head_dim, float eps) -> Tensor
+      (本仓库已这样实现：replace_fn 改为实例方法读 self.head_num/head_dim/eps；
+       Installer 的 register_fake 用 *args 吸收这些常量入参。)
+    - is_neox/interleave：【不作算子入参】，而是【在 Runner 里按其值选不同的算子】——
+      neox 与 interleave 各注册一个融合算子(不同 op_name)，Runner 据 self.interleave 传入
+      对应 op_name，replace_fn 再按 op_name 解析出该算子。
+      (这样两种风格的 fake/schema/kernel 各自独立，避免在一个算子里塞运行时分支。)
+    - position_ids + 完整 cache：有个【设计分叉】(见下)。
+
+(4) 关键分叉：gather(按位置查表)在 op 外还是 op 内
+    - 方案 A：gather 留在 op 外(=当前实现)。
+        cos/sin 是 model.forward 里 cos_sin_cache[positions] 之后的结果([num_tokens, half])，
+        即“查表”发生在 op 之外。
+        → op 不需要 position_ids、不需要完整 cache、也不需要 rotary_dim；只吃已取好的 cos/sin。
+        → op 签名可停在 (x, weight, cos, sin, eps)。pattern 不含 cache 索引/arange，易匹配。
+    - 方案 B：gather 进 op(=真实 kernel fused_qk_norm_rope 的做法)。
+        把完整 cache + position_ids 一起传进去、在 kernel 内部 gather
+        (cos_sin_cache + pos_id*rotary_dim)。
+        → op 签名: (qkv, q_w, k_w, cos_sin_cache, position_ids, eps, is_neox, heads...)。
+        → pattern 必须含 cache[positions] 的 gather + arange，匹配更难。
+
+  方案对比：
+    方案 A: op (x,weight,cos,sin,eps)，cos/sin 已按 token 取好；pattern 不含索引；简单易匹配。
+    方案 B: op (qkv,q_w,k_w,cos_sin_cache,position_ids,...)；pattern 含 gather+arange；难匹配。
+
+结论(本节)：
+  - 列的 (x, weight, cos, sin, eps) 对【方案 A】已足够；rotary_dim 不必要。
+  - 要不要更多参数，取决于打算把多少“位置查表 / 头结构”逻辑塞进融合 op —— 塞得越多，
+    pattern 越难匹配。
+
+
+================================================================================
+六、加不加 rotary_dim：两种方案及取舍（全旋转 vs 部分旋转）
+================================================================================
+
+两种方式的本质区别：slice/pass_through/cat 这段处理，放在 op 外面还是包进 op 里。
+
+  方案 A（不加 rotary_dim）：
+    - search_fn 不含 rot=x[...,:rotary_dim] / pass_through / 末尾 cat。
+    - 只匹配“整段都旋转”(rotary_dim==head_dim)的图；传进 op 的 x 直接是 rot(全部参与旋转)，
+      op/kernel 不用管 pass_through。
+  方案 B（加 rotary_dim）：
+    - 把 slice + pass_through + cat 写进 search_fn → 这些节点进入待匹配子图 → 匹配后整段被
+      替换成 op → op/kernel 内部实现“只旋转前 rotary_dim 维、其余原样透传”。
+
+关键事实：本仓库 runner.build_model 里 rotary_dim = head_dim（始终全旋转）：
+    QKNorm_ROPE(dim=self.head_dim, rotary_dim=self.head_dim, ...)
+  此时 pass_through 恒为空、rot 取全部、末尾 cat 是 no-op（通常被规范化/DCE 折叠）。
+
+对比表：
+  维度              方案 A(不加,全旋转)            方案 B(加 rotary_dim,部分旋转)
+  ----------------  -----------------------------  -----------------------------------
+  pattern 复杂度    小、干净 → 易匹配、鲁棒        多 slice/cat → 大、更具体、更脆
+  通用性            仅 rotary_dim==head_dim        支持 rotary_dim <= head_dim
+  op/kernel         无需 pass_through 逻辑          kernel 要实现“旋转前段 + 透传后段”
+                                                   (真实 fused_qk_norm_rope 本就支持)
+  rotary_dim        不传，可由 cos.shape[-1]*2 推   需作为常量烤进 pattern；一条 pattern 绑一个值
+  匹配风险          低                              slice 下标常量要与真实图精确对上，且依赖规范化
+
+方案 B 的隐藏代价：
+  - slice 把 rotary_dim 当字面常量烤进 pattern → 一条 pattern 只能匹配一个特定 rotary_dim；
+    要支持多种 rotary_dim 需注册多条 pattern。方案 A 用形状推，天然不挑具体数值。
+
+建议：
+  - 现在(rotary_dim==head_dim) → 用方案 A。更简单、更鲁棒；pass_through 对你是死代码。
+  - 只有确需部分旋转(rotary_dim < head_dim，如某些 GPT-J / rotary_pct 模型) → 才上方案 B：
+    把 slice/pass_through/cat 加进 search_fn，op schema 带 rotary_dim，kernel 实现
+    “前 rotary_dim 旋转、其余透传”(真实 kernel 的 rotary_lanes 即做此事)。
+
+补充：即使走方案 A，kernel 本身仍可保留 rotary_dim 参数(真实 kernel 就有)。区别只在
+“pattern 要不要表达 slice”—— A 不表达(图里没有)，调用时把 rotary_dim 设成 = head_dim
+(或让 kernel 从 cos 长度推)即可。A 不是“kernel 不支持部分旋转”，而是“这次匹配的图不含
+部分旋转，所以 pattern 不写它”。
+
+
+================================================================================
+七、rotary_dim 不同是否=不同子图；子图是否要求形状完全一致
+================================================================================
+
+【问题 1】rotary_dim 不同 → 不同子图吗？看走哪种方案：
+
+  方案 B(pattern 含 x[..., :rotary_dim] 切片) → 是，不同值=不同子图：
+    - 切片结束下标 rotary_dim 被当字面整数常量烤进 pattern：
+        rotary_dim=64 → slice(dim=-1, start=0, end=64)
+        rotary_dim=48 → slice(dim=-1, start=0, end=48)
+    - 64/48 是节点上的字面常量参数，matcher 按字面匹配 → rotary_dim=64 的 pattern 匹配不上
+      rotary_dim=48 的图 → 要同时支持多个值，需各注册一条 register_replacement。
+  方案 A(无切片,rotary_dim==head_dim) → 不存在该常量：
+    - pattern 不含 rotary_dim 字面常量，隐含 = head_dim、靠形状推，不因 rotary_dim 取值而变。
+
+【问题 2】子图要求输入/输出形状“完全一样”吗？拆成两个不同的“一样”：
+
+  (1) pattern 匹配时，要不要和 example_inputs 的具体形状完全一致？ —— 不要。
+      - register_replacement 用 example_inputs(具体形状如 [8,8,64]) trace 出 pattern，
+        但匹配按“算子结构 + 节点上的字面常量”进行，维度大小基本保持【符号化】、不被钉死。
+      - 用 [8,8,64] trace 的 pattern，能匹配 [16,8,64]、[N,8,64] 等不同 batch/token 数的图。
+      - 真正约束匹配的是字面常量：slice 下标、cat/mean 的 dim=-1、dtype、显式 view/reshape
+        里写死的尺寸等。
+        * cat([c, c], dim=-1) 是“两个输入喂给 cat”的结构(不是尺寸常量)，不挑具体长度；
+        * x.view(8, 512) 里的 512 是会挑的字面尺寸。
+
+  (2) replace 的输出，要不要和 search 的输出形状/类型一致？ —— 要(必须)。
+      - replace 是就地替换：matcher 把图里那段换成 op，下游节点原样接着用 op 的输出，
+        故 op 产出张量必须能无缝顶替原子图输出 —— shape / dtype / device 等价，否则下游对不上、
+        形状传播会崩。
+      - 这正是 fake 实现写成 torch.empty_like(x) 的原因：声明“输出 == 输入 x 的形状/类型”，
+        与 search_fn 输出(RMSNorm+RoPE 不改形状 = x 形状)一致。
+      - 输入：replace 与 search 共享“同一批被绑定的张量”(按位置传入)，天然一致。
+      - 输出：必须等价(可被下游替用)。若 op 会改形状，fake 须按真实逻辑算出正确输出形状。
+
+小结：
+  - rotary_dim 作为切片常量会让方案 B 的子图随值而异；方案 A 无此常量。
+  - pattern 匹配对 batch/token 这类维度是【形状无关】的，只钉住“结构 + 字面常量”。
+  - replace 的【输出必须能等形等类型地顶替】search 的输出(fake 用 empty_like(x))。
+
+
+================================================================================
+八、背景：cos_sin_cache 指针如何获取与读取（kernel 侧，供对照）
+================================================================================
+
+“cos/sin 在 op 外还是 op 内 gather”关系到 cache 指针怎么来、kernel 怎么读，简述如下。
+
+(A) 指针怎么获取：源头是 host 端对 PyTorch 张量调 .data_ptr()
+    顶层 host 入口 fused_qk_norm_rope(torch::stable::Tensor& cos_sin_cache, ...) 收到张量，
+    张量封装了“指向 GPU 显存的指针 + 形状 + dtype + 设备”。取数据首地址：
+        cos_sin_cache.data_ptr()   // 返回 void*（只有地址、无类型）
+    这个地址就是 Python 端 register_buffer 的那个张量(已 .cuda())在显存里的首地址。
+
+(B) 透传：中间 launch 层形参都是 void const* cos_sin_cache，原样下传不碰数据：
+    fused_qk_norm_rope (.data_ptr() → void*)
+      → launchFusedQKNormRopeNTokenHeads (void const*)
+        → launchFusedQKNormRope (void const*)
+          → fusedQKNormRopeKernel<<<>>> (void const* cos_sin_cache_void)  // kernel 形参
+    用 void* 透传，是因为 cache 的 dtype 编译期未知，进模板化 kernel 后再还原类型。
+
+(C) dtype 何时确定：host 端两层 dispatch 宏，按 scalar_type() 选模板实例
+        VLLM_STABLE_DISPATCH_HALF_TYPES(qkv.scalar_type(), ..., [&]{ using qkv_scalar_t = scalar_t;
+          VLLM_STABLE_DISPATCH_FLOATING_TYPES(cos_sin_cache.scalar_type(), ..., [&]{
+            using cache_scalar_t = scalar_t;
+            launchFusedQKNormRopeNTokenHeads<qkv_scalar_t, cache_scalar_t>(...);
+          });});
+    把运行期 dtype 翻译成编译期模板参数 scalar_t_cache(即 kernel 里的 T_cache)。
+
+(D) kernel 内读取：还原类型后用指针算术取值
+        T_cache const* cos_sin_cache = reinterpret_cast<T_cache const*>(cos_sin_cache_void);
+        int64_t pos_id = position_ids[tokenIdx];
+        T_cache const* cache_ptr = cos_sin_cache + pos_id * rotary_dim;  // 定位本 token 那一行
+        int  embed_dim = rotary_dim / 2;                                 // = half
+        T_cache const* cos_ptr = cache_ptr;                              // 前半 = cos
+        T_cache const* sin_ptr = cache_ptr + embed_dim;                  // 后半 = sin
+        // 每线程按自己的维度下标 dim_idx 取频率：half_dim = dim_idx / 2
+        float cos_val = CacheConverter::convert(VLLM_LDG(cos_ptr + half_dim));
+        float sin_val = CacheConverter::convert(VLLM_LDG(sin_ptr + half_dim));
+    要点：cache 行优先一维数组；pos*rotary_dim 定位行、+embed_dim 分 cos/sin、+half_dim 取频率；
+          VLLM_LDG(=__ldg) 走只读缓存；CacheConverter::convert 把 half/bf16 转 float 再算。
+    与 Python 对照：cache[pos] ↔ +pos*rotary_dim；cache[pos,:half] ↔ cos_ptr；
+                   cache[pos,half:] ↔ sin_ptr；cos[...,i] ↔ cos_ptr+half_dim。
+
+注意：真实 kernel 是“完整 cache + position_ids 进 kernel、内部 gather”(=第五节方案 B)；
+而当前 search_fn 匹配的子图里 cos/sin 已在 op 外按 position 取好([num_tokens, half])
+(=方案 A)。两者的 gather 位置不同，直接影响 op schema 是否需要 cache+position_ids。
+
+
+================================================================================
+九、总纲（速查）
+================================================================================
+
+- matcher 匹配“图 vs 图”：search_fn trace 成针，去 model 编译图(草堆)找同构子图替换成 op。
+- search 与 replace【签名必须一致】；可变张量(weight/cos/sin)要作【输入=通配符】，
+  从 self 读的会被烤成常量、只匹配单一实例且更脆。
+- 不能直接用 _apply_rope(缺 RMSNorm/weight、带 slice/cat、闭包 self)；
+  不能用整个 forward(签名只剩 x、把 weight/cache 烤死、引入 arange/gather)。
+- 要复用就把核心数学抽成【不依赖 self 的纯函数(x,weight,cos,sin,eps)】给 model 与 search 共用。
+- eps 需要(标量常量，烤进 replace_fn，别用 staticmethod)；rotary_dim 在“全旋转”下不必要
+  (可由 cos.shape[-1]*2 推)。num_heads/head_dim 同为常量/可推。
+- op 不需要 position_ids、也不需要完整 cos_sin_cache：因为“按 position 查表”
+  (cos_sin_cache[positions]) 已在 model.forward 即【op 外面】做完，传进来的 cos/sin 是
+  已取好的每 token 一行([num_tokens, half])；op 只吃现成 cos/sin(=方案 A)。
+- num_heads/head_dim/eps 作为【常量烤进算子调用实参】：replace_fn 签名仍 (x,weight,cos,sin)，
+  内部 op(x,weight,cos,sin,num_heads,head_dim,eps)；register_fake 用 *args 吸收这些常量。
+- “签名必须一致”只约束 search_fn↔replace_fn(都 4 参=张量通配符)；【replace_fn 的参数不必与它
+  调用的算子形参一致】——算子可多带常量入参(7 参)，由 replace_fn 从 self 填入。
+- is_neox/interleave 不作算子入参，而是【Runner 按其值选不同算子】(neox / interleave 各一个
+  op_name)；replace_fn 据 op_name 解析对应算子。
+- gather 在 op 外(方案 A，签名 (x,weight,cos,sin)+常量 eps/heads，易匹配) vs 进 op(方案 B，含
+  cache+position_ids，难匹配)；本仓库当前是方案 A。
+- 全旋转用方案 A(简单稳)；确需部分旋转(rotary_dim<head_dim)才用方案 B(通用，但 pattern
+  更大更脆、且 rotary_dim 作为切片常量 → 一条 pattern 绑一个值)。
+- 匹配对 batch/token 维度【形状无关】(维度符号化)，只钉“结构 + 字面常量(slice 下标/dim/
+  dtype/写死的 reshape 尺寸)”；replace 的【输出必须等形等类型顶替】search 输出
+  (fake = empty_like(x))。

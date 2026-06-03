@@ -1,0 +1,87 @@
+================================================================================
+模块(脚本文件)与类同名 + 包/脚本两种运行方式下的导入兜底
+================================================================================
+
+对应本仓库 src/app/ 下：
+  Installer.py                  -> class Installer
+  RMSNormRoPEreplacePass.py     -> class RMSNormRoPEreplacePass
+  runner.py / model.py / util.py 的 try/except 双导入
+
+
+================================================================================
+一、模块(文件)和类可以同名吗？—— 可以
+================================================================================
+
+模块名和模块内的名字处在【不同层级的命名空间】：
+  - RMSNormRoPEreplacePass（文件）→ 一个 module 对象，登记在
+    sys.modules["RMSNormRoPEreplacePass"]；
+  - RMSNormRoPEreplacePass（类）  → 该 module 的一个属性。
+
+from RMSNormRoPEreplacePass import RMSNormRoPEreplacePass
+  含义：从那个模块里取出同名的【类】，绑定到当前作用域的名字 RMSNormRoPEreplacePass。
+  导入后：当前作用域这个名字指向【类】；模块本身仍在 sys.modules 里，
+          只是没占用这个局部名。两者不冲突。
+
+本仓库已经这么用：Installer.py 里就是 class Installer，
+  from .Installer import Installer 一直工作正常 —— 同名模块+类在 Python 中合法。
+
+
+================================================================================
+二、两个注意点
+================================================================================
+
+(1) PEP 8 命名习惯
+    - 模块文件名约定用【小写 snake_case】(如 replace_pass.py)；
+    - 类名用【CapWords】(如 RMSNormRoPEreplacePass)。
+    把文件也命成 CapWords 虽能跑，但不符合惯例，且与 model.py / util.py / runner.py
+    这些小写文件名不统一(Installer.py、RMSNormRoPEreplacePass.py 已偏离)。
+    要不要遵循惯例看取舍，功能上无影响。
+
+(2) 同名易让读者混淆
+    - 若写成 import RMSNormRoPEreplacePass(导【模块】)，要用类得写
+      RMSNormRoPEreplacePass.RMSNormRoPEreplacePass，比较绕；
+    - 用 from <module> import <Class> 就没这问题(局部名直接是类)。
+
+
+================================================================================
+三、try/except 双导入：包方式 vs 脚本方式（两条兜底必须风格一致）
+================================================================================
+
+本仓库为兼容两种运行方式而用 try/except 双导入：
+  1) 包方式  : cd src && python -m app.runner    → 走相对导入 from .X import Y
+  2) 脚本方式: cd src/app && python runner.py     → 相对导入抛 ImportError，
+               退回【裸名】绝对导入 from X import Y(此时 src/app 在 sys.path[0])
+
+【易错点】except 兜底两条风格不一致(曾经的写法)：
+
+    try:
+        from .Installer import Installer
+        from .RMSNormRoPEreplacePass import RMSNormRoPEreplacePass
+    except ImportError:
+        from CUDA_ROPE.src.app.Installer import Installer       # ← 深层绝对路径(错)
+        from RMSNormRoPEreplacePass import RMSNormRoPEreplacePass  # ← 裸名(对)
+
+  问题：脚本方式下 sys.path[0] 是 src/app，并不是“项目根的上层”，
+  故 CUDA_ROPE.src.app.Installer 这种深包路径通常【找不到】→ 再次 ImportError、整体失败。
+
+【正确写法】兜底统一用【裸名】，与 model / util 的兜底对齐：
+
+    try:
+        from .Installer import Installer
+        from .RMSNormRoPEreplacePass import RMSNormRoPEreplacePass
+    except ImportError:
+        from Installer import Installer
+        from RMSNormRoPEreplacePass import RMSNormRoPEreplacePass
+
+  道理：脚本方式下 src/app 已在 sys.path[0]，同目录的 Installer.py /
+  RMSNormRoPEreplacePass.py 可直接按裸名找到，无需也不应写深层包路径。
+
+
+================================================================================
+四、速查
+================================================================================
+- 模块名与类名可同名(不同命名空间)；from <mod> import <Cls> 后局部名指向类，
+  模块仍在 sys.modules。本仓库 Installer.py/class Installer 即如此。
+- 习惯上文件名 snake_case、类名 CapWords；同名 CapWords 文件能跑但非惯例。
+- try/except 双导入：相对导入(包方式) → 失败退【裸名】绝对导入(脚本方式)；
+  两条兜底都应是裸名，别混入 CUDA_ROPE.src.app.* 深路径(脚本方式找不到、会再次报错)。
