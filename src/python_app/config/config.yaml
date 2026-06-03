@@ -1,0 +1,19 @@
+# Runner 配置 —— 由 runner.py 读取后构造 Runner / 造输入
+# 两个顶层分组(run_params / model_arch)，load_config 会各自展平、合并成一个扁平字典
+
+# ---- 运行/输入参数 ----
+run_params:
+  batch: 2              # 序列条数
+  token_size: 4         # 每条序列的 token 数
+  device: null          # null → 自动选(GPU 优先/CPU 兜底)；也可写 "cuda" / "cpu"
+  dtype: float32        # 张量精度，字符串，runner 里映射到 torch.dtype
+  seed: 0               # 随机种子
+
+# ---- 模型架构参数 ----
+model_arch:
+  head_num: 8           # 注意力头数
+  head_dim: 64          # 每个头的特征维（RMSNorm/RoPE 作用维，须为偶数）
+  eps: 1.0e-6           # RMSNorm 的数值稳定项
+  base: 10000.0         # RoPE 频率底数
+  max_token_size: 4096  # 模型上下文最大 token 数（cos/sin cache 行数 max_position）
+  interleave: false     # RoPE 风格：false=neox(前后半配对)，true=interleave(相邻配对)
