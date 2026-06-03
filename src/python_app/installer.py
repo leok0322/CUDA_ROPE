@@ -43,8 +43,7 @@ class Installer:
         def custom_post_grad_pass(graph):
             count = pm_pass.apply(graph)
             if count:
-                print(f"[hook] 融合发生：替换了 {count} 处 (RMSNorm+RoPE) → "
-                      f"torch.ops.ROPE_cuda.run_fused_QKNorm_and_ROPE")
+                print(f"[hook] 融合发生：替换了 {count} 处 (RMSNorm+RoPE) → {self.op_name}")
 
         inductor_config.post_grad_custom_post_pass = custom_post_grad_pass
         return pm_pass

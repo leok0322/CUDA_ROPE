@@ -9,11 +9,15 @@ run_params:
   dtype: float32        # 张量精度，字符串，runner 里映射到 torch.dtype
   seed: 0               # 随机种子
 
-# ---- 模型架构参数 ----
+# ---- 模型架构参数（合并 qkv 模型 FusedQKVNormRope；键须与 Runner.__init__ 形参一一对应）----
 model_arch:
-  head_num: 8           # 注意力头数
   head_dim: 64          # 每个头的特征维（RMSNorm/RoPE 作用维，须为偶数）
   eps: 1.0e-6           # RMSNorm 的数值稳定项
   base: 10000.0         # RoPE 频率底数
   max_token_size: 4096  # 模型上下文最大 token 数（cos/sin cache 行数 max_position）
   interleave: false     # RoPE 风格：false=neox(前后半配对)，true=interleave(相邻配对)
+
+  # ---- 合并 qkv + 仅 QK 处理 + 分离 q/k 权重（贴近真实 vLLM kernel）----
+  num_heads_q: 8        # Q 头数 Hq
+  num_heads_k: 8        # K 头数 Hk（GQA 下可小于 Hq）
+  num_heads_v: 8        # V 头数 Hv（只占位、透传，不归一化/旋转）

@@ -75,11 +75,85 @@ def build_cos_sin_cache(max_position, rotary_dim, base=10000.0,
     return cache.to(dtype)
 
 
-def make_inputs(seed,num_tokens,head_num,head_dim,device,dtype,token_size,batch):
-    """随机 3D 输入 x: [num_tokens, head_num, head_dim]，及每 token 的 position。"""
+def make_inputs_qkv(seed, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
+                    device, dtype, token_size, batch):
+    """合并 qkv 输入: [num_tokens, (Hq+Hk+Hv)*head_dim]，及每 token 的 position。
+    每 token 内按 [Q 头…|K 头…|V 头…] 连续排布(与 FusedQKVNormRope / 真实 kernel 一致)。"""
     torch.manual_seed(seed)
-    x = torch.randn(num_tokens, head_num, head_dim,
-                            device=device, dtype=dtype)
+    total = num_heads_q + num_heads_k + num_heads_v
+    qkv = torch.randn(num_tokens, total * head_dim, device=device, dtype=dtype)
     # 每条序列各自 0..token_size-1 的位置，再按 batch 拼接 → [num_tokens]
     positions = torch.arange(token_size, device=device).repeat(batch)
-    return x, positions
+    return qkv, positions
+
+
+
+def _rotate_half(x):
+    """neox 风格旋转辅助：把最后一维分成前后两半 [x1, x2] -> [-x2, x1]。"""
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat([-x2, x1], dim=-1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 纯函数（不依赖 self/buffer），供【模型 forward】与【torch.compile 的 search_fn】
+# 共用 —— 即“把核心数学抽成纯函数、两边共用”，避免重复实现导致漂移。
+# 约定张量形状：x [num_tokens, num_heads, head_dim]；cos/sin [num_tokens, half]。
+# ─────────────────────────────────────────────────────────────────────────────
+def rms_norm_pure(x, weight, eps):
+    # ---- 步骤 1：最后一维 RMSNorm ----
+    """最后一维 RMSNorm：在 float32 上算 mean(x^2)，再 * 可学习 γ(weight)。"""
+    in_dtype = x.dtype
+    xf = x.float()
+    # 均方值 ms = mean(x^2)（RMSNorm 的核心统计量，即二阶原点矩 E[X^2]）：
+    #   x.pow(2)         逐元素平方，形状不变 [.., head_dim]
+    #   .mean(dim=-1)    沿最后一维(特征维 head_dim)求平均，对每个 (token,head) 行
+    #                    取该行 head_dim 个平方值的均值；【不减均值】(区别于 LayerNorm)
+    #   keepdim=True     保留末维为 1 → [.., 1]，便于下一步与 x 广播相除
+    ms = xf.pow(2).mean(dim=-1, keepdim=True)        # 二阶原点矩 mean(x^2)
+    # x/[..,head_dim] 乘 rsqrt(ms)/[..,1]：靠广播自动把末维 1 拉伸到 head_dim，
+    #   即每行 head_dim 个特征同乘一个标量(该行 RMS 的倒数)。依赖上面 keepdim=True
+    #   保留末维为 1；否则形状 [..,head_dim]*[..] 从右对齐失败需手动 unsqueeze(-1)。
+    #   广播是逻辑扩展、不复制数据。
+    xf = xf * torch.rsqrt(ms + eps)                  # x / sqrt(mean(x^2)+eps)
+    return xf.to(in_dtype) * weight                  # 逐维乘 γ
+
+
+def rope_pure(x, cos, sin, interleave=False):
+     # ---- 步骤 2：最后一维 RoPE ----
+    """对 x 的最后一维做 RoPE(此处 rotary_dim==head_dim，整段都旋转)。
+    cos/sin: [num_tokens, half]，在 head 维广播(同 token 各 head 共享角度)。"""
+    # 索引里 None = 在该位置插一个 size=1 的新维(等价 unsqueeze(1))，: 表示该维原样保留。
+    #   cos: [num_tokens, half] -> [num_tokens, 1, half]，中间补出的就是 head 维。
+    #   cos/sin 本无 head 维：RoPE 旋转角只与 position 和频率 i 有关、与是哪个 head 无关，
+    #   故同一 token 的所有 head 共享同一组角度。补出长度 1 后，与 x[num_tokens,num_heads,..]
+    #   相乘时这个 1 沿 head 维广播成 num_heads，即每个 head 都乘同一份 cos/sin。
+    c = cos[:, None, :]                              # [num_tokens, 1, half]
+    s = sin[:, None, :]
+    if interleave:
+        # interleave(=!neox)：相邻 (2i, 2i+1) 配对
+        # 切片 [..., start::step]：... 保留前面所有维、只切最后一维(rotary_dim)；
+        #   0::2 = 从下标0起步长2 → 偶数位 0,2,4,…；1::2 = 从1起步长2 → 奇数位 1,3,5,…
+        #   即把相邻一对 (2i,2i+1) 分别抽进 x1[i]=rot[2i]、x2[i]=rot[2i+1]，各 half 长。
+        x1 = x[..., 0::2]                            # 偶数位 -> [.., half]
+        x2 = x[..., 1::2]                            # 奇数位 -> [.., half]
+        # 每对 (x1,x2) 用同一角度 θ 旋转：r1=x1cosθ-x2sinθ, r2=x1sinθ+x2cosθ
+        # cos/sin 是 [.,1,half]，与 x1[.,num_heads,half] 相乘时中间 1 广播成 num_heads，
+        # 故 r1、r2 形状均为 [num_tokens, num_heads, half]。
+        r1 = x1 * c - x2 * s
+        r2 = x1 * s + x2 * c
+        # torch.stack：在【新建维度】上叠同形状张量(区别于 cat 沿已有维拼接，不增维)。
+        #   dim=-1 把长度2的新维插到最后：[.,num_heads,half] -> [.,num_heads,half,2]，
+        #   末维 [r1[i], r2[i]] 即每个频率位的一对。
+        # flatten(-2)：合并倒数两维 half*2=rotary_dim，按最内先变展开成
+        #   r1[0],r2[0],r1[1],r2[1],… 的【交错】排布(若用 cat 会得到前半全r1/后半全r2，
+        #   那是 neox 排布，不是 interleave)。
+        return torch.stack([r1, r2], dim=-1).flatten(-2)
+    # neox：第 j 维 ↔ 第 j+half 维(前后半对应)配对，二者共享同一组角度 (c_j, s_j)。
+    #   cos/sin(长 half)各复制一份拼成 rotary_dim，使前半第 j 位与后半第 j 位都拿到 c_j/s_j。
+    c2 = torch.cat([c, c], dim=-1)                   # 前后半同角，拼到 head_dim
+    s2 = torch.cat([s, s], dim=-1)
+    # _rotate_half(rot)=[-后半, 前半]，逐元素展开后：
+    #   前半第 j 位 = a_j·c_j - b_j·s_j；后半第 j 位 = b_j·c_j + a_j·s_j
+    #   (a=前半, b=后半) —— 即对每对 (a_j,b_j) 做标准 2D 旋转，与 interleave 同式、仅配对/摆放不同。
+    return x * c2 + _rotate_half(x) * s2

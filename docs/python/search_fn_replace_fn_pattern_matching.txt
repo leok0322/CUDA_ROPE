@@ -309,6 +309,8 @@ _apply_rope 的 slice/cat：
   - rotary_dim 作为切片常量会让方案 B 的子图随值而异；方案 A 无此常量。
   - pattern 匹配对 batch/token 这类维度是【形状无关】的，只钉住“结构 + 字面常量”。
   - replace 的【输出必须能等形等类型地顶替】search 的输出(fake 用 empty_like(x))。
+  - “结构常量 → 不同值=不同子图”这一结论不止 rotary_dim，对 Hq/Hk/Hv/head_dim/interleave
+    同样成立(合并 qkv 后 search 里有 view/slice 切 Q/K/V)；详见第十一节。
 
 
 ================================================================================
@@ -383,6 +385,87 @@ _apply_rope 的 slice/cat：
   cache+position_ids，难匹配)；本仓库当前是方案 A。
 - 全旋转用方案 A(简单稳)；确需部分旋转(rotary_dim<head_dim)才用方案 B(通用，但 pattern
   更大更脆、且 rotary_dim 作为切片常量 → 一条 pattern 绑一个值)。
+- 【模型结构】(单一 x ↔ 合并 qkv / 共享 ↔ 分离 q/k 权重 / 全处理 ↔ 仅 QK+V 透传) 与
+  【gather 位置 A/B】是两条【正交轴】，可任意组合：合并 qkv 也能配方案 A(详见第十节)。
+- 切片/形状常量(rotary_dim、Hq/Hk/Hv、head_dim、interleave)在 trace 时烤成字面量 →
+  不同取值=不同子图；把它们“形参化”成普通 int 也一样烤死，不能做张量通配符；要覆盖多组配置
+  只能注册多条 pattern(详见第十一节)。
+- 复用纯函数避免漂移已落地：model 里 rms_norm_pure / rope_pure 同时被 FusedQKVNormRope.forward
+  与 RMSNormRoPEreplacePass.search_fn 调用(单一真相源)。
+
+
+================================================================================
+十、合并 qkv 模型 + “模型结构”与“gather 位置 A/B”是两条正交轴
+================================================================================
+
+真实 vLLM 的 qkv 是【一整块合并张量】：[num_tokens, (Hq+Hk+Hv)*head_dim]，每 token 内按
+[Q 头… | K 头… | V 头…] 连续；仅 Q、K 头做 QK-Norm+RoPE，V 头【透传】；Q、K 各用一份独立
+的 γ(q_weight / k_weight)。本仓库的 FusedQKVNormRope(model.py) 即此形态的参考实现。
+
+(1) 两条【正交】的设计轴（可任意组合，不要混为一谈）
+    轴 1·模型结构：单一 x[num_tokens,num_heads,head_dim] ↔ 合并 qkv；共享 γ ↔ Q/K 分离 γ；
+                  全头处理 ↔ 仅 QK 处理 + V 透传。
+    轴 2·gather 位置(=方案 A/B)：cos/sin 在 op 外已 gather(A) ↔ 完整 cache+position_ids 进
+                  op 内 gather(B)。
+    玩具实现 = (单一 x)×(A)；真实 kernel = (合并 qkv)×(B)。但对角/混搭都成立——
+    【合并 qkv 也可以配方案 A】。
+
+(2) 合并 qkv + 方案 A：op 签名与 pattern 形态
+    op(qkv, q_weight, k_weight, cos, sin, num_heads_q, num_heads_k, num_heads_v, head_dim, eps)
+      其中 cos/sin 已 gather [num_tokens, half]；num_heads_q/k/v、head_dim、eps 是常量。
+    search_fn 子图(与 FusedQKVNormRope.forward 同构)：
+      view→切 Q/K/V → Q/K 各自 RMSNorm(分离权重) → 前 rotary_dim 维 RoPE(其余透传) →
+      V 透传 → cat → reshape。
+    与“单一 x + A”相比，pattern 多了【Q/K/V 的 view+slice、双权重 RMSNorm、V 透传的
+    cat+reshape】——这来自【轴 1(合并 qkv)】；但【仍不含 gather/arange】——因为仍是【轴 2=A】。
+    即：合并 qkv 让 pattern 变大；A/B 只决定要不要再把 cache 索引也塞进 pattern。
+
+(3) 方案 A 也能复用 stock kernel(无需另写)
+    stock kernel 内部按 cos_sin_cache + position_ids[token]*rotary_dim 取行。方案 A 下把
+    【已 gather 的 cos/sin([num_tokens, rotary_dim])】当 cos_sin_cache 传、position_ids 传
+    arange(num_tokens)，内部 gather 退化为恒等，等价“外面查好、里面直取第 token 行”。
+
+(4) 本仓库实现现状
+    - model.py：保留 QKNorm_ROPE(单一 x)；新增 FusedQKVNormRope(合并 qkv，方案 A)；
+      抽出纯函数 rms_norm_pure / rope_pure 供模型与 search 共用。
+    - rmsnorm_rope_replace_pass.py：RMSNormRoPEreplacePass 改为合并 qkv 版
+      (search_fn/replace_fn/make_example_inputs 均按 (qkv,q_weight,k_weight,cos,sin) + 常量)。
+    - runner.py：is_qkv 开关选 QKNorm_ROPE / FusedQKVNormRope；util.make_inputs_qkv 造合并
+      qkv 输入；op_name = ROPE_cuda::fused_qkv_norm_rope_{neox,interleave}。
+
+
+================================================================================
+十一、切片/形状常量为何“不同值=不同子图”；“形参化”不改变这一点
+================================================================================
+
+search_fn 里凡是进了 view / slice / reshape 的【整数】(rotary_dim、Hq/Hk/Hv、head_dim)，
+以及切换算子序列的 interleave，都是【结构/形状常量】，在 trace 时被烤成图里的字面量。
+
+(1) 以 _qk_norm_rope 里的 rot = x[..., :rotary_dim] 为例
+    trace 时 rotary_dim 是具体 int(如 64) → slice 节点带字面上界 slice(dim=-1,0,64)。
+    - 不同 rotary_dim 值 = 结构不同的 pattern(slice 上界常量不同)；
+    - 之所以能匹配，是因为【同一份 rotary_dim 同时喂给 model 与 search_fn】，两边 slice 常量
+      一致 → 对得上。措辞要准：不是“任意 rotary_dim 都匹配同一条 pattern”，而是“对某个固定
+      rotary_dim，search 与 model 一致才匹配”，每个值是各自独立的一条 pattern。
+
+(2) 把 rotary_dim“作为形参”——分两种，结论不同
+    a. 形参 = 普通 Python int(闭包捕获 / 默认值 / 传参后固定)：与从 self 读【完全一样】。
+       只要 trace 时是具体 int，照样烤成 slice 字面常量 → 不同值=不同子图。形参化【不会】
+       让一条 pattern 覆盖多个 rotary_dim。
+    b. 形参 = register_replacement 的【张量通配符】(example_inputs 里的输入)：【做不到】。
+       通配符是张量，而 slice 上界必须是 int/SymInt，不能是待绑定的张量 → rotary_dim 注定
+       是常量，无法“匹配任意值”。
+
+(3) 同理适用于 Hq/Hk/Hv、head_dim、interleave
+    - qkv.view(num_tokens, H, head_dim) 的 H、head_dim；
+    - v[:, :Hq] / v[:, Hq:Hq+Hk] 切 Q/K/V 的上下界 Hq/Hk；
+    - interleave 切换 neox / interleave 的算子序列结构。
+    全是 trace 时烤死的字面常量/分支选择。
+
+(4) 实务结论
+    一条注册的 pattern ↔ 一组具体的 (rotary_dim, Hq, Hk, Hv, head_dim, interleave)。
+    要支持多种取值，只能【为每组配置各注册一条 register_replacement】(循环注册多条 pattern)，
+    而非指望一条 pattern 泛化。
 - 匹配对 batch/token 维度【形状无关】(维度符号化)，只钉“结构 + 字面常量(slice 下标/dim/
   dtype/写死的 reshape 尺寸)”；replace 的【输出必须等形等类型顶替】search 输出
   (fake = empty_like(x))。

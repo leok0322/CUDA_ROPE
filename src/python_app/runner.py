@@ -1,6 +1,6 @@
-"""runner.py —— 用一个 Runner 类驱动 model.py 的 QKNorm_ROPE，并用 torch.compile
-   把 "RMSNorm + RoPE 的分步子图" 替换成一次自定义算子
-   torch.ops.ROPE_cuda.run_fused_QKNorm_and_ROPE。
+"""runner.py —— 用一个 Runner 类驱动 model.py 的 FusedQKVNormRope，并用 torch.compile
+   把 "合并 qkv 的 QK-Norm + RoPE 分步子图" 替换成一次自定义算子
+   torch.ops.ROPE_cuda.fused_qkv_norm_rope_{neox,interleave}。
 
 Runner 封装了：配置 → 造输入 → 建模型 → eager 前向(不反向) → 安装融合 pass →
               torch.compile 执行 的整条流程（对应 docs/fork/fused_silu_mul_compile_hook.py）。
@@ -49,9 +49,9 @@ except Exception as e:  # 未编译 / 未在 sys.path / 依赖未就位
 #      from model —— 此时 src/app 已被加进 sys.path[0]，同目录的 model.py 可直接找到。
 # 先试相对导入、失败再退绝对导入，两种启动方式都能定位到 model.py。
 try:
-    from .model import QKNorm_ROPE
+    from .model import FusedQKVNormRope
 except ImportError:
-    from model import QKNorm_ROPE
+    from model import FusedQKVNormRope
 
 # Installer(通用 pass 安装器) 与 RMSNormRoPEreplacePass(子图替换内容定义)，兼容包/脚本两种运行方式。
 # 注：两条兜底都用【裸名】绝对导入(脚本方式下 src/app 在 sys.path[0])，
@@ -65,15 +65,15 @@ except ImportError:
 
 
 class Runner:
-    """封装 QKNorm_ROPE 的 eager 运行与 torch.compile 融合替换全流程。"""
+    """封装 FusedQKVNormRope 的 eager 运行与 torch.compile 融合替换全流程。"""
 
-    def __init__(self, batch=2, token_size=4, head_num=8, head_dim=64,
+    def __init__(self, batch=2, token_size=4, head_dim=128,
                  eps=1e-6, base=10000.0, max_token_size=4096, device=None, dtype=torch.float32,
-                 seed=0, interleave=False):
+                 seed=0, interleave=False,
+                 num_heads_q=8, num_heads_k=8, num_heads_v=8):
         # ---- 配置 ----
         self.batch = batch
         self.token_size = token_size
-        self.head_num = head_num
         self.head_dim = head_dim          # = 最后一维（RMSNorm/RoPE 作用维），须为偶数
         self.eps = eps
         self.base = base
@@ -81,6 +81,11 @@ class Runner:
         self.seed = seed
         # RoPE 风格：模型与 replace_pass 的 search_fn 须用同一个值，否则计算图对不上
         self.interleave = interleave
+        # 合并 qkv 模型(FusedQKVNormRope)：输入 [num_tokens,(Hq+Hk+Hv)*head_dim]，
+        #   仅 QK 处理、V 透传、Q/K 分离权重，贴近真实 vLLM kernel；torch.compile 走方案 A。
+        self.num_heads_q = num_heads_q
+        self.num_heads_k = num_heads_k
+        self.num_heads_v = num_heads_v
         # device 兜底：传了就用传入的，没传(None)则自动选 GPU 优先、CPU 兜底。
         #   - or：Python 的 or 返回【操作数本身】而非 True/False，且短路——
         #     左边 device 为真值就直接返回它，右边那串(含 is_available())不求值；
@@ -101,12 +106,16 @@ class Runner:
 
     # ------------------------------------------------------------------ 模型
     def build_model(self):
-        self.model = QKNorm_ROPE(
-            dim=self.head_dim, rotary_dim=self.head_dim, max_position=self.max_position,
+        # 合并 qkv 版：仅 QK 处理、V 透传、Q/K 分离权重
+        self.model = FusedQKVNormRope(
+            num_heads_q=self.num_heads_q, num_heads_k=self.num_heads_k,
+            num_heads_v=self.num_heads_v, head_dim=self.head_dim,
+            rotary_dim=self.head_dim, max_position=self.max_position,
             eps=self.eps, base=self.base, interleave=self.interleave,
             dtype=self.dtype, device=self.device,
         ).to(self.device)
         return self.model
+
 
     # ------------------------------------------------------------- 输入校验
     @staticmethod
@@ -136,13 +145,15 @@ class Runner:
             self.build_model()
         # is_neox/interleave 不作算子入参，而是【按其值选不同的算子】：
         #   neox(interleave=False) 与 interleave(True) 各对应一个已注册的融合算子。
-        op_name = ("ROPE_cuda::run_fused_QKNorm_and_ROPE_interleave"
+        op_name = ("ROPE_cuda::fused_qkv_norm_rope_interleave"
                    if self.interleave
-                   else "ROPE_cuda::run_fused_QKNorm_and_ROPE_neox")
+                   else "ROPE_cuda::fused_qkv_norm_rope_neox")
         # 第 2 步：RMSNormRoPEreplacePass 只定义"换什么"(search/replace 的语义 + 替换目标 +
         #   example_inputs 的结构)。构造函数只持有服务 search/replace 的长期状态。
+        #   合并 qkv 模型：传 num_heads_q/k/v 与 head_dim，供 search 切 Q/K/V、replace 烤进算子实参。
         rp = RMSNormRoPEreplacePass(
-            eps=self.eps, head_num=self.head_num, head_dim=self.head_dim,
+            eps=self.eps, num_heads_q=self.num_heads_q, num_heads_k=self.num_heads_k,
+            num_heads_v=self.num_heads_v, head_dim=self.head_dim,
             op_name=op_name,                       # 据 interleave 选定的算子
             interleave=self.interleave,            # 与 build_model 的 RoPE 风格保持一致
         )
@@ -170,9 +181,10 @@ class Runner:
             return y, y_ref
         except Exception as e:
             print(f"[warn] torch.compile 融合替换未完成：{e}\n"
-                  f"       多半因 run_fused_QKNorm_and_ROPE 仍是占位 schema()->()、"
-                  f"或 kernel 未实现。请先把 interface.cpp 的算子 schema 改为 "
-                  f"(Tensor x, Tensor weight, Tensor cos, Tensor sin) -> Tensor 并实现。")
+                  f"       多半因 fused_qkv_norm_rope_{{neox,interleave}} 尚未注册/实现。请先在 "
+                  f"interface.cpp 注册算子，schema 为 (Tensor qkv, Tensor q_weight, "
+                  f"Tensor k_weight, Tensor cos, Tensor sin, int num_heads_q, int num_heads_k, "
+                  f"int num_heads_v, int head_dim, float eps) -> Tensor 并实现 kernel。")
             return None, y_ref
 
 
@@ -180,10 +192,11 @@ if __name__ == "__main__":
     # 从 config.yaml 读取配置(util.load_config 已把 dtype 字符串映射成 torch.dtype)
     cfg = util.load_config()
     runner = Runner(**cfg)                     # 配置键与 Runner.__init__ 形参一一对应
-    # 用 runner 自身的配置造输入，避免与 YAML 不一致
-    x, positions = util.make_inputs(
-        runner.seed, runner.num_tokens, runner.head_num, runner.head_dim,
-        runner.device, runner.dtype, runner.token_size, runner.batch,
+    # 用 runner 自身的配置造【合并 qkv】输入，避免与 YAML 不一致
+    x, positions = util.make_inputs_qkv(
+        runner.seed, runner.num_tokens, runner.num_heads_q, runner.num_heads_k,
+        runner.num_heads_v, runner.head_dim, runner.device, runner.dtype,
+        runner.token_size, runner.batch,
     )
     y, y_ref = runner.run(x, positions)        # run 内部已跑 eager，统一返回 (y, y_ref)
     # 用 allclose 比对 compiled 输出与 eager 参考输出是否一致
