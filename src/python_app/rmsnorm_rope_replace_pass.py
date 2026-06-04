@@ -39,6 +39,7 @@ class RMSNormRoPEreplacePass:
         self.head_dim = head_dim
         # rotary_dim<head_dim 时每头只旋转前 rotary_dim 维、其余透传；默认全旋转
         self.rotary_dim = rotary_dim if rotary_dim is not None else head_dim
+        assert self.rotary_dim % 2 == 0, "rotary_dim需要是2的倍数" 
         self.half = self.rotary_dim // 2
         # 融合算子全名(命名空间::算子名)，供 Installer 注册 fake/meta 实现用
         self.op_name = op_name
@@ -110,13 +111,46 @@ class RMSNormRoPEreplacePass:
                      int head_dim, float eps) -> Tensor
            且 neox / interleave 各注册一个算子；否则此调用会 schema 不匹配。"""
         op = self._resolve_op()
-        return op(qkv, q_weight, k_weight, cos, sin,
-                  self.num_heads_q, self.num_heads_k, self.num_heads_v,
-                  self.head_dim, self.eps)
+        # 前 5 个是【张量通配符】(matcher 绑定)，后 5 个是【常量】(从 self 烤入)：
+        #   qkv      : [num_tokens, (Hq+Hk+Hv)*head_dim]   合并 qkv，每 token 内 [Q…|K…|V…]
+        #   q_weight : [head_dim]                          Q 的 RMSNorm γ
+        #   k_weight : [head_dim]                          K 的 RMSNorm γ
+        #   cos      : [num_tokens, rotary_dim//2]         已 gather(方案 A)
+        #   sin      : [num_tokens, rotary_dim//2]
+        #   num_heads_q/k/v, head_dim : int 常量(切 Q/K/V、定形状)
+        #   eps      : float 常量(RMSNorm 数值稳定项)
+        op(qkv, q_weight, k_weight, cos, sin,          # [nt,H*hd] [hd] [hd] [nt,r/2] [nt,r/2]
+                self.num_heads_q, self.num_heads_k, self.num_heads_v,  # int Hq, Hk, Hv
+                self.head_dim, self.eps)                    # int head_dim, float eps
+        return qkv
+
+    # --------------------------------- 本算子的 fake/meta（随 op 语义而定，注入给 Installer 注册）
+    def make_fake_fn(self):
+        """返回本算子的 fake/meta 实现（供 Installer 用 register_fake(op_name, fake) 注册）。
+        fake 的"返回什么"由算子 schema 决定，故由【拥有算子的本类】给出，而非 Installer 写死：
+          - 本算子是【写法③ void in-place（-> ()）】→ 无输出张量 → 返回 None；
+          - 若改函数式（-> Tensor），应改成 lambda qkv, *a: torch.empty_like(qkv)。
+        *args 通配：fake 只声明返回、不读参数(参数流入见 installer.py 注释)。"""
+
+        # 融合算子需要 fake/meta 实现，torch.compile 才能在 FakeTensor 上推断形状。
+        # 写法③(void in-place)：算子 -> ()，故 fake 返回 None(不另开输出)。
+        # 形参用 *args 通配：fake 只声明“返回 None”、不读任何参数，无需逐个命名(避免名字对不上语义)。
+        # 参数流入路径(非直接调用，编译期间接到达)：
+        #   make_example_inputs(5 张量) → example_inputs → register_replacement trace replace_fn
+        #   → replace_fn 调 op(qkv,q_weight,k_weight,cos,sin, Hq,Hk,Hv,head_dim,eps)
+        #   →(FakeTensorMode 路由到本 fake) _fake(*args)：前 5=example_inputs(转 FakeTensor)、
+        #     后 5=replace_fn 从 self 烤入的常量。(trace search_fn 不调本 fake)
+        def _fake(*args):
+            return None
+        return _fake
 
     # --------------------------------- 样例张量(结构归本类、运行期规格外部传入)
     def make_example_inputs(self, num_tokens, device, dtype):
-        """register_replacement 描摹子图形状用的样例张量(形状/精度须与真实输入一致)。
+        """供 register_replacement 把 search_fn/replace_fn trace 成 FX pattern 的样例张量。
+        【只返回 5 个张量】(与 search_fn/replace_fn 形参一一对应=pattern 通配符)；num_heads_q/k/v、
+        head_dim、eps 是常量、由 replace_fn 从 self 烤入算子，【不放进 example_inputs】(否则
+        search_fn(*example_inputs) 参数个数对不上而报错)。只需形状/精度对、数值随机；与运行期
+        模型输入(util.make_inputs_qkv)无关。详见 docs/.../torch.PatternMatcherPass_register_replacement.txt 五点五。
         结构：qkv[num_tokens,(Hq+Hk+Hv)*head_dim]、q/k_weight[head_dim]、cos/sin[num_tokens,half]。"""
         H = self.num_heads_q + self.num_heads_k + self.num_heads_v
         return [

@@ -64,7 +64,14 @@
           torch.empty_like(x)                      # 形状/类型同 x
           x.new_empty(out_shape, dtype=..., ...)   # 自定义输出形状
       返回值只是"占位"，编译器只读它的元信息，不读数值。
-    - 原地写算子(schema 用 Tensor!)：fake 里不改输入，按返回约定返回即可。
+    - 原地写(in-place)算子：schema 用 Tensor(a!) 标记被改写的入参（a 是别名、! 表“会改写”；
+      不是 "Tensor!"）。fake 里【不要真改输入】，只按返回约定给出输出占位：
+        * 返回型 in-place (... -> Tensor(a!))：fake 返回输入本身，如 return qkv；
+        * void  in-place (... -> ())        ：fake 返回 None（无输出张量）。
+      另：in-place 算子会在 functionalize 时被 auto_functionalized 包裹（由 (a!) 触发）——
+      fake 只负责“输出元信息”，“就地改写如何在图里表达”由 auto_functionalized 处理；
+      事后 Inductor re-inplace 去掉其引入的 clone。详见 custom_op_inplace_autofunctionalized.txt
+      （第四节 auto_functionalized / 第五节 re-inplace / 第九(5) _fake）。
 
 
 ================================================================================
@@ -110,6 +117,17 @@
     def _(x, s):
         return torch.empty_like(x)
 
+--------------------------------------------------------------------------------
+例 5：void in-place 算子（-> ()）——本仓库 fused_qkv_norm_rope_* 的写法③
+--------------------------------------------------------------------------------
+    # schema: "...(Tensor(a!) qkv, Tensor q_weight, Tensor k_weight, Tensor cos, Tensor sin,
+    #             int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps) -> ()"
+    @torch.library.register_fake("ROPE_cuda::fused_qkv_norm_rope_interleave")
+    def _fake(*args):       # *args 通配：fake 不读参数、只声明返回(避免逐个命名对不上语义)
+        return None         # void(-> ())：无输出张量，返回 None
+    # 说明：qkv 的就地改写由 (a!)/auto_functionalized 在图里表达，不靠 fake 返回值；
+    #       fake 只声明“本算子无输出”。函数式版(-> Tensor)则相反：return torch.empty_like(qkv)。
+
 
 ================================================================================
 三点五、它在 register_replacement / trace 时被怎么调用（真张量→FakeTensor→推断形状）
@@ -150,6 +168,34 @@
 
 
 ================================================================================
+三点六、何时被调（编译四阶段定位）+ 推断出的元信息喂给谁
+================================================================================
+  fake 在“FakeTensor 形状传播遇到该自定义算子”时被调。算子何时进图，决定 fake 何时被用：
+
+  (A) 模型本身就调该算子（如 vLLM 的 custom op）
+      ① TorchDynamo 抓图 → ② AOTAutograd functionalize：算子在 ② 就进图，fake 在 ② 被调。
+
+  (B) 算子由 post_grad pass 引入（本项目：模型函数式，pass 把散装子图换成自定义算子）
+      ① TorchDynamo    抓 Python → FX 图            ── 不调（算子未进图）
+      ② AOTAutograd    → 函数式 aten post-grad 图    ── 不调本算子（调的是散装 aten 自带 meta）
+      ③ post_grad pass 替换子图为自定义算子          ── 算子在此进图；register_replacement 构造
+                       (post_grad_custom_post_pass)     替换、trace replace_fn 调用它时 → 调它的 fake
+      ④ TorchInductor  编译含该算子的图 + 缓存        ── 继续靠其输出 meta 做后续优化/codegen
+      前提：register_fake 必须在【替换/编译之前】登记好（install 里先 register_fake 再
+            register_replacement）；否则 ③~④ 传播到该算子即 UnsupportedOperatorException。
+
+  推断出的【输出元信息(shape/dtype/device)】喂给谁（为什么非要它不可）：
+    - 继续建图：你的算子输出是下游算子的输入，推不出输出 → 图在你这儿断、后面 trace 不下去；
+    - 算子融合：判断能否融、广播/元素数都要形状；
+    - 内存规划 / buffer 分配：按大小/dtype/device 分配与复用输出缓冲；
+    - re-inplace：对 (a!) 算子做“原输入是否还存活”的生命周期分析；
+    - codegen(Triton/CUDA)：生成 kernel 要精确 shape/strides/dtype（循环边界、索引）；
+    - 动态形状：用 SymInt 跟踪形状、生成 guard。
+  一句话：fake 用 FakeTensor（只有元信息、无显存）替真实 kernel 占位，把全图形状/类型推全，
+          供“继续建图 + 融合 + 内存规划 + re-inplace + codegen + 动态形状”使用。
+
+
+================================================================================
 四、与本仓库报错的对应
 ================================================================================
   ../fork/fused_silu_mul_compile_hook.py 第一版【漏了 register_fake】，
@@ -172,6 +218,8 @@
 
 相关文档：
   torch.library.register_replacement.txt   配套的模式匹配-替换(fwd_only 也在 fake 上 trace)
+  custom_op_inplace_autofunctionalized.txt  in-place/out-of-place 三种写法、auto_functionalized/
+                                            re-inplace 的阶段·触发·作用、_fake 时机与作用(四阶段)
   ../fork/fused_silu_mul_compile_hook.py/.txt 用到本注册的最小复刻 + 报错七
   ../c++/TORCH_LIBRARY_vs_PYBIND11.txt       CompositeExplicitAutograd(fake)块 + 三块分工
   ../torch/vllm自定义算子调用链路.txt         vLLM 里 fake/meta 块的位置(torch_bindings.cpp:590)

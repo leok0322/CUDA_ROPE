@@ -161,7 +161,9 @@ class Runner:
         #   由 Runner 传入；连同 search/replace 一起注入通用安装器 Installer，由它完成
         #   register_replacement + PatternMatcherPass + post_grad 钩子。
         example_inputs = rp.make_example_inputs(self.num_tokens, self.device, self.dtype)
-        installer = Installer(rp.search_fn, rp.replace_fn, example_inputs, rp.op_name)
+        # fake/meta 也由 rp(拥有算子者)给出、注入 Installer；Installer 只负责注册，不写死 fake。
+        installer = Installer(rp.search_fn, rp.replace_fn, example_inputs,
+                              rp.op_name, rp.make_fake_fn())
         installer.install_fusion_pass()
         compiled = torch.compile(self.model)   # 编译时回调 custom_post_grad_pass
         with torch.no_grad():

@@ -17,11 +17,14 @@ class Installer:
     """通用的 "匹配-替换" pass 安装器：注入 search/replace/example_inputs 即可用。"""
 
     def __init__(self, search_fn, replace_fn, example_inputs,
-                 op_name=""):
+                 op_name="", fake_fn=None):
         self.search_fn = search_fn          # 被匹配的分步子图
         self.replace_fn = replace_fn        # 替换成的融合算子调用
         self.example_inputs = example_inputs  # 样例张量，供 register_replacement 描摹形状
         self.op_name = op_name              # 融合算子全名，用于注册 fake/meta 实现
+        # fake/meta 实现【由调用方(拥有算子的 pass)提供并注入】，本类不写死——因为"fake 返回什么"
+        # 取决于算子 schema(void→None / 函数式→empty_like)，是算子语义的一部分。
+        self.fake_fn = fake_fn
 
     # ----------------------- 注册替换 → PatternMatcherPass → post_grad 钩子
     def install_fusion_pass(self):
@@ -31,10 +34,14 @@ class Installer:
         )
 
         # 融合算子需要 fake/meta 实现，torch.compile 才能在 FakeTensor 上推断形状。
-        # *args 吸收算子的常量入参(num_heads, head_dim, eps 等)，输出与输入 x 同形同类型。
-        @torch.library.register_fake(self.op_name)
-        def _fake(x, weight, cos, sin, *args):
-            return torch.empty_like(x)
+        # fake 实现【由调用方注入(self.fake_fn)】，本类只负责"注册"，不写死其返回逻辑。
+        # 何时被调(参数流入路径，非直接调用、编译期间接到达)：
+        #   make_example_inputs(5 张量) → example_inputs → register_replacement trace replace_fn
+        #   → replace_fn 调 op(qkv,q_weight,k_weight,cos,sin, Hq,Hk,Hv,head_dim,eps)
+        #   →(FakeTensorMode 路由到 fake_fn) fake_fn(*args)：前 5=example_inputs(转 FakeTensor)、
+        #     后 5=replace_fn 从 self 烤入的常量。(trace search_fn 不调它)
+        if self.fake_fn is not None:
+            torch.library.register_fake(self.op_name, self.fake_fn)
 
         pm_pass = PatternMatcherPass()
         register_replacement(self.search_fn, self.replace_fn,

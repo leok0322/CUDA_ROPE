@@ -269,6 +269,42 @@ example_inputs 详解（为什么需要、用什么、要注意什么）
 
 
 ================================================================================
+五点五、本项目 make_example_inputs：返回什么 / 要不要含常量 / 怎么流到 _fake
+================================================================================
+(RMSNormRoPEreplacePass.make_example_inputs；对应 src/python_app/rmsnorm_rope_replace_pass.py)
+
+(1) 产出什么、给谁
+    def make_example_inputs(self, num_tokens, device, dtype):
+        return [qkv, q_weight, k_weight, cos, sin]    # 仅 5 个【张量】(形状/类型对、数值随机)
+    这 5 个张量被 Runner 取出，作为 register_replacement(search_fn, replace_fn, example_inputs,
+    fwd_only, pm_pass) 的【example_inputs】。
+
+(2) 作用：trace 出 pattern(针/替换子图)
+    register_replacement 用它“跑一遍”两函数来 trace 成 FX 图：
+      search_fn(*example_inputs)  → 待匹配子图(针)
+      replace_fn(*example_inputs) → 替换子图
+    它只提供 shape/dtype/device(数值随机无所谓)；与运行期模型输入(util.make_inputs_qkv 造的、
+    喂给 model.forward 的真实 qkv)【是两回事】，只在编译期构造 pattern 时用。
+
+(3) 【不能把常量也返回】——必须与 search_fn/replace_fn 的形参表对齐
+    两函数签名是 5 个张量参数：def (self, qkv, q_weight, k_weight, cos, sin)。
+    register_replacement 按 search_fn(*example_inputs) 调用，故 example_inputs 必须正好 5 个张量。
+    若把 num_heads_q/k/v、head_dim、eps 也塞进去(变 10 个)：
+        search_fn(*[...5 张量..., Hq,Hk,Hv,head_dim,eps])  # → TypeError：多给了 5 个参数
+    常量【不是 pattern 通配符、也不是这两个函数的参数】，而是 replace_fn 内部从 self 读出、
+    烤进算子调用：op(qkv,q_weight,k_weight,cos,sin, self.num_heads_q,...,self.eps)。
+
+(4) example_inputs 怎么间接流到 _fake
+    你不直接 _fake(example_inputs)。但 trace replace_fn 时，replace_fn 调 op(...)，FakeTensorMode
+    下路由到 _fake；此刻 _fake(*args) 收到：
+        前 5 个 = example_inputs(转成 FakeTensor)；后 5 个 = 常量(replace_fn 从 self 补)。
+    数据流：make_example_inputs → example_inputs → trace replace_fn(*example_inputs)
+            → replace_fn 调 op(qkv,...,eps) → (FakeTensorMode) _fake(*args)。
+    所以“example_inputs 只给 5 张量”与“_fake 收到 10 个”不矛盾——常量是 replace_fn 调用时补的。
+    注：trace search_fn 不会调 _fake(search 侧是散装函数式 aten，没有这个自定义算子)。
+
+
+================================================================================
 六、易错点
 ================================================================================
   1) replace_fn 里的自定义算子缺 fake 实现 → trace(fwd_only→make_fx) 在 FakeTensor 上

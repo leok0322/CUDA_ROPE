@@ -1,0 +1,177 @@
+================================================================================
+torch 张量拼接/堆叠/按索引收集与分散：cat / stack / gather / scatter_
+================================================================================
+
+四个方法分两组：
+  - 拼接类：torch.cat(沿【已有】维连接)、torch.stack(沿【新建】维堆叠)
+  - 索引类：torch.gather(按索引【收集/读】)、Tensor.scatter_(按索引【分散/写】，gather 的逆)
+
+本仓库关联：rope_pure 用 cat / stack(见 util.py)；cos_sin_cache[positions] 是一次 gather
+(见第六节)；采样里的 top-k/top-p 常用 scatter_。
+
+
+================================================================================
+一、torch.cat —— 沿【已有维度】连接
+================================================================================
+
+torch.cat(tensors, dim=0) -> Tensor
+  把一串张量沿【已有的第 dim 维】首尾相接。除 dim 维外，其余维度形状必须相同；
+  结果在 dim 维上长度 = 各输入该维长度之和，【总维数不变】。
+
+解析：
+  - tensors 是“张量的序列”(tuple 或 list 都行)。
+  - 只在 dim 这一维“加长”，其它维原样对齐。
+
+例(dim 决定往哪个方向接)：
+  X = torch.arange(12.).reshape(3, 4)          # [3,4]
+  Y = torch.ones(3, 4)                         # [3,4]
+  torch.cat((X, Y), dim=0).shape  -> [6, 4]    # 行方向接：3+3=6
+  torch.cat((X, Y), dim=1).shape  -> [3, 8]    # 列方向接：4+4=8
+
+  # 列表序列也可以：
+  l = [torch.arange(20).reshape(2,2,5) for _ in range(3)]
+  torch.cat(l, dim=0).shape  -> [6, 2, 5]      # 2+2+2=6
+
+要点：cat 不增加维数；除 dim 外其余维必须一致(否则报错)；空张量可参与。
+
+
+================================================================================
+二、torch.stack —— 沿【新建维度】堆叠
+================================================================================
+
+torch.stack(tensors, dim=0) -> Tensor
+  把【形状完全相同】的一串张量，叠在一个【新插入】的第 dim 维上，【总维数 +1】，
+  新维长度 = 张量个数。dim 取值范围 [0, 原维数]（含端点，可插到最后）。
+
+解析(与 cat 的本质区别)：
+  - cat：沿已有维连接，不增维；
+  - stack：新建一维再堆，增一维；所有输入必须【同形】。
+  - 等价关系：torch.stack(seq, dim=d) == torch.cat([t.unsqueeze(d) for t in seq], dim=d)
+    即“先各自 unsqueeze(d) 补出长度1的新维，再 cat”。
+
+例：
+  x = torch.randn(2, 3)                  # [2,3]
+  torch.stack((x, x)).shape       -> [2, 2, 3]   # dim=0：新维在最前，长度=2(两个)
+  torch.stack((x, x), dim=1).shape-> [2, 2, 3]   # dim=1：新维插到中间
+  torch.stack((x, x), dim=2).shape-> [2, 3, 2]   # dim=2(=-1)：新维插到最后
+
+  # dim=-1 把“配对”放到最内层(本仓库 interleave RoPE 用法)：
+  #   stack([r1, r2], dim=-1) : [.,half] -> [.,half,2]，末维即 [r1[i], r2[i]]
+  #   再 .flatten(-2) 压平成 [.,2*half]，得到 r1[0],r2[0],r1[1],r2[1],… 交错排布
+
+cat vs stack 一句话：
+  cat = “接长”(同一维变长，维数不变)；stack = “摞起来”(多一维，要求同形)。
+
+
+================================================================================
+三、torch.gather —— 按索引【收集/读取】
+================================================================================
+
+torch.gather(input, dim, index) -> Tensor
+  沿 dim 维，用 index 给出的下标，从 input 里【挑元素】组成输出。
+  输出形状 == index 形状。input 与 index 维数相同，且除 dim 外 index.size(d)<=input.size(d)。
+
+3-D 规则(只有 dim 那一维的下标被 index 替换，其余用各自原位置)：
+  out[i][j][k] = input[index[i][j][k]][j][k]   # dim == 0
+  out[i][j][k] = input[i][index[i][j][k]][k]   # dim == 1
+  out[i][j][k] = input[i][j][index[i][j][k]]   # dim == 2
+
+例：
+  t = torch.tensor([[1, 2],
+                    [3, 4]])
+  idx = torch.tensor([[0, 0],
+                      [1, 0]])
+  torch.gather(t, 1, idx)
+  # out[0][0]=t[0][idx[0][0]=0]=1 ; out[0][1]=t[0][0]=1
+  # out[1][0]=t[1][idx[1][0]=1]=4 ; out[1][1]=t[1][0]=3
+  -> [[1, 1],
+      [4, 3]]
+
+直观理解：gather 是“按一张下标表去原张量里取值”，输出和下标表同形。
+与“高级索引” x[index_tensor] 是同一类操作(都是 gather 语义)。
+
+
+================================================================================
+四、Tensor.scatter_ —— 按索引【分散/写入】(gather 的逆，就地)
+================================================================================
+
+Tensor.scatter_(dim, index, src, *, reduce=None) -> Tensor   # 就地，改 self
+  把 src 的值，按 index 指定的 dim 维下标，【写回】到 self 对应位置。
+  其它维用 src 中元素的原位置；只有 dim 维用 index 的值作下标。
+
+3-D 规则(与 gather 对称，方向相反)：
+  self[index[i][j][k]][j][k] = src[i][j][k]   # dim == 0
+  self[i][index[i][j][k]][k] = src[i][j][k]   # dim == 1
+  self[i][j][index[i][j][k]] = src[i][j][k]   # dim == 2
+
+约束：self / index / src 维数相同；index.size(d)<=src.size(d) 全维成立、
+      index.size(d)<=self.size(d)(d!=dim)；index 取值 ∈ [0, self.size(dim)-1]；不广播。
+
+例 1(dim=0，把 src 一行散到不同行)：
+  src = torch.arange(1, 11).reshape(2, 5)
+  index = torch.tensor([[0, 1, 2, 0]])
+  torch.zeros(3, 5, dtype=src.dtype).scatter_(0, index, src)
+  # self[0][0]=1 self[1][1]=2 self[2][2]=3 self[0][3]=4
+  -> [[1,0,0,4,0],
+      [0,2,0,0,0],
+      [0,0,3,0,0]]
+
+变体：scatter_(dim, index, value) 把【标量 value】写到 index 指定位置(等价 src 全填 value)：
+  torch.zeros(3, 5).scatter_(0, torch.tensor([[0, 1]]), 2)
+  # self[0][0]=2 self[1][1]=2
+  reduce='add'/'multiply' 时改为“累加/累乘”而非覆盖写。
+
+gather 与 scatter_ 互逆：
+  gather  : 从源【收集】→ 输出与 index 同形(读)
+  scatter_: 把源【分散】→ 写回 self 指定位置(写)
+  注意：当 src 与 self 是同一张量(如 top-p 里)，需先 .clone() 再写，否则报
+        “某些元素读写同一内存”的 RuntimeError。
+
+
+================================================================================
+五、scatter_ 实战：采样里的 top-k / top-p 掩码
+================================================================================
+
+top-k(把非前 k 大的位置置 -inf；按原始下标写回)：
+  top_k_logits, top_k_indices = torch.topk(logits, k)        # 取前 k 与其原下标
+  filtered = torch.full_like(logits, float('-inf'))
+  filtered.scatter_(-1, top_k_indices, top_k_logits)         # 按原下标把保留值写回
+  # 未被写到的位置仍是 -inf → softmax 后概率≈0
+
+top-p(核采样，二维版要点)：
+  sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+  cum = torch.cumsum(sorted_probs, dim=-1)
+  remove = cum > p                       # 累计超过 p 的(在排序序里)标记删除
+  remove[..., 1:] = remove[..., :-1].clone(); remove[..., 0] = False  # 右移一位，保至少 1 个
+  # 把“排序序里的删除标记”按 sorted_indices 散回【原始下标】顺序：
+  remove_orig = remove.scatter_(-1, sorted_indices, remove.clone())
+  # 之后 logits[remove_orig] = -inf 即可
+
+要点：sort/topk 给的是“排序序”的值与“原始下标”；scatter_ 用这些原始下标把结果
+      写回原始位置，这是 top-k/top-p 的标准套路。
+
+
+================================================================================
+六、与本仓库的联系
+================================================================================
+
+- util.rope_pure：
+    neox     : c2 = torch.cat([c, c], dim=-1)；rot = x*c2 + rotate_half(x)*s2
+    interleave: torch.stack([r1, r2], dim=-1).flatten(-2)   # stack 新维 + flatten 还原交错
+- cos_sin_cache[positions]：一次【gather】——从 [max_position, rotary_dim] 的表里，
+    按每 token 的 position 取对应行 → [num_tokens, rotary_dim]。
+    方案 A 把这步放在算子外(pattern 不含 gather/index 节点，好匹配)；
+    方案 B(真实 kernel)把整表+position_ids 传入、kernel 内部用指针偏移
+    (cos_sin_cache + pos_id*rotary_dim) 手写 gather。
+- _rotate_half([-后半, 前半])：内部就是切片 + torch.cat。
+
+
+================================================================================
+七、速查
+================================================================================
+- cat(tensors, dim)      ：沿【已有】dim 连接；除 dim 外同形；不增维。
+- stack(tensors, dim)    ：沿【新建】dim 堆叠；输入须同形；增一维。
+  关系：stack(seq,d) == cat([t.unsqueeze(d) for t in seq], d)
+- gather(input, dim, index)：按 index 沿 dim 【读】；输出与 index 同形(= 高级索引)。
+- Tensor.scatter_(dim, index, src/value)：按 index 沿 dim 【写】回 self(就地，gather 的逆)；
+  src==self 时先 .clone()；reduce='add'/'multiply' 可累加/累乘。

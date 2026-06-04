@@ -1,0 +1,509 @@
+================================================================================
+自定义算子 in-place / out-of-place、search_fn/replace_fn、auto_functionalized 与
+re-inplace —— vLLM 与本项目(CUDA_ROPE)的对照
+================================================================================
+
+关联文件：
+  src/python_app/model.py                 (FusedQKVNormRope，函数式参考实现)
+  src/python_app/rmsnorm_rope_replace_pass.py  (search_fn / replace_fn / make_example_inputs)
+  src/python_app/installer.py             (register_fake + register_replacement + post_grad 钩子)
+  src/interface.cpp                       (TORCH_LIBRARY 算子 schema 注册)
+  docs/python/search_fn_replace_fn_pattern_matching.txt (方案 A/B、匹配机制)
+
+
+================================================================================
+一、两个项目的根本差异（决定一切）
+================================================================================
+
+torch.compile 流水线：
+  Dynamo 捕获 → AOTAutograd(trace + functionalize) → Inductor(post_grad passes) → codegen
+本项目与 vLLM 的融合 pass 都挂在【post_grad 阶段】(post_grad_custom_post_pass)，
+即【都在 functionalize 之后的图】上匹配 —— 阶段相同，差别在【图里的内容】：
+
+  vLLM      ：模型用【in-place custom op】(rms_norm/rotary_embedding)
+              → 图里是 auto_functionalized(custom_op) 高阶节点
+              → 融合是【op-to-op】(两个节点 → 一个节点)，稳。
+  本项目    ：模型是【纯函数式 PyTorch】(mean/rsqrt/cat/mul…)
+              → 图里是散开的函数式 aten 算子，无 auto_functionalized
+              → 融合是【散装子图匹配】，相对脆。
+
+记住：阶段相同(都 post-grad/functionalized)；不同的是 search 侧图的“长相”。
+
+
+================================================================================
+二、search_fn / replace_fn 的【通用规则】(vLLM 与本项目都适用)
+================================================================================
+
+register_replacement(search_fn, replace_fn, example_inputs, fwd_only, pm_pass) 要求：
+
+(1) 两个函数【都必须 return】，且【返回值的个数/结构一致】。
+    - 返回值 = pattern 的“输出锚点”：matcher 据此定位“替换谁的输出”，并把原来用
+      search 输出的下游节点改接到 replace 的输出。
+    - 不 return → 没有输出节点 → 匹配/替换都无从谈起。
+    - 这条与“模型函数式还是 custom op”无关，谁都要 return。
+
+(2) “void”指的是【算子(op)的 C++ 签名 -> ()】，不是函数。
+    - void in-place 算子也要在函数里把被改写的张量交出去：op(qkv,…); return qkv。
+    - 函数本身永远不是 void。
+
+(3) 张量入参 = pattern 的【通配符】(matcher 绑定)；标量/int(num_heads/head_dim/eps)
+    是【常量】，不进 pattern，由 replace_fn 从 self 烤进算子调用实参。
+
+(4) search_fn 必须复刻【模型图里那段】的形态(本项目复用 util.rms_norm_pure/rope_pure，
+    与 FusedQKVNormRope.forward 逐步同构，避免漂移)。
+
+
+================================================================================
+三、fused 算子的三种写法：C++ schema + Python(replace_fn/_fake) + 优缺点
+================================================================================
+
+设输入 qkv:[num_tokens,(Hq+Hk+Hv)*head_dim]，输出同形。
+
+────────────────────────────────────────────────────────────────────────────
+写法 ① 函数式 out-of-place： -> Tensor （本项目推荐）
+────────────────────────────────────────────────────────────────────────────
+C++ schema:
+  m.def("fused_qkv_norm_rope_neox(Tensor qkv, Tensor q_weight, Tensor k_weight,
+        Tensor cos, Tensor sin, int num_heads_q, int num_heads_k, int num_heads_v,
+        int head_dim, float eps) -> Tensor");
+C++ impl: 另开一块输出 buffer，把结果写进去，return 之(不改 qkv)。
+Python replace_fn:
+  return op(qkv, q_weight, k_weight, cos, sin, Hq, Hk, Hv, head_dim, eps)
+Python _fake:
+  def _fake(qkv, q_weight, cos, sin, *args): return torch.empty_like(qkv)   # 返回新张量
+优点：最简单；无 auto_functionalized/无 re-inplace；replace 直接拿到张量、与 search 对齐。
+缺点：多一份 qkv 大小的【输出 buffer】(峰值显存 +1 份)。
+      ★ 注意：这【不是冗余拷贝、不增带宽】——读 qkv 一次、写结果一次，和 in-place 相同；
+        只是结果写到新 buffer 而非写回 qkv。代价是“显存占用”，不是“数据搬运”。
+
+────────────────────────────────────────────────────────────────────────────
+写法 ② in-place 且返回被改写张量： Tensor(a!) … -> Tensor(a!)
+────────────────────────────────────────────────────────────────────────────
+C++ schema:
+  m.def("...(Tensor(a!) qkv, Tensor q_weight, ..., float eps) -> Tensor(a!)");
+C++ impl: 就地把结果写回 qkv，return qkv。
+Python replace_fn:
+  return op(qkv, ...)            # op 返回(被就地改写的)qkv
+Python _fake:
+  def _fake(qkv, ...): return qkv   # in-place：返回输入本身(语义上被改写)
+优点：省那份输出 buffer(显存最优)。
+缺点：是 mutating op → 图里走 auto_functionalized(临时 clone) → 依赖 re-inplace 去 clone；
+      比函数式复杂，meta/aliasing 要写对。
+
+────────────────────────────────────────────────────────────────────────────
+写法 ③ void in-place(vLLM 风格)： Tensor(a!) … -> ()
+────────────────────────────────────────────────────────────────────────────
+C++ schema:
+  m.def("...(Tensor(a!) qkv, Tensor q_weight, ..., float eps) -> ()");
+C++ impl: 就地写回 qkv，返回 void。
+Python replace_fn:
+  op(qkv, ...); return qkv       # 算子 void(返回 None)，函数仍 return qkv
+Python _fake:
+  def _fake(qkv, ...): return None   # void：不另开输出
+优点：触发 re-inplace 后显存最优；最贴近真实 vLLM kernel(fused_qk_norm_rope 即 void in-place)。
+
+【必须写对的点(footgun，不是运行期缺点)——三处同时对才跑得通】
+  写对之后写法③就能正常工作：replace 侧经 auto_functionalized 产值，search 侧保持函数式、
+  不需要 auto_functionalized——这个“函数式 search ↔ auto_functionalized replace”的不对称是 OK 的。
+  但三处缺一即【静默挂】(且只在 compile 暴露)：
+  (a) replace_fn 必须写 `op(qkv,...); return qkv`；写成 `return op(...)` → 返回 None →
+      与 search 张量输出对不上 → 替换装不上。
+  (b) schema 必须标 (a!)；不标 → 编译器当纯算子 → void 无输出 → 被 DCE(kernel 不跑)/缓冲区错乱。
+  (c) _fake 必须 return None(与 -> () 一致)；用 empty_like(函数式版)会返回类型不符。
+  连环关系：即使 (a) 写了 `return qkv`，漏了 (b) 的 (a!) 仍会 DCE 拿到原值 → 错。
+
+【真正的权衡(写对之后仍存在)】
+  - 省显存“有条件”：靠 re-inplace 去掉 auto_functionalized 的 clone 才省；re-inplace 证不出
+    “原 qkv 之后无人用”时会【保留 clone】→ 多一次真·拷贝 → 反而比函数式①更费。即内存优势
+    “看 re-inplace 脸色”，非无条件。(单张量、qkv 用完即死的简单场景通常会触发。)
+  - 复杂度更高/更吃版本：图里多一套 auto_functionalized + clone + re-inplace，meta/aliasing/
+    re-inplace 行为都随 PyTorch 版本变，要 reason 的地方更多。
+  → 对比：① 用“无条件 +1 buffer”换“简单、可预测”；③ 用“多一套机制 + 内存优势看 re-inplace”
+     换“触发时 0 额外内存”。本项目这种规模，① 通常更划算。
+
+▶ 重要澄清(别误解为“search 侧帮 replace 对齐”)：
+  auto_functionalized 与上面 (a)(b)(c) 这些 footgun，都是【按算子是否标 (a!) 逐个触发/要求】的，
+  与该算子处在 search 侧还是 replace 侧【无关】。所以：
+  - (a)(b)(c) 是【void in-place 算子的固有要求】，对谁都一样：vLLM 用 void 也必须满足它们，
+    它满足只是因为【自己的算子注册对了(成熟、测过)】，并非被 search 侧“自动对齐”。
+  - 本项目【同样可以用 void in-place(写法③)】，只要 (a)(b)(c) 写对即可；不会因为我们 search 侧
+    是函数式而“更难”——不存在“靠 search 侧 auto_functionalized 兜底”的机制。
+  vLLM 与本项目【唯一真实差别】是 search pattern 的形态 → 匹配鲁棒性：
+    vLLM = auto_functionalized(custom op) 节点的 op-to-op 匹配(稳)；本项目 = 散装 aten 子图(脆)。
+  这与“fused op 选 ①/②/③ 哪种写法”是【两根独立的轴】，互不决定。
+
+  → 故本项目首选写法①，理由是【普适的“简单/可预测”】(无 (a!)/auto_functionalized/re-inplace，
+    少 (a)(b)(c) footgun，内存无条件 +1 buffer，不吃版本)，而非“缺 auto_functionalized 兜底”。
+    要省那份显存可改用 ②/③，但需自担 footgun + re-inplace 的条件性收益，本项目这种规模性价比不高。
+
+
+================================================================================
+四、auto_functionalized：阶段 / 触发 / 操作 / 作用
+================================================================================
+
+【阶段】functionalization 时 —— 即“该 in-place 算子进入【被 functionalize 的图】”那一刻；
+        按算子来源分两种(都对，别只记成②)：
+        - 模型自带的 in-place 算子(如 vLLM 的 rms_norm/rotary_embedding)：在 ② AOTAutograd
+          functionalize 时被包(trace 之后、Inductor 之前)。
+        - pass 在 ③ 引入的 in-place 算子(本项目写法②/③，模型本身函数式)：该算子到 ③ 才进图，
+          故其 auto_functionalized 在 ③(register_replacement 构造/trace replace_fn、把替换插入
+          已 functionalize 的 post-grad 图)时产生，而非 ②。
+        共性：触发点 = “in-place 算子出现在被 functionalize 的图里”的那一刻。
+
+        编译四阶段(供定位 auto_functionalized 落在哪)：
+          ① TorchDynamo    抓 Python → FX 图                    ── 不涉及(算子未进图/未 functionalize)
+          ② AOTAutograd    trace + functionalize → 函数式 aten   ── 【模型自带的 in-place 算子在此被包】
+                           post-grad 图
+          ③ post_grad pass 匹配-替换子图为自定义算子             ── 【pass 引入的 in-place 算子(本项目)在此被包】
+                           (post_grad_custom_post_pass)
+          ④ TorchInductor  把图编译成 Triton/自定义 kernel + 缓存 ── 不再“产生”auto_functionalized，
+                                                                  但在含它的图上做 re-inplace 去 clone(见五)
+        结论：auto_functionalized 的产生点是 ②(模型自带 in-place) 或 ③(pass 引入 in-place)；
+              其“消除/还原原地”(re-inplace)发生在 ④。
+【触发】算子 schema 标了【会改写入参】，即 (a!)。没标 → 不触发(被当纯算子)。
+【操作】把 in-place 算子调用包成高阶节点 auto_functionalized：
+        1) clone 输入(qkv_clone = clone(qkv))，不动原 qkv；
+        2) 在副本上跑 op(改写 qkv_clone)；
+        3) 把“被改写的副本”作为【新值】返回，并把【下游对 qkv 的使用改接到这个新值】。
+        示意：
+          op(qkv,...); use(qkv)   ──►   qkv_new = auto_functionalized(op, qkv=qkv,...); use(qkv_new)
+        对 void op 也成立——它把被改写张量的新值吐出来(于是 replace_fn 的 return qkv 拿到 qkv_new)。
+【作用】把“有副作用的就地改写”变成“无副作用的 SSA 产值”，让 AOTAutograd/Inductor 能在
+        【函数式图】上安全地重排、融合、去重、求导。代价：一次 clone(拷贝)。
+
+================================================================================
+_fake：阶段 / 触发 / 作用
+================================================================================
+【阶段】③(pass 引入算子、register_replacement trace replace_fn 时) ~ ④(Inductor 编译含该算子的图)；
+        模型自带的 in-place 算子(vLLM)则在 ②。本项目算子在 ①/② 不被调(详见下"何时被调")。
+【触发】FakeTensor 形状传播遇到该自定义算子(图里出现它、在 Meta/FakeTensor 分发键下求值)。
+        前提：register_fake 必须在替换/编译【之前】登记好(install 里先 register_fake 再 register_replacement)。
+【操作】用输入的【元信息】(shape/dtype/device)构造“输出占位”，不真算、不碰数据/不读数值：
+        函数式 -> Tensor    ：return torch.empty_like(x)；
+        void in-place -> () ：return None(无输出张量；改写由 (a!)/auto_functionalized 表达)。
+【作用】在【不真跑 kernel】的前提下，回答“给定 fake 输入 → 输出元信息”，把全图形状/类型推全，
+        供【继续建图 + 算子融合 + 内存规划 + re-inplace + codegen + 动态形状】使用；
+        缺它 → 编译期 FakeTensor 推不出输出 → UnsupportedOperatorException。
+
+────────────────────────────────────────────────────────────────────────────
+（以下展开）
+_fake 是【该算子的 fake/meta 实现】—— fake 的是“算子在编译期的输出元信息”
+    @torch.library.register_fake("ROPE_cuda::fused_qkv_norm_rope_interleave")
+    def _fake(*args):        # 形参用 *args 通配：fake 不读参数、只声明返回，免去逐个命名(避免误导)
+        return None          # 写法③ void in-place(-> ())：无输出张量，故返回 None
+    - 它 fake 的是【哪个算子】：register_fake(op_name) 把它绑到该算子；它是这个算子的【Meta/
+      FakeTensor 分发键】那一支实现，与 CUDA 真实现【并列】(同一算子的不同实现)：
+        CUDA 真实现 (m.impl(name,&fn), CUDA 键) ：运行期、真张量 → 真跑 kernel/真改 qkv
+        fake/meta  (register_fake(name))      ：编译期、FakeTensor → 只推输出元信息、不真算
+    - 它 fake 的是【什么】：编译期 torch.compile 用 FakeTensor(只有 shape/dtype/device、无真实
+      数据/显存)把图干算一遍做形状传播；遇到自定义算子就问“给定这些 fake 输入，输出长啥样”，
+      由 _fake 回答【输出的元信息】(不真算、也不 fake 输入)。
+        函数式 -> Tensor    ：fake 返回 torch.empty_like(x)(声明输出与 x 同形同类型)；
+        void in-place -> () ：无输出张量(改写发生在 qkv、由 (a!)/auto_functionalized 追踪)，返回 None。
+    - 为何必需：缺 fake/meta，编译期在 FakeTensor 上推不出该算子输出 → 报
+      UnsupportedOperatorException: <op_name>。它只在【编译期】被调；运行期走 CUDA 真实现。
+    - 【何时被调(四阶段定位)】fake 在“FakeTensor 形状传播遇到该自定义算子”时被调；本项目算子
+      由 pass 在 ③ 才进图，故：
+        ① TorchDynamo(抓 Python→FX)              ：不调(算子还没进图)
+        ② AOTAutograd(→ 函数式 aten post-grad 图) ：不调本算子(图里是模型散装函数式 aten，
+                                                    传播调的是那些 aten 自带的 meta)
+        ③ post_grad pass(替换子图为自定义算子)     ：算子在此进图；register_replacement 构造替换、
+                                                    trace replace_fn 调用该算子时 → 调它的 fake
+        ④ TorchInductor(编译含该算子的图)          ：继续靠它的输出 meta 做融合/内存规划/codegen
+      前提：register_fake 必须在替换/编译【之前】登记好(install_fusion_pass 里先 register_fake
+            再 register_replacement)，否则 ③~④ 传播到该算子即 UnsupportedOperatorException。
+    - 【“trace replace_fn + fake”在 ③ 的作用】register_replacement 要把“替换成什么”从 Python
+      函数变成可剪贴的 FX 子图：trace replace_fn 把 op(...) 变成图节点，而 fake 给出该节点的
+      【输出 meta】，作用有三：
+        i.  物化：matcher 在图层面工作，需要 replace 是【一段 FX 节点】(而非 Python 可调用)，
+            才能剪贴进目标图、顶替匹配到的 search 子图。
+        ii. drop-in 对齐：替换输出要接到“原来用 search 输出的下游”，故其 meta 必须与 search 子图
+            输出【等形等类型】；fake 提供该输出 meta，register_replacement 据此对齐/校验。
+            (void in-place：fake 返回 None 表“算子无返回”，真正顶替 search 输出的产值由
+             (a!)/auto_functionalized 给出的 qkv_new 充当。)
+        iii.维持元信息链：替换插入后，③~④ 仍要在含该算子的图上 FakeTensor 传播，fake 是这条链
+            能继续的前提。
+
+================================================================================
+make_example_inputs：返回什么 / 要不要含常量 / 怎么流到 _fake
+================================================================================
+(RMSNormRoPEreplacePass.make_example_inputs；对应 src/python_app/rmsnorm_rope_replace_pass.py)
+
+(1) 产出什么、给谁
+    def make_example_inputs(self, num_tokens, device, dtype):
+        return [qkv, q_weight, k_weight, cos, sin]    # 仅 5 个【张量】(形状/类型对、数值随机)
+    这 5 个张量被 Runner 取出，作为 register_replacement(search_fn, replace_fn, example_inputs,
+    fwd_only, pm_pass) 的【example_inputs】。
+
+(2) 作用：trace 出 pattern(针/替换子图)
+    register_replacement 用它“跑一遍”两函数来 trace 成 FX 图：
+      search_fn(*example_inputs)  → 待匹配子图(针)
+      replace_fn(*example_inputs) → 替换子图
+    它只提供 shape/dtype/device(数值随机无所谓)；与运行期模型输入(util.make_inputs_qkv 造的、
+    喂给 model.forward 的真实 qkv)【是两回事】，只在编译期构造 pattern 时用。
+
+(3) 【不能把常量也返回】——必须与 search_fn/replace_fn 的形参表对齐
+    两函数签名是 5 个张量参数：def (self, qkv, q_weight, k_weight, cos, sin)。
+    register_replacement 按 search_fn(*example_inputs) 调用，故 example_inputs 必须正好 5 个张量。
+    若把 num_heads_q/k/v、head_dim、eps 也塞进去(变 10 个)：
+        search_fn(*[...5 张量..., Hq,Hk,Hv,head_dim,eps])  # → TypeError：多给了 5 个参数
+    常量【不是 pattern 通配符、也不是这两个函数的参数】，而是 replace_fn 内部从 self 读出、
+    烤进算子调用：op(qkv,q_weight,k_weight,cos,sin, self.num_heads_q,...,self.eps)。
+
+(4) example_inputs 怎么间接流到 _fake
+    你不直接 _fake(example_inputs)。但 trace replace_fn 时，replace_fn 调 op(...)，FakeTensorMode
+    下路由到 _fake；此刻 _fake(*args) 收到：
+        前 5 个 = example_inputs(转成 FakeTensor)；后 5 个 = 常量(replace_fn 从 self 补)。
+    数据流：make_example_inputs → example_inputs → trace replace_fn(*example_inputs)
+            → replace_fn 调 op(qkv,...,eps) → (FakeTensorMode) _fake(*args)。
+    所以“example_inputs 只给 5 张量”与“_fake 收到 10 个”不矛盾——常量是 replace_fn 调用时补的。
+    注：trace search_fn 不会调 _fake(search 侧是散装函数式 aten，没有这个自定义算子)。
+
+
+================================================================================
+五、re-inplace：阶段 / 触发 / 操作 / 作用
+================================================================================
+
+【阶段】④ TorchInductor 阶段(把图编译成 Triton/自定义 kernel 之前的优化里)，且在
+        【auto_functionalized 已经存在之后】——即时序上晚于它的产生点(②模型自带 / ③pass 引入)。
+        对照编译四阶段(同四节)：
+          ① TorchDynamo    抓 Python → FX 图                    ── 不涉及
+          ② AOTAutograd    functionalize → 函数式 aten          ── 产生 auto_functionalized(模型自带 in-place)
+          ③ post_grad pass 替换子图为自定义算子                 ── 产生 auto_functionalized(pass 引入 in-place，本项目)
+          ④ TorchInductor  编译成 kernel + 缓存                  ── 【re-inplace 在此】：去 clone、还原原地
+        一句话：auto_functionalized 在 ②/③ 产生 → 中间各项优化照常 → re-inplace 在 ④ 把多余 clone 消掉。
+【触发】图里存在 auto_functionalized 节点(即前提是写法②/③标了 (a!) 才会有)。
+【操作】判断“原输入(qkv)在该 op 之后是否还被用”：
+        - 若【已无人用】→ 那份 clone 多余 → 去掉 clone、直接在原 qkv 上原地改：
+            qkv_clone=clone(qkv); op(qkv_clone); use(qkv_clone)  ──►  op(qkv); use(qkv)
+        - 若【还要用/有别名】→ 保留 clone(不能覆盖，保正确)。
+【作用】消除 auto_functionalized 临时引入的 clone，把执行还原成“原地、省显存”——
+        实现“优化时函数式、执行时原地”的两全。
+
+★ (a!) 是【总开关】：(a!) → auto_functionalized → 才有 re-inplace 可做。
+  不标 (a!)：两者都不发生；且 void 算子会被 DCE / 缓冲区错乱(静默错误)。
+
+【通用 re-inplace 的具体策略(Inductor)】
+  本质是对“被改写的输入张量”做【生命周期 / 最后一次使用(liveness/last-use)分析】，
+  满足以下三条才去 clone、改原地，否则【保留 clone】：
+    1) 改写前的值之后【无人再读】：该输入在此 auto_functionalized 节点之后没有其它消费者
+       (它的“最后一次使用”就是喂给本 op)；若后面还读原值 → 不能覆盖。
+    2) 【无别名(aliasing)】：被改写张量不与其它仍存活的张量共享/别名同一存储(否则踩坏别人)。
+    3) 【可安全覆盖】：不是必须保持不变的对象(如需原样保留的图输入/参数)。
+  三条都满足 → op(原张量) 原地写、丢 clone；任一不满足 → 保留 clone(保正确)。
+  实现上就是看该张量节点后续的 use/use-count：唯一使用者且之后不再出现 → 判可原地。
+
+【“保留 clone → 多一次真·拷贝”是什么意思】
+  clone(qkv) 是一次真实全量拷贝：分配新 buffer + 读 qkv(HBM) + 写副本(HBM)。
+  - re-inplace 去掉它 → 直接 op(qkv) 原地改，无此拷贝(真省)；
+  - re-inplace 保留它 → 这次 clone 的读+写白白发生 = “多一次真·拷贝”。
+  带宽对比(各 qkv 大小)：
+    函数式①              ：读 qkv + 写结果              = 1读+1写
+    in-place 但保留 clone ：clone(读 qkv+写副本)+op(读副本+写副本) ≈ 2读+2写(≈ 函数式 2 倍)
+  ⇒ in-place 想赢必须靠 re-inplace 干掉 clone；干不掉反而比函数式更费。
+
+【何时触发不了(保留 clone) / 本项目情况】
+  触发不了的典型：qkv 在 op 之后【还被别处读】(如残差/skip 又用原始 qkv)、qkv 与存活张量
+  【别名】(view/共享存储)、或分析过于保守证不出安全。
+  本项目：fused op 改写 qkv，子图里 qkv 唯一消费者就是 fused op、之后下游用其输出、不再读原
+  qkv，且无别名 → 满足三条 → re-inplace 通常会触发 → 真原地、真省。
+
+
+================================================================================
+六、不标 (a!) 却就地改写 → 会出什么事（静默错误，最难查）
+================================================================================
+
+(a!) 是“告诉编译器 qkv 被改写”的唯一渠道；Python 的 return qkv 传达不了 mutation 信息。
+不标 (a!) 但算子实际改了 qkv：
+  - void 算子：编译器当“无返回、无副作用”的纯算子 → 判为无用 → 【DCE 删掉，kernel 不跑】
+    → 结果 = 未处理的原 qkv(没 norm/没 rope)。
+  - 重排错乱：编译器以为 qkv 是常量 → 把“改写后才该执行的读”提前到写之前、或把前后两次读
+    合并 → 读到旧值/算错。
+  - 缓冲区复用错乱：内存规划以为 qkv 用完即死 → 把它的 buffer 复用给别的张量 → op 的写踩踏。
+特点：eager 正常(直接执行)，一上 torch.compile 才坏；靠 runner 的 allclose 能发现“不一致”。
+
+【为什么 eager 正常】
+  eager 是逐条 Python 调用、立即执行：无 functionalization / 无 DCE / 无重排 / 无内存规划。
+  算子被调用就真跑 kernel、物理写进 qkv 内存，return qkv 拿到的就是真被改写的值。
+  eager 执行时【不看 schema 的 (a!)】——它只是元信息，eager 忽略它。故标没标 (a!) eager 都对。
+  (本项目特定：eager 参考走 model.forward 函数式、压根不调 custom op，更是双重正确。)
+
+【为什么 compile 才坏】
+  torch.compile 要建图 + functionalize + Inductor 优化，这些【全靠 schema 判断每个 op 干了啥】。
+  schema 撒谎(实际改 qkv 却没标 (a!)) → 编译器据此做错误决策：DCE 删掉 void 算子 / 重排读 /
+  复用 qkv 的 buffer。schema 是编译器唯一的真相来源，真相错 → 编译出的图就错。
+  即：eager 凭“真执行”拿对结果、不依赖 schema；compile 凭“按 schema 推理并优化”，schema 错就全错。
+
+【为什么 allclose 能发现】
+  runner 里 y_ref = eager 前向(可信参考)、y = compiled 输出(被测)，torch.allclose(y_ref, y) 本质是
+  【差分测试】。compile 路径若 silent 出错(op 被 DCE → qkv 未处理 / 缓冲区错乱)，y 必偏离 y_ref →
+  allclose 返回 False → 打印 “[compiled] 与 eager 是否一致: False” → 抓到。
+  这正是 runner 拿 compiled 与 eager 比对的意义：对“不报错、只算错、且只在编译路径出现”的 silent
+  bug，eager 当黄金参考、allclose 当哨兵。
+
+
+================================================================================
+七、为何 vLLM 要自定义 re-inplace(FixFunctionalizationPass)
+================================================================================
+
+Inductor 本就自带 re-inplacing，vLLM 仍自写 FixFunctionalizationPass，主要因为通用版
+“不够用 / 不够可控”(vLLM 内部、随版本变，方向如下)：
+
+(1) 通用 re-inplacing 保守：证不出安全就保留 clone。vLLM 改的是巨型张量(hidden/residual/
+    KV cache)，多留一份 clone = 几十 MB~GB 的额外拷贝+HBM 带宽。vLLM 凭 op 语义更激进地去 clone。
+(2) 时机/顺序可控：vLLM 的融合就在 auto_functionalized 层做，需要在“自己融完之后、按自己
+    顺序”把残留包装拆掉；通用版固定时机未必覆盖其自定义融合后的形态。
+(3) 反 functionalize 到“裸 in-place 调用”：vLLM 要最终图是直接的 in-place custom op 调用
+    (无高阶包装、无拷贝)，利于 codegen / CUDA Graph 捕获 / 内存确定性。
+(4) 跨 PyTorch 版本鲁棒：自带 re-inplacing 逐版本才成熟，vLLM 自己兜底保证行为一致。
+(5) 复杂 mutation：多输出(query/key/kv_cache)、分页 KV cache 按 slot 写等，通用分析证不出
+    安全而保守保留拷贝；vLLM 凭语义知道安全。
+本质：更可控 + 更激进 + 贴合自身 op 语义。本项目走函数式①则全不涉及；即便走简单单张量
+      in-place，Inductor 自带 re-inplacing 基本够用，无需自定义。
+
+
+================================================================================
+八、函数式 vs in-place：显存 / 带宽 对比（破除“函数式=大量拷贝”的误解）
+================================================================================
+
+写法           额外显存(峰值)        额外数据搬运(带宽)       复杂度
+────────────   ──────────────────   ───────────────────────  ─────────────────────
+① 函数式        +1 份 qkv buffer(临时)  无(读 qkv+写结果，同 in-place)  最低，无需 (a!)
+② in-place(re-inplace 成功)  0          无                        需 (a!)+meta，依赖 re-inplace
+③ in-place(re-inplace 失败)  +1 clone   +1 次冗余读写(更差)        同上，且踩坑
+
+要点：
+  - 函数式不是“把 qkv 复制一遍”——它写的是【计算结果】到新 buffer，读写量和 in-place 相同；
+    代价仅是“多一份输出 buffer 的【显存占用】”，不是“多一次数据搬运”。
+  - “大大降低内存效率”被高估：只多一份 qkv 大小、且临时(输入随后可释放)。小规模可忽略；
+    大规模推理(qkv 巨大)才显著 —— 这正是 vLLM 选 in-place 的原因。
+  - 反直觉：若 in-place 的 clone 没被 re-inplace 去掉，反而【比函数式更费】(多一次真·拷贝)。
+
+
+================================================================================
+九、schema(m.def) 的角色：算子的统一契约
+    —— 类型声明/校验、(a!) 触发 auto_functionalized、支撑多实现
+================================================================================
+
+(0) 为什么由 schema 决定？—— Python【不能直达】你的 C++ 函数，必经 Dispatcher
+    常见疑问：“Python 参数不是直接传给 run_..._cuda_interleave 吗？保证两边类型一致不就行，
+    m.def 起什么作用？” —— 关键是【根本没有直达通路】：
+      - 跨语言：Python 实参是 PyObject(int/float/Tensor 对象)，C++ 要的是 at::Tensor&/int64_t/
+        double；PyObject 不能直接当 C++ 类型用，必须转换。
+      - 调用路径(不是直达)：
+          Python 实参(PyObject)
+            │ 按 schema 装箱
+            ▼
+          Dispatcher（通用的"装箱"调用约定：一个 IValue 栈）
+            │ 按【算子名 + 分发键(CPU/CUDA/Meta/Autograd…)】路由
+            ▼
+          unboxing 包装（m.impl 用模板从你的 C++ 签名自动生成）
+            │ 把 IValue 拆箱成 at::Tensor/int64_t/double
+            ▼
+          你的 run_..._cuda_interleave(...)
+      - Dispatcher 是【通用】的，对所有算子一视同仁，并不知道你某个具体 C++ 函数的签名；
+        它靠 schema(m.def)得知“几个参数、各是什么类型”，才能把 Python 实参装箱、校验、路由。
+    m.def 与 m.impl 的分工：
+      - m.def  = 声明【接口/契约】(语言无关)；Python、Dispatcher、Autograd、FakeTensor、序列化
+                 都读它。一次声明。
+      - m.impl = 注册【实现】；用模板从你的 C++ 签名生成“拆箱包装”，把 IValue 拆成 C++ 类型调你。
+                 可多次(CUDA / CPU / Meta-fake / Autograd 各一个实现，【共享同一 schema】)。
+    两处校验：
+      - 注册期：m.impl 时 PyTorch 校验【你的 C++ 签名 ⟷ schema 兼容】，不符 → 编译/注册期报错
+                (如 schema int 你写 double、schema float 你写 C++ float)。
+      - 调用期：Dispatcher 按 schema 校验【Python 实参】的运行时类型/个数(见(3))。
+    为什么非有 schema 不可：一个算子可挂【多个实现】(CUDA kernel + Meta/fake + Autograd…)，
+      它们是不同函数、却共享同一签名；schema 就是这份共同“接口”，Dispatcher 据分发键在它们间路由。
+      若只是“Python 直接对一个 C++ 函数”，就支持不了多后端 / fake / autograd 这套。
+    ⇒ 所以不是“Python ↔ C++ 直接对齐类型”，而是【Python 对 schema、C++(m.impl) 也对 schema，
+       schema 居中两头校验】。
+
+(1) 类型的【声明】只在一处：C++ schema(m.def 字符串)
+    schema 是算子签名的【唯一真相源】，它规定每个参数的类型与顺序、以及返回：
+      m.def("fused_qkv_norm_rope_interleave(Tensor(a!) qkv, Tensor q_weight, Tensor k_weight,
+            Tensor cos, Tensor sin, int num_heads_q, int num_heads_k, int num_heads_v,
+            int head_dim, float eps) -> ()");
+    Python 端【不声明、也不需要声明】类型；类型“是什么”由 schema 说了算。
+    schema 类型 ↔ C++ 类型(易错点)：
+      Tensor      ↔ at::Tensor / torch::Tensor(同一类型；schema 串里只能写 Tensor)
+      Tensor(a!)  ↔ 就地改写的张量(C++ 惯用 at::Tensor&)
+      int         ↔ int64_t（没有 uint）
+      float       ↔ double （torch schema 的 float 就是 64 位 double，不是 C++ float）
+      -> ()       ↔ void
+
+    ★ Tensor(a!) 不只是“类型标注”，更是【触发 auto_functionalization 的前提/开关】：
+      schema 是“算子会不会改写入参”的唯一声明渠道(Python 的 return 传达不了 mutation 信息)。
+      functionalization 正是【看到 (a!)】才知道该 in-place 算子会改写 qkv，进而：
+        标了 (a!)  → 包 auto_functionalized(clone+产新值+改接下游) → 之后 re-inplace 去 clone；
+        漏标 (a!)  → 被当纯算子 → void 无输出被 DCE(kernel 不跑) / 缓冲区错乱(静默错误)。
+      故 (a!) 是“auto_functionalized → re-inplace”这条 in-place 处理链的【总开关】。
+      (机制详见第四节 auto_functionalized / 第五节 re-inplace。)
+
+(2) Python 是【动态类型】：变量无类型，但每个“值/对象”运行时都带类型
+    - “Python 没类型”指【变量不声明静态类型】，不是“值没类型”。
+    - 每个对象运行时都有明确类型：type(3)=int、type(3.5)=float、type(True)=bool(int 子类)、
+      type(torch.randn(2))=torch.Tensor、type("a")=str。
+    - 对比：C++ 类型绑在【变量/形参】上(编译期定)；Python 类型绑在【对象】上(运行时看)。
+
+(3) 调用时的【校验】：Dispatcher 在运行时按 schema 装箱/校验/拆箱(boxing/unboxing)
+    op(qkv,...,num_heads_q,...,eps) 调用时，Dispatcher：
+      a) 按【位置】把 Python 实参对到 schema 的形参；
+      b) 在 C 层检查每个实参对象的运行时类型(THPVariable_Check 是否张量 / PyLong_Check 是否
+         int / PyFloat_Check 是否 float …)，装箱成带类型标签的 IValue；
+      c) 按 schema 声明的类型校验，再拆箱成 C++ 类型(at::Tensor / int64_t / double)调你的函数。
+    可接受/拒绝的细节：
+      schema Tensor ← 仅 torch.Tensor；其它一律报错。
+      schema int    ← Python int(含 bool)；不收 3.5 这类非整数 float。
+      schema float  ← Python float，也收 Python int(自动提升为 double)。
+      传错类型(如 eps 传字符串)→ 运行期 TypeError(不像 C++ 编译期拦)。
+
+(4) 所以“与 Python 侧一致”到底要一致什么(类型不在其中)
+    - 名字一致：ROPE_cuda::<opname> 与 runner 的 op_name 逐字相同(getattr 才找得到)。
+    - 个数 + 顺序一致：Python 按 schema 顺序传齐(5 张量 → 3 头数 → head_dim → eps)。
+    - 值可转换：Python 传的值的【运行时类型】能转成 schema 声明的类型。
+    - 【类型的定义不在 Python，在 schema】；Python 只“按序传可转换的值”。
+
+
+一句话：Python【不能直达】C++ 函数，调用经【通用 Dispatcher】(装箱 IValue + 按分发键路由)；
+        Dispatcher 不认识你的 C++ 函数，只认 schema(m.def)——故类型由【schema 唯一声明】。
+        Python 动态、不声明类型，只按位置传【值】，Dispatcher 在调用边界按 schema 检查每个对象的
+        运行时类型并装箱/拆箱；你的 C++ 函数由 m.impl 模板拆箱接上，注册期校验其签名与 schema 兼容。
+        即【Python 对 schema、C++ 对 schema，schema 居中】；schema 还让一个算子挂多实现(CUDA/Meta/
+        Autograd)，这是 m.def 不可省的根本原因。
+
+
+================================================================================
+十、速查
+================================================================================
+- 阶段：本项目与 vLLM 的融合都在 post-grad(functionalized)图上匹配；差别是图内容
+  (函数式散装 aten vs auto_functionalized 的 custom-op 节点)。
+- search_fn/replace_fn：都【必须 return】且输出对齐；“void”是算子签名、不是函数；in-place
+  算子在函数里也要 return 被改写的张量。
+- 三种 fused op：① -> Tensor(函数式，最省心，+1 buffer)；② Tensor(a!) -> Tensor(a!)(in-place+
+  返回)；③ Tensor(a!) -> ()(void in-place，vLLM 风格)。②/③ 的 footgun((a!)/return qkv/_fake)
+  与 search 侧无关、对谁都一样(vLLM 也要满足)，本项目同样能用；选① 只是更省心、性价比高。
+- auto_functionalized：在“in-place 算子进入被 functionalize 的图”那一刻、由 (a!) 触发——模型自带
+  in-place 算子在 ②AOTAutograd，pass 在 ③ 引入的 in-place 算子(本项目)在 ③(trace replace_fn/插入替换)；
+  clone+在副本跑+产新值+改接下游；把就地改写变成函数式 SSA 产值(代价 clone)。
+- re-inplace：Inductor 后期，前提是存在 auto_functionalized(即 (a!))；原输入若已无人用就去掉
+  clone、还原原地写。(a!) 是总开关。
+- 不标 (a!) 却改写：void 被 DCE/重排/缓冲区错乱 → 静默错误(eager 正常、compile 才坏)。
+- vLLM 自定义 fix_functionalization：更激进去大张量 clone、时机可控、反 functionalize 成裸
+  in-place、跨版本鲁棒、处理复杂 mutation。本项目函数式则不涉及。
+- 为何由 schema 定类型：Python【不能直达】C++ 函数，调用经【通用 Dispatcher】(装箱 IValue+按分发键
+  路由)；Dispatcher 不认识具体 C++ 函数，只认 schema。m.def=声明接口(一次)；m.impl=注册实现(可多次，
+  模板拆箱)。注册期校验 C++ 签名⟷schema、调用期校验 Python 实参⟷schema。schema 让一个算子挂多实现
+  (CUDA/Meta/Autograd)，故不可省。
+- 类型声明与校验：类型【只在 C++ schema 声明】(Tensor/int=int64_t/float=double)；Python 动态、
+  不声明类型，只按位置传【值】；Dispatcher 运行时按 schema 检查每个对象的运行时类型并装箱/拆箱
+  校验。schema 串里张量只能写 Tensor(不是 torch::Tensor)；就地改写须标 (a!)。
+- “与 Python 一致”=名字 + 参数个数/顺序 + 值可转换；类型不由 Python 定，由 schema 定。
+- _fake = 该算子的【fake/meta 实现】(Meta/FakeTensor 分发键，与 CUDA 真实现并列)：只在【编译期】
+  替真实 kernel 占位、推【输出元信息】(不真算、不 fake 输入)；函数式 → empty_like(x)，void in-place
+  (-> ()) → return None；缺它编译期 FakeTensor 推不出输出 → UnsupportedOperatorException。
+  形参用 def _fake(*args) 通配最干净(不读参数、避免名字对不上语义)。
+- _fake 何时被调(四阶段)：①不调(没进图)；②不调本算子(调散装 aten 自带 meta)；③ pass 把算子插入图、
+  register_replacement trace replace_fn 调用它时被调；④ Inductor 在含该算子图上继续靠它。前提：
+  register_fake 须在替换/编译前登记好。trace replace_fn+fake 在③的作用：①物化成可剪贴 FX 子图；
+  ②给输出 meta 做 drop-in 对齐(与 search 输出等形等类型)；③维持 ③~④ 的 FakeTensor 元信息链。
+- 本项目推荐：函数式 `-> Tensor`(写法①)；要省那份显存再上写法②，并确保 (a!)+meta+可靠 re-inplace。
