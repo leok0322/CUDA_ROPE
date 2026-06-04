@@ -1,0 +1,158 @@
+================================================================================
+vLLM 的 rope/rmsnorm 算子是怎么进图的？—— 「直接调用」入图 vs 「融合替换」
+                  + forward 里直接调的 custom op 能否 void + fake 写在哪
+================================================================================
+
+关联：
+  docs/python/torch/custom_op_inplace_autofunctionalized.txt （in-place/auto_functionalized/re-inplace、三种写法）
+  docs/python/torch/torch.library.register_fake.txt          （register_fake 详解）
+  docs/python/torch/torch.PatternMatcherPass_register_replacement.txt（融合-替换机制）
+  本目录 vllm自定义算子调用链路.txt / _C扩展的Python调用过程.txt
+
+
+================================================================================
+一、核心澄清：要分清【两步】，别把"进图"当成"替换"
+================================================================================
+  ① 算子【进图】 = 模型 forward 里【直接调用】它们（不是被 pass 加进去的）。
+  ② 【融合替换】 = 一个 pass 把图里【已存在】的若干算子节点，匹配出来、换成一个 fused 算子。
+
+  vLLM 的 rms_norm / rotary_embedding 进图，靠的是【①直接调用】；
+  「替换」是【②融合】那一步（QKNormRoPEFusionPass）——不是它们"进图"的方式。
+
+
+================================================================================
+二、算子怎么被 Dynamo 捕获：custom op 不透明=一个节点；内置算子=拆成 aten
+================================================================================
+  - custom op（torch.library/TORCH_LIBRARY 注册）对 Dynamo/tracing 是【不透明】的：
+    Dynamo 看到 torch.ops._C.rotary_embedding(...) 只记成【一个 call_function 节点】，
+    不往里拆（gather/旋转都藏在 kernel 内部，对图不可见）。
+  - 普通函数 / 内置算子（如 x.pow(2).mean(-1)、F.silu）会被【拆解成一串 aten 小算子】。
+
+  vLLM 模型 forward 大致：
+      q = torch.ops._C.rms_norm(q, q_weight, eps)          # → 图里一个 rms_norm 节点
+      torch.ops._C.rotary_embedding(positions, q, k, ...)  # → 图里一个 rope 节点（gather 藏内部）
+  本项目模型 forward（纯函数式）：
+      ms = x.pow(2).mean(-1, keepdim=True); ...            # → 图里一串散装 aten 节点
+
+
+================================================================================
+三、vLLM vs 本项目：同一套「两步」，差别只在第①步产物
+================================================================================
+  步骤                 vLLM                              本项目
+  ────────────────     ──────────────────────────────    ──────────────────────────────
+  ① 算子进图(直接调)    直接调 custom op → 不透明 op 节点   直接调函数式 PyTorch → 散装 aten 节点
+  ② 融合替换(pass)      匹配[rms_norm 节点→rope 节点]      匹配[散装 RMSNorm+RoPE 子图]
+                        → 换成 fused_qk_norm_rope          → 换成 fused_qkv_norm_rope_*
+
+  两边①都是"直接用"，②都是"替换"。差别只在①的产物（custom op 节点 vs 散装 aten），
+  它决定②的匹配难易：op-to-op 稳；散装子图脆（也是本项目把 gather 拿到子图外的原因）。
+  注：②若不跑/没匹配上，①的算子照常各自执行（每个一个 kernel），融合只是优化。
+
+
+================================================================================
+三点五、gather/cos·sin：vLLM 为何留 op 内(方案B)、本项目为何拿出去(方案A) + 性能代价
+================================================================================
+(详尽版见 docs/python/search_fn_replace_fn_pattern_matching.txt 方案 A/B；此处给结论)
+
+(1) vLLM 能把 position_ids + cos_sin_cache 传进 fused op —— 因为 rope 是 custom op
+    - vLLM 的 RoPE custom op 内部就吃 positions + cos_sin_cache、gather 在 kernel 里做
+      （对 matcher 不透明=一个节点）。
+    - 融合是 op-to-op：matcher 匹配的是 rms_norm 节点 → rope 节点，【不需要匹配 gather】
+      （gather 藏在 rope op 内，看不见）。
+    - 融合后 fused op 继承 rope 接口 → 自然带 cache + position_ids，gather 仍在 kernel 内（方案B）。
+    - 关键因果：正因 rope 是 custom op、gather 被它"包住"，方案B 才好匹配；若像本项目拆成散装
+      gather，方案B 同样难匹配。
+
+(2) 本项目替换的是散装内置算子 → gather 难匹配 → 拿到子图外（方案A）
+    - 模型纯函数式，cos_sin_cache[positions] 在图里是散开的 index/gather(+arange) 节点；
+    - 纳入待匹配子图(方案B)要匹配这些 index/gather/arange：脆、难匹配——
+        节点更多更具体；cos_sin_cache buffer 会被烤成捕获常量(只匹配那一份 cache、不通用)；
+        positions=arange(num_tokens) 引入动态形状。
+    - 故走方案A：gather 留在 model.forward(子图匹配之外)，fused op 只吃【已 gather 的 cos/sin】，
+      pattern 只剩干净 pointwise(mean/rsqrt/mul/cat…)，匹配稳；顺带 op 接口更简单(不收 cache/positions)。
+
+(3) 性能代价：gather 是真算子(多一趟小搬运)；slice 是视图算子(不搬数据)
+    - gather = 真算子(真 kernel)：读 cache 若干行 + 把 cos/sin 物化到 HBM；fused op 再读回。
+      方案B 在 kernel 内直接读 cache、cos/sin 从不物化。故方案A 多一趟 cos/sin 的写+读。
+      ★ 量级小：cos/sin 是 [num_tokens, rotary_dim/2]，远小于 qkv [num_tokens,(Hq+Hk+Hv)*head_dim]
+        (kernel 本就要读写 qkv)；主要是多一次小 kernel 启动 + 小张量往返，非大带宽损失。
+    - slice(x[..., :rotary_dim]、v[:, :Hq]、[..., 0::2]) = 【视图算子】：只改 shape/stride/offset
+      元信息，不复制数据、不启 kernel、不碰 HBM → 零搬运、不影响性能。
+      (精确：FX 图里 slice 也是节点 aten.slice/select，只是"视图、不搬数据"，非"不是算子"。)
+    - ⚠ 但重组用的 torch.cat(拼回 q/k/v)和某些 reshape 会【真复制/物化】，那几个才是真搬运
+      (别把"图里所有非 gather 都免费")。
+
+
+================================================================================
+四、forward 里直接调的 custom op，能不能 void（不 return）？—— 能
+================================================================================
+  能。vLLM 的 rms_norm / rotary_embedding 就是【void in-place】：原地改写 q/k、返回 void，
+  直接在 forward 里调，没有返回值。其"输出"靠【原地改写 + 下游用被改后的 q/k】：
+      torch.ops._C.rotary_embedding(positions, q, k, ...)  # void：原地改 q、k
+      out = attn(q, k, v)                                  # 下游用被改后的 q、k
+  也可写函数式（有返回）：q = op(q, ...)。两种皆可，看算子是 in-place 还是 out-of-place。
+
+  eager vs compile：
+    - eager：void in-place 直接可用（立即跑 kernel 真改 q/k；不看 schema 的 (a!)）。
+    - compile：必须把算子标 (a!)（声明会改写）→ functionalization 用 auto_functionalized 把
+      "原地改"变成"产新值"、下游改接；漏标 → 当纯算子 → void 被 DCE/缓冲区错乱(静默错)。
+      且被改的 q/k 须被下游使用，否则该改写是"死的"，可能被消除。
+
+  ★ 别和另一条规则混：之前说"必须 return"针对的是 register_replacement 的 search_fn/replace_fn
+    （pattern 函数，其 return 是输出锚点、两边要对齐）；那是【融合②】里的事。
+    【①forward 里直接调的算子本身】可以 void。
+
+
+================================================================================
+五、直接在 forward 调的 custom op，fake 写在哪？—— 写在【算子定义/注册处】，不写在 forward
+================================================================================
+  先纠一个易误解：【任何 custom op 只要走 torch.compile、被 FakeTensor 传播 trace 到，都要
+  fake】，与它是 forward 直接调、还是 pass 替换进来无关。custom op 对 fake 传播是黑盒，缺 fake
+  → UnsupportedOperatorException。vLLM 给它直接调的 rms_norm/rope 也都注册了 fake。
+
+  "不用 fake"只发生在：纯 eager（从不碰 FakeTensor）；或它是内置 aten 算子（PyTorch 自带 meta）。
+  本项目模型 forward 是函数式、用内置算子，所以没自定义 fake；唯一 custom op(fused op)注册了 fake。
+
+  fake 的位置：它是【按 op 名的全局注册】，写在【算子定义/注册处、import 时执行】即可，
+  只要在 torch.compile 之前注册好；forward 只负责"调用"。按定义方式：
+
+  (a) C++ 定义的算子（TORCH_LIBRARY，如本项目/vLLM）——二选一或并存：
+      - C++ 里写 Meta 实现（与 CUDA 实现并列，挂 Meta 分发键）：
+          TORCH_LIBRARY_IMPL(ns, CUDA, m) { m.impl("op", &op_cuda); }   // 真算
+          TORCH_LIBRARY_IMPL(ns, Meta, m) { m.impl("op", &op_meta); }   // 只推形状/不真算
+            （void in-place: op_meta 返回 void；函数式: 返回 at::empty/empty_like）
+      - 或 Python 里写，放在【import 时就执行】的模块（如包 __init__ / _custom_ops.py）：
+          import torch, ROPE_cuda
+          @torch.library.register_fake("ROPE_cuda::op")
+          def _fake(*args): return None     # 跟 schema：void→None / 函数式→empty_like
+      vLLM 即此：vllm/_custom_ops.py 里 @register_fake(...)，import vllm._C 时一并注册。
+
+  (b) Python 定义的算子（torch.library.custom_op）：fake 紧挨定义写：
+      @torch.library.custom_op("ns::op", mutates_args=("qkv",))
+      def op(qkv, ...): ...
+      @op.register_fake
+      def _(qkv, ...): return None          # 或 empty_like(qkv)
+
+  对照本项目：fused op 的 fake 写在 installer.py（register_fake，在 register_replacement/编译前），
+  因为它是【②替换才引入】的算子，装 pass 时顺手注册；若是【①forward 直接调的】算子，则应放在
+  【算子注册处（C++ Meta 块 / import 时跑的 Python 模块）】，不放 installer。
+
+
+================================================================================
+六、速查
+================================================================================
+- 进图≠替换：①算子进图=模型 forward【直接调用】(Dynamo 捕获)；②融合=pass 把已存在的算子节点
+  【替换】成一个 fused op。vLLM 的 rms_norm/rope 靠①进图，QKNormRoPEFusionPass 做②。
+- custom op 对 Dynamo【不透明】→ 一个节点(gather 藏内部)；内置算子→拆成散装 aten。
+- vLLM 与本项目同是「①直接调 + ②替换」；差别只在①产物(custom op 节点 vs 散装 aten)→ 决定②匹配难易。
+- gather/cos·sin：vLLM rope 是 custom op、gather 藏 op 内 → op-to-op 匹配不必匹配 gather → fused op
+  带 cache+positions(方案B)；本项目散装 gather 难匹配(index/gather/arange + cache 被烤常量 + arange
+  动态)→ 把 gather 拿到子图外(方案A)、fused op 只吃已 gather 的 cos/sin。
+- 代价：gather=真算子(多一趟 cos/sin 的 HBM 物化+读回，但 cos/sin 小、代价小)；slice=视图算子(不搬
+  数据、不影响性能)；注意重组的 cat/reshape 才是真复制。
+- forward 里直接调的 custom op【可以 void in-place】(vLLM 的 rope/rmsnorm 即是)：靠原地改写+下游
+  用被改张量；eager 直接可用，compile 需标 (a!)。"必须 return"是 register_replacement 的 search/
+  replace 规则，与"算子能否 void"无关。
+- 任何 custom op 走 torch.compile 都【需要 fake】(与在 forward 直接调还是替换无关)；写在【算子
+  定义/注册处、import 时执行】(C++ Meta 块 或 Python register_fake，如 vLLM 的 _custom_ops.py)，
+  须在编译前注册好。纯 eager 或内置 aten 算子才无需 fake。

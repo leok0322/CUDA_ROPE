@@ -1,0 +1,271 @@
+================================================================================
+            _C 扩展（.so）安装后，Python 是如何调用其中方法的
+================================================================================
+
+核心结论
+--------------------------------------------------------------------------------
+_C.so 不是被当成普通 Python 扩展模块直接 `import _C; _C.foo()` 调用的，
+而是通过 PyTorch 的【算子注册机制（TORCH_LIBRARY）】：
+
+    import vllm._C          → dlopen 触发 TORCH_LIBRARY 静态注册
+                              → 算子进入 PyTorch 全局 Dispatcher（算子表）
+    torch.ops._C.foo(...)   → 按 "_C::foo" + 张量设备 查表
+                              → 调到 .so 里的 C++ 函数
+                              → C++ 内部 launch CUDA kernel
+
+即：.so 把自己的 CUDA 算子"注册"给 PyTorch，
+Python 端再统一通过 torch.ops 这个全局入口间接调用。
+
+
+================================================================================
+一、完整调用链路（四个阶段）
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ 编译期：C++ 源码里"声明 schema + 绑定实现"                                  │
+└──────────────────────────────────────────────────────────────────────────┘
+csrc/torch_bindings.cpp:18
+    TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) { ... }
+          │
+          │  TORCH_EXTENSION_NAME 由 CMake 在 define_extension_target 里传入
+          │  （编译命令带 -DTORCH_EXTENSION_NAME=_C），
+          │  宏展开后即： TORCH_LIBRARY(_C, ops)
+          │
+          ├─ ops.def("paged_attention_v1(Tensor! out, ...) -> ()")
+          │       → 声明算子的【schema】：名字 + 参数类型 + 返回类型
+          │
+          └─ ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1)
+                  → 把算子名 绑定到 C++ 函数指针，并指定分发键 kCUDA
+                    （"在 CUDA 张量上调用时走这个实现"）
+
+    这些 TORCH_LIBRARY 块本质是【静态初始化对象】，
+    编译进 _C.so 后，会在 .so 被加载进进程的瞬间自动执行。
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ 安装期：CMake install 把 _C.so 放到 Python 包目录                            │
+└──────────────────────────────────────────────────────────────────────────┘
+cmake/utils.cmake 的 define_extension_target 里：
+    install(TARGETS _C ... DESTINATION vllm)
+          → _C.cpython-3xx-x86_64-linux-gnu.so 落到  <site-packages>/vllm/  下
+            （开发模式 pip install -e . 时，落在项目根的 vllm/ 目录）
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ 运行期 第①步：把 .so 加载进进程 → 触发静态注册                                 │
+└──────────────────────────────────────────────────────────────────────────┘
+vllm/platforms/cuda.py:21
+    import vllm._C          # noqa
+          │
+          │  Python 的 import 扩展模块 = dlopen 这个 .so 文件。
+          │  dlopen 一旦完成，.so 里所有静态初始化对象立即运行，
+          │  也就是上面的 TORCH_LIBRARY(_C, ...) 全部执行：
+          ▼
+    算子被注册进【PyTorch 全局算子表（Dispatcher）】，现在全局存在一张表：
+        "_C::paged_attention_v1"  (kCUDA) → &paged_attention_v1
+        "_C::rms_norm"            (kCUDA) → &rms_norm
+        ...
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ 运行期 第②步：Python 通过 torch.ops 命名空间调用                           │
+└──────────────────────────────────────────────────────────────────────────┘
+vllm/_custom_ops.py:135
+    torch.ops._C.paged_attention_v1(out, query, ...)
+          │        │   └─ 算子名 op
+          │        └─ 库名(namespace) = TORCH_LIBRARY 的第一个参数 _C
+          │
+          │  torch.ops.<ns>.<op> 不是普通属性访问，
+          │  而是去【全局算子表】里按 "_C::paged_attention_v1" 查找。
+          ▼
+    Dispatcher 根据传入张量的设备(CUDA)选择 kCUDA 分发键
+          ▼
+    调用到 _C.so 里的 C++ 函数 &paged_attention_v1
+          ▼
+    C++ 函数内部 launch CUDA kernel，在 GPU 上执行
+
+
+================================================================================
+二、三个核心机制详解
+================================================================================
+
+--------------------------------------------------------------------------------
+1. 为什么是 `import vllm._C` 而不是调用它的方法？
+--------------------------------------------------------------------------------
+`import vllm._C` 之后，你几乎不会去访问 `vllm._C.xxx`。
+注意 vllm/_custom_ops.py 里全程用的是 `torch.ops._C.xxx`，而不是 `vllm._C.xxx`。
+
+import 的唯一目的是【让 Python 去 dlopen 这个 .so】，
+从而触发里面的 TORCH_LIBRARY 静态注册。
+注册完成后，算子就挂在 PyTorch 全局 Dispatcher 上，
+跟 `_C` 这个 Python 模块对象本身就没关系了。
+
+这就是为什么源码里写  `import vllm._C  # noqa`：
+    # noqa 是告诉 linter "这个 import 看似没用（没人用 _C 这个变量），
+            但别删，它有副作用（触发算子注册）"。
+
+
+--------------------------------------------------------------------------------
+2. def 和 impl 的分工
+--------------------------------------------------------------------------------
+    ops.def("paged_attention_v1(...) -> ()");            // 声明 schema
+    ops.impl("paged_attention_v1", torch::kCUDA, &fn);   // 绑定实现
+
+  - def  ：只登记"有这么个算子，长这样"，让 PyTorch 知道参数/返回类型。
+           这套类型信息用于 autograd、torch.compile、fake tensor 等。
+  - impl ：才把算子名真正绑到 C++ 函数，并打上 kCUDA 标签。
+           Dispatcher 调用时按【算子名 + 张量设备】两个维度查表，
+           因此同一个算子名可以为 kCUDA / kCPU 注册不同实现。
+
+
+--------------------------------------------------------------------------------
+3. 命名空间 `_C` 从哪来
+--------------------------------------------------------------------------------
+TORCH_LIBRARY(_C, ops) 的第一个参数 _C，就是 torch.ops._C 里的 _C。
+它来自 CMake：define_extension_target 编译时传入 -DTORCH_EXTENSION_NAME=_C，
+源码里 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops)
+宏展开后变成 TORCH_LIBRARY(_C, ops)。
+
+所以【库名(namespace)】和【.so 文件名】是同一个 _C，
+但二者通过不同机制各自起作用：
+    - 文件名 _C.so       → 决定 `import vllm._C` 找哪个文件去 dlopen
+    - namespace _C       → 决定 `torch.ops._C` 查全局算子表里的哪张子表
+
+torch_bindings.cpp 里还用 CONCAT 派生出多个子命名空间，例如：
+    TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops),  ...)  → _C_cache_ops
+    TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), ...)  → _C_cuda_utils
+    TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar),  ...)  → _C_custom_ar
+对应 Python 端就是 torch.ops._C_cache_ops.xxx 等。
+
+
+================================================================================
+三、底层细节：函数指针、"跳进 .so"、CPU/GPU 分工
+================================================================================
+
+--------------------------------------------------------------------------------
+1. ops.impl 里的 &paged_attention_v1 是什么？—— .so 里机器码的入口地址
+--------------------------------------------------------------------------------
+    ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);
+                                                  └────────┬────────┘
+                                              这是 C++ 函数的"地址"
+
+  - paged_attention_v1 是一个 C++ 函数，实现源码在 csrc/attention/ 里，
+    编译时和 torch_bindings.cpp 一起编进了 _C.so。
+  - &paged_attention_v1 取这个函数的地址 —— 它编译后那段机器码
+    在 _C.so 里的【入口位置】。
+  - ops.impl(...) 把这个地址存进 PyTorch 全局算子表，
+    作为 "_C::paged_attention_v1"(kCUDA) 这一项的 value。
+
+  验证：函数代码确实在 .so 里
+      csrc/torch_bindings.cpp        ─┐
+      csrc/attention/attention_...   ─┤ 都属于 _C 这个 target 的 SOURCES
+      csrc/layernorm_kernels...      ─┘
+              │ nvcc/g++ 各自编译成 .o
+              ▼  链接成一个 _C.so
+              ├─ torch_bindings.o   ：TORCH_LIBRARY 注册表（存的是函数地址）
+              └─ attention_...o     ：paged_attention_v1 的真正机器码 ← 指针指向这里
+
+  torch_bindings.cpp 顶部能写 &paged_attention_v1，前提是它先 #include 了
+  声明该函数的头文件（如 ops.h）；函数的【定义/机器码】和它在同一个 .so 里，
+  链接器才能把这个地址解析出来。
+
+      PyTorch 全局算子表(Dispatcher)          _C.so 的代码段(.text)
+      ┌──────────────────────────────┐       ┌──────────────────────────┐
+      │ "_C::paged_attention_v1"      │       │ 0x7f..a0:                │
+      │   (kCUDA) → 0x7f..a0  ────────┼──────▶│   paged_attention_v1:    │
+      │ "_C::rms_norm"                │       │     ...launch kernel...  │
+      │   (kCUDA) → 0x7f..c8  ────────┼────┐  │     ret                  │
+      └──────────────────────────────┘    │  │ 0x7f..c8:                │
+                                          └─▶│   rms_norm: ...          │
+                                             └──────────────────────────┘
+
+
+--------------------------------------------------------------------------------
+2. "跳进 .so" 是什么意思？—— CPU 把指令指针设到 .so 里那个函数地址
+--------------------------------------------------------------------------------
+  前提：.so 被 dlopen 后，操作系统把它 mmap 进进程的虚拟内存，
+        于是 .so 里每个函数都有了一个确定的内存地址（如 0x7f..a0）。
+
+  CPU 永远在做：读取"指令指针(RIP/PC)"指向的指令 → 执行 → 指针前进。
+  函数调用时，CPU 执行一条 call 指令：
+      call 0x7f..a0
+        ① 把"下一条指令地址"压栈（记住回来的位置）
+        ② 把指令指针 RIP 直接设为 0x7f..a0     ← 这就是"跳"
+  于是 CPU 下一拍读取的指令，变成了 .so 里 0x7f..a0 处的 paged_attention_v1
+  的机器码 —— 执行"现场"转移到了 .so 内部。函数执行完遇到 ret，
+  CPU 从栈里取回地址跳回原处。这就是"跳进 .so"。
+
+  和普通调用的唯一区别：地址是【运行期查表】查来的（间接调用）：
+      普通调用：   call paged_attention_v1     ← 地址编译期写死(直接调用)
+      vLLM 这里：  地址 = Dispatcher表["_C::paged_attention_v1"]  ← 先查表
+                  call [那个地址]                                ← 间接调用
+  但对 CPU 而言，"跳"的动作完全一样——都是把指令指针设到函数入口地址。
+
+
+--------------------------------------------------------------------------------
+3. 调用时是"把机器码交给 CPU 执行"吗？—— host 在 CPU，kernel 在 GPU
+--------------------------------------------------------------------------------
+  对一半。CUDA 算子一次调用其实跨了两个处理器、两段机器码：
+
+  torch.ops._C.paged_attention_v1(...)
+          │  Dispatcher 查表拿地址，跳进 .so
+          ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ CPU 执行（host 代码，__host__）                               │
+  │   paged_attention_v1 这段 x86 机器码在 CPU 上跑：             │
+  │     - 读张量 shape/stride/dtype                              │
+  │     - 算 grid/block 维度、选模板特化的 kernel                │
+  │     - 发射 kernel：kernel<<<grid, block, 0, stream>>>(...)   │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ 经 CUDA Runtime 把 kernel 入队到 GPU stream
+                              ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ GPU 执行（device 代码 / kernel，__global__）                 │
+  │   成千上万个线程并行执行 kernel 的 SASS 机器码               │
+  │     - 这才是真正算 attention 的地方                          │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────┬─────────────┬──────────┬──────────────────┐
+  │ 代码                    │ 编译产物     │ 在哪执行  │ 谁触发            │
+  ├────────────────────────┼─────────────┼──────────┼──────────────────┤
+  │ paged_attention_v1      │ x86 机器码   │ CPU      │ Dispatcher 查表跳转│
+  │ (host 函数, __host__)   │             │          │                  │
+  │ paged_attention_kernel  │ GPU 的 SASS │ GPU      │ host 里的 <<<>>> │
+  │ (__global__ kernel)     │             │          │ 发射             │
+  └────────────────────────┴─────────────┴──────────┴──────────────────┘
+
+  - 两段机器码都打包在【同一个 _C.so】里：GPU 那段 SASS 嵌在 .so 的
+    fatbin 段（由 -gencode 生成，见 gencode.txt）。
+  - "把机器码交给 CPU 执行"准确对应的是 host 函数那段：是的，CPU 跳进去
+    执行 x86 机器码。但 host 只是"指挥者"，真正的数值计算是它发射的
+    GPU kernel，那段 SASS 由 GPU 众多线程执行，不经过 CPU。
+  - 纯 CPU 算子（torch::kCPU 注册的，如部分 _C_cache_ops）则只有 host 这步——
+    全程 CPU 执行机器码，没有 GPU 参与。
+
+  精确表述：
+      torch.ops._C.paged_attention_v1(...) 调用时：
+        ① CPU 执行 .so 里的 host 函数机器码（查表跳转后的间接调用）
+        ② host 函数通过 <<<>>> 把 GPU kernel 发射到 stream
+        ③ GPU 上海量线程并行执行 kernel 的 SASS 机器码 ← 真正的计算
+
+
+================================================================================
+四、关键源码位置速查
+================================================================================
+  csrc/torch_bindings.cpp:18      TORCH_LIBRARY_EXPAND(_C, ops) 注册入口
+  csrc/torch_bindings.cpp:29      ops.def / ops.impl 成对出现的范例
+  cmake/utils.cmake               define_extension_target：编译产出 + install 落盘
+                                  （-DTORCH_EXTENSION_NAME=_C 在此传入）
+  vllm/platforms/cuda.py:21       import vllm._C  # noqa   ← 触发 dlopen + 注册
+  vllm/_custom_ops.py:135 起      torch.ops._C.xxx(...)    ← 真正的调用点
+
+
+================================================================================
+五、一句话总结
+================================================================================
+.so 不是被当成普通 Python 扩展模块直接调方法，
+而是把自己的 CUDA 算子"注册"给 PyTorch 全局 Dispatcher，
+再由 Python 端统一通过 torch.ops 这个全局入口间接调用。
+
+    import vllm._C          → dlopen → TORCH_LIBRARY 静态注册 → 算子入全局表
+    torch.ops._C.foo(...)  → 按 "_C::foo" + 设备查表 → 调 C++ 函数 → 启动 kernel

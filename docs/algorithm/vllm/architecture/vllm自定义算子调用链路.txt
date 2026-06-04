@@ -1,0 +1,341 @@
+================================================================================
+   vLLM 自定义算子的实现方式与调用链路 —— 以 fused_qk_norm_rope 为例
+================================================================================
+
+例子：fused_qk_norm_rope
+    把 "Q-RMSNorm + K-RMSNorm + RoPE 旋转" 三步融合进一个 CUDA kernel
+    （kernel 名 fusedQKNormRopeKernel）。
+
+本文回答两件事：
+    1) vLLM 是怎么"实现"一个自定义算子的（从 .cu 到 Python 可调用）
+    2) 运行时这个算子是怎么被"调用"到的（完整调用链）
+并把各文件中的重点代码逐行注释。
+
+相关前置文档：
+    _C扩展的Python调用过程.txt   —— TORCH_LIBRARY → torch.ops 基本机制
+    torch_compile流水线.txt       —— Dynamo/AOT/Inductor/post_grad 钩子
+    ../fork/fused_silu_mul_compile_hook.py —— 同思路的最小可运行复刻
+
+
+================================================================================
+零、全景图：一个自定义算子的 7 层结构
+================================================================================
+              【实现侧：C++/CUDA，编译进 _C.so】
+  ┌──────────────────────────────────────────────────────────────┐
+  │ ① CUDA kernel        fusedQKNormRopeKernel  (在 GPU 跑)         │
+  │ ② host 函数          fused_qk_norm_rope     (CPU 算 grid 并发射)│
+  │ ③ TORCH_LIBRARY 注册 def(schema)+impl(CUDA)+fake → torch.ops._C │
+  └──────────────────────────────────────────────────────────────┘
+                          ▲ import vllm._C 触发注册（dlopen）
+              【桥接侧：Python】
+  ┌──────────────────────────────────────────────────────────────┐
+  │ ④ Python 包装        vllm/_custom_ops.py:fused_qk_norm_rope     │
+  │ ⑤ 输入预计算         RotaryEmbedding._compute_cos_sin_cache     │
+  └──────────────────────────────────────────────────────────────┘
+              【接入侧：torch.compile 编译期图改写】
+  ┌──────────────────────────────────────────────────────────────┐
+  │ ⑥ 融合 pass          QKNormRoPEFusionPass（模式匹配→替换）      │
+  │ ⑦ 注册+钩子          PostGradPassManager → Inductor post_grad   │
+  └──────────────────────────────────────────────────────────────┘
+                          ▲ @support_torch_compile / model runner 发起
+
+
+================================================================================
+一、实现侧（C++/CUDA）——重点代码注释
+================================================================================
+
+--------------------------------------------------------------------------------
+① + ② kernel 与 host 函数
+   文件: csrc/libtorch_stable/fused_qknorm_rope_kernel.cu
+--------------------------------------------------------------------------------
+  // :104  ★ GPU kernel：真正在 GPU 上并行执行的代码
+  __global__ void fusedQKNormRopeKernel(
+      ...,
+      void const* cos_sin_cache_void,  // :112 ★ 预计算好的 cos/sin 表（只读，不在此计算）
+      ...) {
+    T_cache const* cos_sin_cache =
+        reinterpret_cast<T_cache const*>(cos_sin_cache_void);  // :140 void* 解释成具体类型
+    ...
+    T_cache const* cache_ptr = cos_sin_cache + pos_id * rotary_dim;  // :235 按位置id查表
+    // kernel 内只有"读表 + 做 RMSNorm + 做旋转"，没有 cos()/sin() 计算
+  }
+
+  // :699  ★ host 函数：算子的 C++ 入口（CPU 执行），负责校验+算grid+发射kernel
+  void fused_qk_norm_rope(
+      torch::stable::Tensor& qkv,           // :701 输入输出张量(原地改写, schema 里是 Tensor!)
+      int64_t num_heads_q, ...,
+      torch::stable::Tensor& cos_sin_cache, // :720 预计算表(作为张量参数传入)
+      ...) {
+    ...
+    // :804 双重 dispatch：按 qkv dtype 和 cache dtype 选择模板特化的 kernel
+    VLLM_STABLE_DISPATCH_HALF_TYPES(qkv.scalar_type(), ..., [&] {
+      VLLM_STABLE_DISPATCH_FLOATING_TYPES(cos_sin_cache.scalar_type(), ..., [&] {
+        launchFusedQKNormRopeNTokenHeads<...>(
+            qkv.data_ptr(),                  // :810 ★ 从 Tensor 取 GPU 显存裸指针
+            ...,
+            cos_sin_cache.data_ptr(),        // :813 ★ 表的显存指针 → 传给 kernel(零拷贝)
+            reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
+            ...);
+      });
+    });
+  }
+  // launch... 内部用 <<<gridDim, blockDim, smem, stream>>> 发射 fusedQKNormRopeKernel
+
+  重点：
+    - cos_sin_cache 不在 kernel 里算，是预计算好的输入；kernel 只按 pos_id 查表。
+    - Tensor → kernel 的桥是 data_ptr()：取显存地址，零拷贝、只传 8 字节指针。
+    - schema 里 qkv 是 Tensor!（带感叹号）= 原地修改，影响后面 functionalize（见⑥）。
+
+--------------------------------------------------------------------------------
+③ TORCH_LIBRARY 注册：把 host 函数变成 torch.ops._C.xxx
+   文件: csrc/libtorch_stable/torch_bindings.cpp
+--------------------------------------------------------------------------------
+  这里用的是 STABLE_TORCH_LIBRARY（稳定 ABI 版，对应 _C_stable_libtorch 扩展）。
+  共三个块，分工不同：
+
+  // :9  ★ 块1：声明算子 schema（名字+参数类型+返回类型），不含实现
+  STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {       // 命名空间 _C → torch.ops._C
+    ...
+    ops.def(                                      // :330 ★ 声明 fused_qk_norm_rope 的签名
+        "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "    // Tensor! = 原地写
+        "int num_heads_k, int num_heads_v, int head_dim, float eps, "
+        "Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, "
+        "bool is_neox, Tensor position_ids, "
+        "int forced_token_heads_per_warp=-1) -> ()");          // -> () 无返回(结果写回qkv)
+  }
+
+  // :479  ★ 块2：为 CUDA 设备绑定真正的实现
+  STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+    ...
+    ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));  // :542 名字→host函数指针
+    // 含义：当在 CUDA 张量上调用 _C::fused_qk_norm_rope 时，走上面那个 host 函数
+  }
+
+  // :590  ★ 块3：CompositeExplicitAutograd（给 meta/fake 用，torch.compile 必需）
+  STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
+    ...  // 注册"假实现"(fake/meta)：只推断输出 shape/dtype，不真算
+         // torch.compile 在 trace/编译时用它来在不跑 GPU 的情况下推断张量元信息
+  }
+
+  重点：def / impl / fake 三者分工
+    - def  ：登记"有这么个算子，长这样"（schema），供 autograd / compile / 类型检查用
+    - impl (CUDA)            ：绑定真实 GPU 实现，按 [算子名 + 设备] 分发
+    - impl (CompositeExpl...)：绑定 fake/meta 实现，编译期推断形状用（无此则 compile 报错）
+
+
+================================================================================
+二、桥接侧（Python）——重点代码注释
+================================================================================
+
+--------------------------------------------------------------------------------
+触发注册：import 即 dlopen，执行上面的 TORCH_LIBRARY 静态初始化
+   文件: vllm/platforms/cuda.py:21-22
+--------------------------------------------------------------------------------
+  import vllm._C                  # noqa  ← dlopen _C.so，触发 ③ 的算子注册
+  import vllm._C_stable_libtorch  # noqa  ← 稳定 ABI 扩展(fused_qk_norm_rope 在这里)
+  // # noqa：告诉 linter"这 import 看似没用，但有副作用(注册算子)，别删"
+
+--------------------------------------------------------------------------------
+④ Python 包装：给算子一个有类型签名的 Python 函数
+   文件: vllm/_custom_ops.py:330
+--------------------------------------------------------------------------------
+  def fused_qk_norm_rope(             // :330 Python 侧同名包装(便于类型标注/IDE/直接调用)
+      qkv: torch.Tensor, num_heads_q: int, ...,
+      cos_sin_cache: torch.Tensor, is_neox: bool,
+      position_ids: torch.Tensor, forced_token_heads_per_warp: int = -1,
+  ) -> None:
+      torch.ops._C.fused_qk_norm_rope(   // :344 ★ 真正的调用点：转给全局算子表
+          qkv, num_heads_q, ..., cos_sin_cache, is_neox, position_ids,
+          forced_token_heads_per_warp,
+      )
+  // torch.ops._C.fused_qk_norm_rope ≠ 普通属性访问，是去 Dispatcher 按
+  //   "_C::fused_qk_norm_rope" + 张量设备 查表，调到 ③ 注册的 CUDA 实现。
+
+--------------------------------------------------------------------------------
+⑤ 输入预计算：cos_sin_cache 在模型初始化时算一次
+   文件: vllm/model_executor/layers/rotary_embedding/base.py
+--------------------------------------------------------------------------------
+  def _compute_cos_sin_cache(self):           // :94 纯数学，只跟位置/rotary_dim/base 有关
+      inv_freq = 1.0/(base**(arange(0,rotary_dim,2)/rotary_dim))  // 逆频率
+      t = torch.arange(self.max_position_embeddings)  // :97 行数=最大上下文长度
+      freqs = einsum("i,j->ij", t, inv_freq)          // :99 外积 [max_pos, rotary_dim/2]
+      cos, sin = freqs.cos(), freqs.sin()             // :100 ★ cos/sin 在此真正计算
+      return torch.cat((cos, sin), dim=-1)            // :102 [max_pos, rotary_dim]
+
+  // :59  __init__ 里算一次并存为 buffer：
+  cache = self._compute_cos_sin_cache()
+  self.register_buffer("cos_sin_cache", cache, persistent=False)  // :63
+  //   register_buffer：登记进模块 _buffers，随 model.to("cuda") 自动搬到显存；
+  //   persistent=False：不进 checkpoint（纯派生数据，可随时重算）。
+
+  为什么用 torch 而非 CUDA 算这张表：
+    它是"一次性、非热路径、纯数学"，PyTorch 三行外积搞定，还能与 HF 数值对齐、
+    便于各种 RoPE 变体(YaRN/Llama3...)用子类 override。热路径的"用表做旋转"才手写 CUDA。
+
+
+================================================================================
+三、接入侧（torch.compile 编译期图改写）——重点代码注释
+================================================================================
+关键事实：没有任何模型 forward 代码直接调用 fused_qk_norm_rope。
+          它是 torch.compile 编译时，由融合 pass 把"分步子图"改写插入的。
+
+--------------------------------------------------------------------------------
+⑥ 融合 pass：匹配分步子图 → 替换成融合算子
+   文件: vllm/compilation/passes/fusion/qk_norm_rope_fusion.py
+--------------------------------------------------------------------------------
+  FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default   // :26 要插入的目标算子
+
+  // :35-44  待匹配的"未融合"写法(eager 里就是这几步)：
+  //   qn = rms_norm(qh, q_weight, eps); kn = rms_norm(kh, k_weight, eps)
+  //   qf, kf = rotary_embedding(positions, qf, kf, cos_sin_cache, is_neox)
+
+  def replacement(qkv, positions, q_weight, k_weight, cos_sin_cache):   // :145 替换成
+      result = auto_functionalized(          // ★ 因 schema 是 Tensor!(原地写)，
+          FUSED_QK_ROPE_OP,                  //   编译图里要用 auto_functionalized 包一层
+          qkv=qkv, num_heads_q=self.num_heads, ...,
+          cos_sin_cache=cos_sin_cache,
+          position_ids=positions.view(-1),   // :166 一维化的位置id → 进 kernel 查表
+          forced_token_heads_per_warp=-1,
+      )
+      result_qkv = result[1]                 // 取出被原地改写后的 qkv
+      ...
+  //   register_replacement(search, replacement, inputs, fwd_only, pm_pass)
+  //   把"匹配→替换"规则注册进本 pass(QKNormRoPEFusionPass)。
+
+  // :188  pass 类本身 + 启用门槛
+  class QKNormRoPEFusionPass(VllmPatternMatcherPass):
+      // :199 只在 bf16/fp16 启用；:206/:218 需有 Attention 层且 RoPE 启用
+
+  重点：auto_functionalized
+    算子原地改写 qkv（schema Tensor!），但编译图要求"函数式纯净"，
+    所以用 auto_functionalized 包装，让 Inductor 正确处理原地副作用。
+
+--------------------------------------------------------------------------------
+⑦ 注册进流水线 + 挂到 Inductor 钩子
+   文件: vllm/compilation/passes/pass_manager.py、backends.py
+--------------------------------------------------------------------------------
+  // pass_manager.py:96  总管维护一个 pass 列表
+  self.passes: list[InductorPass] = []
+
+  // pass_manager.py:187-189  受开关控制，把本 pass append 进列表(=“注册”)
+  if self.pass_config.enable_qk_norm_rope_fusion:
+      self.passes += [SplitCoalescingPass(config)]
+      self.passes += [QKNormRoPEFusionPass(config)]   // ★ 在此注册进流水线
+
+  // pass_manager.py:99-105  ★ "统一运行"：一个 for 循环把所有 pass 施加到同一张图
+  def __call__(self, graph):
+      for pass_ in self.passes:
+          pass_(graph)               // 逐个改写 → QKNormRoPEFusionPass 在此把子图融合
+
+  // backends.py:966  ★ 把总管挂到 Inductor 的 post_grad 钩子
+  self.inductor_config[self.pass_key] = self.pass_manager
+  //   pass_key = "post_grad_custom_post_pass"
+  //   Inductor 在 post-grad 阶段(图已规整、未生成代码)回调它 → 触发上面的 for 循环
+
+
+================================================================================
+四、发起侧：谁按下"开始" —— 入口与运行时调用栈
+================================================================================
+--------------------------------------------------------------------------------
+编译/运行时入口：@support_torch_compile 替换的 __call__
+   文件: vllm/compilation/decorators.py
+--------------------------------------------------------------------------------
+  // 模型类定义时被装饰：
+  @support_torch_compile
+  class XxxModel(nn.Module): def forward(...): ...
+
+  // decorators.py:331 _support_torch_compile 把 __call__ 换成新的(:719 cls.__call__=__call__)
+  // decorators.py:502  ★ 运行时真正入口
+  def __call__(self, *args, **kwargs):
+      if self.do_not_compile or torch.compiler.is_compiling():
+          return self.forward(*args, **kwargs)     // ① 不编译→eager分步(不碰kernel)
+      ...
+      if self.compiled:
+          return TorchCompileWithNoGuardsWrapper.__call__(...)  // ② 已编译→跑含融合算子的产物
+      // ③ 首次→触发编译(Dynamo→Inductor→PostGradPassManager→融合)
+
+  【为什么要替换 __call__，而不是 forward？】
+
+  (1) model(x) 调的是"类的 __call__"，不是 forward。PyTorch 的调用机制：
+        model(x)  ──Python──▶  type(model).__call__(model, x)
+                                  └─ nn.Module.__call__ 内部(含 hook)最后才调 self.forward(x)
+      要在"每次调用模型"时插入"走 eager 还是走编译产物"的判断，
+      唯一的总拦截点就是 __call__（拦 forward 拦不全，且会绕过 hook）。
+      上面 ①eager / ②跑产物 / ③首次编译 的三岔状态机，
+      只能放在每次调用都会经过的 __call__ 里。
+
+  (2) forward 必须保持"原始 eager 实现"，不能动，有两个硬性原因：
+        (a) Dynamo 要 trace 原始 forward 来建图。若把 forward 换成编译包装器，
+            Dynamo 会去 trace 包装器本身 → 自我递归 / 抓不到真正的算子图。
+        (b) eager 兜底路径 ① return self.forward(...) 要执行的正是未改动的 forward。
+      分工：__call__ = 调度入口(vLLM 替换)；forward = 纯算子实现(保持原样)。
+
+  (3) 必须替换"类的" __call__（:719 cls.__call__=__call__），不是实例属性。
+      因为 Python 特殊方法(__call__ 等)在调用时只从"类型"上查找：
+        model(x) == type(model).__call__(model, x)   # 永远查 类 上的 __call__
+      若只设 self.__call__ = xxx(实例属性)，model(x) 根本不会用它。
+
+  (4) 为什么不直接 self.forward = torch.compile(self.forward)？
+      因为 __call__ 这层还要编排一堆 torch.compile 之外的逻辑，集中在此最干净：
+        - 动态 shape 标记 _mark_dynamic_inputs（避免按每个 batch 大小重编）
+        - 编译缓存键 / AOT 编译（算 hash、查磁盘缓存、加载 AOT 产物）
+        - CUDA graph partition wrapper（maybe_use_cudagraph_partition_wrapper）
+        - 无 guards 执行包装 TorchCompileWithNoGuardsWrapper
+        - 条件跳过 do_not_compile / torch.compiler.is_compiling() / enc-dec 跳过
+      这些都是"每次调用要决策"的事，放 __call__ 自然；forward 专注计算。
+
+--------------------------------------------------------------------------------
+最外层发起者：model runner
+   文件: vllm/v1/worker/gpu_model_runner.py
+--------------------------------------------------------------------------------
+  // :3692  每步推理真正调模型前向
+  return self.model(input_ids=..., positions=..., ...)
+  //   self.model 是被 @support_torch_compile 装饰过(可能再套 CUDAGraphWrapper)的模型，
+  //   所以这一句进入 decorators.py:502 的 __call__；
+  //   这里准备的 positions 张量，正是 kernel 里查 cos_sin_cache 用的 position_ids。
+
+
+================================================================================
+五、两条路径对比（开/不开 torch.compile）
+================================================================================
+  不开 compile（eager）:
+      model(...) → decorators.py:502 → self.forward
+        → rms_norm + rms_norm + rotary_embedding 三个独立算子分步执行
+        → 根本不会用到 fusedQKNormRopeKernel
+
+  开 compile（首次编译后）:
+      model(...) → decorators.py:502 → 编译产物
+        → 图里已是 torch.ops._C.fused_qk_norm_rope(auto_functionalized 包装)
+        → host 函数 fused_qk_norm_rope → <<<>>> → fusedQKNormRopeKernel(GPU)
+
+  设计意图：
+    eager 分步 = 可读/好调试/可降级；编译融合 = 省 kernel launch 和 HBM 往返，提速。
+
+
+================================================================================
+六、完整调用链（一图到底）
+================================================================================
+  gpu_model_runner.py:3692   self.model(input_ids, positions, ...)
+        ▼
+  decorators.py:502          __call__  (==@support_torch_compile 替换的入口)
+        │  首次：Dynamo→AOTAutograd→Inductor post_grad 回调
+        │        PostGradPassManager.__call__ (pass_manager.py:103-105)
+        │          └─ QKNormRoPEFusionPass(graph)  把三步子图换成融合算子
+        ▼  之后：直接跑编译产物，图里是↓
+  _custom_ops 等价         torch.ops._C.fused_qk_norm_rope(qkv,...,cos_sin_cache,...)
+        ▼  Dispatcher 按 "_C::fused_qk_norm_rope"+CUDA 查表(③ 注册)
+  torch_bindings.cpp:542   host 函数 fused_qk_norm_rope  (.cu:699)
+        ▼  cos_sin_cache.data_ptr() 取显存指针(⑤ 预计算好的表)
+        ▼  <<<gridDim, blockDim, smem, stream>>>
+  fused_qknorm_rope_kernel.cu:104   fusedQKNormRopeKernel   ← GPU 执行
+
+
+================================================================================
+七、一句话总结
+================================================================================
+vLLM 自定义算子 = 「C++/CUDA 写 kernel+host 函数 → TORCH_LIBRARY 注册成
+torch.ops._C.xxx（def 声明 / CUDA impl 真实现 / Composite fake 假实现三块）→
+import 触发注册 → Python 包装 + 预计算输入(cos_sin_cache) →
+torch.compile 时融合 pass 把分步子图改写成该算子(挂在 Inductor post_grad 钩子) →
+model runner 调 model(...) 经装饰器 __call__ 跑编译产物，最终发射 GPU kernel」。
+不开 compile 则走 eager 分步，不触发该 kernel。
