@@ -771,6 +771,21 @@ base=10000)：
     【结果】(小 cos/sin)。
   对照：rms_norm_pure 同理——x.float() 上算 mean(x^2)，再 .to(in_dtype)。
 
+-------------------------------------------------------------------- ★ "需 fp32"指的是 cache 构造，不是旋转施加(rope_pure 可 bf16)
+  RoPE 分两段，精度命门只在第一段：
+    build_cos_sin_cache：positions / inv_freq / angle=pos×inv_freq / cos / sin  ← 恒 fp32(三崩点)
+          │  cache.to(dtype) 降回 bf16
+          ▼
+    rope_pure：拿【已算好】的 cos/sin 对 x 做 2D 旋转 r=x1·c∓x2·s             ← bf16 即可
+  rope_pure 在 bf16 安全，因为三机制【一个都没踩】：
+    · 机制A(累加)：每个输出元素只是【2 项】组合(x1·c∓x2·s)，N=2，非大 K 累加 → 误差 ~几个 ε，有界。
+    · 机制B(超越/大角度)：【这里没有 sin/cos 运算】——cos/sin 是 cache 里已算好的值，rope_pure 只
+      是拿来相乘；危险的"大角度喂 sin/cos"(崩点3)已发生在 cache 构造(fp32)里。
+    · 机制C(吞没)：|c|,|s|≤1、x1/x2 同量级，两项量级相当 → 无小加大被吞。
+    且旋转保范数(|c|,|s|≤1 不放大)。⟹ "RoPE 需 fp32"= cos/sin cache 的计算；rope_pure 消费的是
+    已在 fp32 算好、再 cast 成 bf16 的 cos/sin，自身只做有界 2 项旋转，故全程不升精度(对照
+    rms_norm_pure 内部 x.float()，rope_pure【不】升精度——因为确实不需要)。
+
 
 ================================================================================
 十点五、推广：大模型里还有哪些计算需要 fp32（混合精度 / AMP）
