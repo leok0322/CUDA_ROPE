@@ -285,6 +285,30 @@ _apply_rope 的 slice/cat：
   方案 A(无切片,rotary_dim==head_dim) → 不存在该常量：
     - pattern 不含 rotary_dim 字面常量，隐含 = head_dim、靠形状推，不因 rotary_dim 取值而变。
 
+【问题 1.5】“不同值=不同子图”→ 真的要并存多条 register_replacement 吗？分两种工作流：
+
+  先厘清一个关键机制：pattern(针)只在【调用 register_replacement 那一刻】用 example_inputs
+  把 search_fn trace 一次、把 rotary_dim 烤死存进 pass；之后 model 怎么 torch.compile 重编译，
+  inductor 只是拿【这根已烤好的旧针】去新图里找，【不会回头重新 trace search_fn】。
+  ⟹ 让针跟上新 rotary_dim 的，是【重新调用 register_replacement】(重新 trace 出新常量的针)，
+     【不是】model 重编译。草堆随 model 重编译更新；针只随 register_replacement 更新。
+
+  (1) 先后跑不同值(改 config→重跑脚本) → 【不需要】并存多条：
+      本仓库每次运行都会走 installer.install_fusion_pass() → 内部 register_replacement(search_fn,
+      replace_fn, example_inputs)；而 search_fn 里 rot=x[..., :self.rotary_dim] 的 self.rotary_dim
+      来自当前 config。故改 config 的 rotary_dim 后重跑脚本：install_fusion_pass 重跑 → 用新
+      rotary_dim【重新 trace 出新针(end=48)】→ model 也 end=48 → 自然匹配。
+      ★ 生效靠的是“重跑脚本时 register_replacement 也重跑了(重新注册)”，不是“重编译自动更新针”。
+        任一时刻只有一根针、配一个 model，先后切换值即可，无须手动维护多条。
+
+  (2) 同一进程内要【同时】支持多值 → 才【需要】并存多条：
+      若 install_fusion_pass 只在进程启动调用一次、之后想用【同一个已装好的 pass】既匹配 64 又
+      匹配 48 的子图(如一个常驻服务里多种 rotary_dim 共存) → 一根针只认一个值 → 必须为每个值各
+      调一次 register_replacement，让多根针并存于同一 pass。文档下文“需各注册一条”指的就是【这种
+      “同时支持多个值”】的场景。
+  小结：要不要多条，取决于“多个 rotary_dim 是【先后】出现还是【同时】出现”。本仓库是先后(每次
+        重跑 install_fusion_pass 重注册)，故一条即可；常驻进程同时多值才需多条。
+
 【问题 2】子图要求输入/输出形状“完全一样”吗？拆成两个不同的“一样”：
 
   (1) pattern 匹配时，要不要和 example_inputs 的具体形状完全一致？ —— 不要。
@@ -307,6 +331,8 @@ _apply_rope 的 slice/cat：
 
 小结：
   - rotary_dim 作为切片常量会让方案 B 的子图随值而异；方案 A 无此常量。
+  - 针只在 register_replacement 时 trace、烤死常量；model 重编译只更新草堆、不重 trace 针。
+    先后跑不同值=每次重跑 install_fusion_pass 重注册(一条即可)；同一进程同时多值才需并存多条。
   - pattern 匹配对 batch/token 这类维度是【形状无关】的，只钉住“结构 + 字面常量”。
   - replace 的【输出必须能等形等类型地顶替】search 的输出(fake 用 empty_like(x))。
   - “结构常量 → 不同值=不同子图”这一结论不止 rotary_dim，对 Hq/Hk/Hv/head_dim/interleave

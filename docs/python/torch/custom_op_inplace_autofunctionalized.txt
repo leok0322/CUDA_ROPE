@@ -136,6 +136,46 @@ Python _fake:
     少 (a)(b)(c) footgun，内存无条件 +1 buffer，不吃版本)，而非“缺 auto_functionalized 兜底”。
     要省那份显存可改用 ②/③，但需自担 footgun + re-inplace 的条件性收益，本项目这种规模性价比不高。
 
+────────────────────────────────────────────────────────────────────────────
+写法 ③ 的实战形态：vLLM 的 op-to-op 替换（search 侧【本身就是 custom op】）—— 简化示意
+────────────────────────────────────────────────────────────────────────────
+与本项目“search 侧是散装 aten”不同：vLLM 模型前向【直接调 void in-place custom op】(都是写法③
+那种 -> () 的算子)，functionalize 后图里它们是 auto_functionalized 高阶节点。故 pattern 直接拿
+【这些 custom op 节点】拼 search，再换成【一个融合 custom op】——即“N 个 custom op → 1 个融合 op”。
+
+  模型前向(节选)：两个独立的 void in-place custom op
+      torch.ops._C.rms_norm(out, x, weight, eps)                       # 写法③ void in-place
+      torch.ops._C.rotary_embedding(positions, q, k, head_size, cos_sin, is_neox)  # 写法③ void in-place
+
+  search_fn / replace_fn(简化伪码)：【直接调算子本身，不手写 auto_functionalized】
+      def search_fn(x, weight, positions, q, k, cos_sin):
+          out = torch.empty_like(x)
+          torch.ops._C.rms_norm(out, x, weight, eps)                  # void in-place：改写 out
+          torch.ops._C.rotary_embedding(positions, q, k, head_size, cos_sin, is_neox)  # 改写 q,k
+          return out, q, k          # 写法③ 的 (a)：op(...) 无返回 → 函数把【被改写的张量】交出去
+      def replace_fn(x, weight, positions, q, k, cos_sin):
+          out = torch.empty_like(x)
+          torch.ops._C.fused_add_rms_norm_rope(out, x, weight, positions, q, k, cos_sin, ...)  # 一次吃掉
+          return out, q, k
+      register_replacement(search_fn, replace_fn, example_inputs, fwd_only, pm_pass)
+
+  ★ 关于 auto_functionalized：你【不手写】它。register_replacement 以 fwd_only 在【functionalize
+    模式】下 trace 这两个函数；因为算子标了 (a!)(会改写入参)，trace 出的【针】里那几个直接调用
+    会【自动变成 auto_functionalized 节点】；model 前向经同样 functionalize 后【草堆】里也是
+    auto_functionalized → 两边同构 → 匹配。即 auto_functionalized 是“trace/functionalize 的产物”，
+    源码只管【直接调 op + return 被改写张量】。(对照本项目写法① -> Tensor 不改写、无 (a!)、压根不
+    产 auto_functionalized；故那里 search/replace 也只是直接调 op、return 返回值。)
+
+  要点：
+    - search 侧节点【本身就是 custom op】(trace 后表现为 auto_functionalized 包着的 _C.xxx) →
+      op-to-op 匹配，稳；不像本项目要匹配 mean/rsqrt/mul/cat 一长串【散装 aten】(脆)。
+    - 两边算子都是写法③(void in-place -> ())，(a)(b)(c) footgun 由【各算子自己的注册】满足
+      (vLLM 算子成熟、测过)，不是被 search 侧“自动对齐”(见上“重要澄清”)。
+    - 这是【N 个 custom op → 1 个融合 custom op】，不是“已融合的再换融合的”；“op-to-op”指
+      search 侧是【独立 custom op 节点】，非 search 侧已是融合算子。
+    - 本项目要复刻此“稳”的形态，需让模型也以 custom op 出现在图里(而非纯函数式)；当前选择是
+      函数式①(简单)，代价是 search 侧为散装 aten、匹配更脆(第一节根本差异)。
+
 
 ================================================================================
 四、auto_functionalized：阶段 / 触发 / 操作 / 作用
