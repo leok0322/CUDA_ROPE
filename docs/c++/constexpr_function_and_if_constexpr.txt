@@ -1,0 +1,227 @@
+================================================================================
+constexpr 函数 与 if constexpr：编译期求值与编译期分支裁剪
+================================================================================
+
+本文件分两大块：
+  Part A  constexpr 函数：什么是「能在编译期求值的函数」，规则与例子。
+  Part B  if constexpr：编译期分支选择，如何与 constexpr 函数配合，
+          并以 ATen/Dispatch.h 的 should_include_kernel_dtype 为真实案例收尾。
+
+
+================================================================================
+Part A —— constexpr 函数
+================================================================================
+
+一、一句话定义
+--------------------------------------------------------------------------------
+constexpr 函数 = 「在实参都是常量表达式时，可以在编译期被求值」的函数。
+编译器在编译阶段就把调用算成一个常量结果，运行时不再发生函数调用。
+
+注意是「可以」而非「必须」：
+  - 实参是编译期常量 → 编译期求值，结果当常量用。
+  - 实参是运行时变量 → 退化为一个普通函数，在运行时正常调用。
+同一个 constexpr 函数，两种场景都能用，编译器按上下文自动选择。
+
+
+二、最小例子：编译期 vs 运行时同一个函数
+--------------------------------------------------------------------------------
+
+    constexpr int square(int n) { return n * n; }
+
+    constexpr int a = square(5);   // (1) 编译期求值：a 就是常量 25
+    int arr[square(3)];            // (2) 编译期：数组维度必须是编译期常量 → OK
+
+    int x = std::atoi(argv[1]);    // x 运行时才知道
+    int b = square(x);             // (3) 退化为运行时调用，完全合法
+
+    static_assert(square(4) == 16);// (4) 编译期断言里也能用
+
+  关键：square 没有任何改动，(1)(2)(4) 把它当编译期常量算，(3) 当普通函数跑。
+
+
+三、constexpr 函数能用在哪些「普通函数不行」的位置
+--------------------------------------------------------------------------------
+凡是语言要求「编译期常量」的上下文，普通函数都不能用，constexpr 函数可以：
+
+    - 数组维度：           int buf[square(8)];
+    - 模板非类型实参：     std::array<float, square(3)> v;
+    - case 标签：          case square(2): ...
+    - static_assert：      static_assert(square(3) == 9);
+    - 其他 constexpr 变量初始化： constexpr int k = square(2);
+    - if constexpr 的条件（见 Part B）
+
+  普通函数在以上任一处都会编译报错（"不是常量表达式"）。
+
+
+四、对函数体的限制（C++ 标准逐版本放宽）
+--------------------------------------------------------------------------------
+要让函数"可在编译期求值"，函数体里出现的东西也必须是编译期能完成的。
+
+  允许（现代 C++ 中）：
+    - 局部变量、算术/逻辑运算
+    - if / switch / for / while（C++14 起放开）
+    - 调用其它 constexpr 函数
+    - C++20 起：constexpr 范围内的 new/delete、try-catch、虚函数等大幅放宽
+
+  禁止（会让它"无法用于编译期求值"）：
+    - 调用非 constexpr 函数（一旦在常量上下文触达就报错）
+    - I/O（std::cout、文件、读取运行时全局状态）
+    - 读取非 const / 非 constexpr 的全局变量
+    - 在 C++20 前使用 new/delete、try-catch 等
+
+  额外说明：
+    - constexpr 函数隐含 inline，可放在头文件被多处包含而不违反 ODR
+      （这就是 ATen 源码写 "inline constexpr" 的原因，inline 在此是显式冗余标注）。
+    - 若函数体写法本身不满足上述要求，且你又在常量上下文调用它 → 编译错误；
+      若只在运行时上下文调用，有些情况编译器宽容，但语义上它就不再是真 constexpr。
+
+
+五、constexpr / consteval / constinit 区分（避免混淆）
+--------------------------------------------------------------------------------
+    constexpr 函数  ：可在编译期求值，也可运行时调用（二选一，看实参）。
+    consteval 函数（C++20）：必须在编译期求值，运行时调用直接报错（"立即函数"）。
+    constexpr 变量  ：值在编译期确定的常量。
+    constinit（C++20）：要求变量在编译期完成初始化，但之后可修改（与 const 不同）。
+  本文只展开 constexpr 函数。
+
+
+================================================================================
+Part B —— if constexpr：编译期分支裁剪
+================================================================================
+
+六、if constexpr 与普通 if 的本质区别
+--------------------------------------------------------------------------------
+    普通 if (cond)：
+        两个分支都要编译、都生成代码；cond 在【运行时】判断走哪边。
+
+    if constexpr (cond)：
+        cond 必须是【编译期常量表达式】；编译器在编译期求值后，
+        【只保留命中的分支，另一分支被丢弃(discarded statement)】——
+        它不会被实例化、不生成任何机器码。
+
+  最重要的附加特性（模板里尤其关键）：
+    被丢弃的那个分支【不需要对当前类型合法】。普通 if 里两边都必须能编译通过，
+    if constexpr 里没命中的一边即使含有对当前类型非法的代码，也不会报错。
+
+
+七、if constexpr 配合 constexpr 函数：典型用法
+--------------------------------------------------------------------------------
+因为 if constexpr 的条件必须是编译期常量，而 constexpr 函数恰好能在编译期
+求值，二者天然配对。常见于「按类型特征在编译期选择不同实现」：
+
+    #include <type_traits>
+
+    template <typename T>
+    T add_one(T x) {
+        if constexpr (std::is_integral_v<T>) {     // 编译期就能定真假
+            return x + 1;                          // 仅整型实例化这一支
+        } else if constexpr (std::is_floating_point_v<T>) {
+            return x + 1.0;                        // 仅浮点实例化这一支
+        } else {
+            static_assert(sizeof(T) == 0, "unsupported type");
+            // 另两类型实例化时，这一支被丢弃，static_assert 不触发
+        }
+    }
+
+    add_one(3);     // T=int   → 只编译第一支
+    add_one(2.5);   // T=double→ 只编译第二支
+
+  若改用普通 if，三支都要编译；当 T=int 时 "x + 1.0" 也得合法，而且 else 里的
+  static_assert 一定触发 → 整个模板编译失败。if constexpr 才能做到「只保留对的
+  那支」。
+
+
+八、本项目真实案例：ATen 的 should_include_kernel_dtype
+--------------------------------------------------------------------------------
+ATen/Dispatch.h 用「constexpr 函数 + if constexpr」实现「编译期按 dtype 裁剪
+kernel」。这正是 AT_DISPATCH_FLOATING_TYPES_AND2 内部 (D7) 那段检查的来历。
+
+  (1) constexpr 函数（默认/桌面构建版本，源码原文）：
+
+        namespace at {
+        inline constexpr bool should_include_kernel_dtype(
+            const char* /*kernel_tag_str*/,
+            at::ScalarType /*scalar_type*/
+        ) {
+          return true;          // 恒真：永远包含该 dtype
+        }
+        } // namespace at
+
+      ─ 这里的 inline 是什么意思 ───────────────────────────────────────────
+      容易误解：inline ≠「建议编译器把函数内联展开」。那层"内联提示"含义如今
+      基本退化——现代编译器用自己的成本模型决定要不要内联，没写 inline 照样会
+      内联，写了也可能不内联；真要强制得用 __attribute__((always_inline)) /
+      __forceinline。
+
+      inline 在现代 C++ 里【由标准保证的核心含义】是：放宽 ODR（单一定义规则），
+      允许【同一个实体在多个翻译单元(.cpp)里各有一份定义】，只要各份逐 token
+      完全相同；链接器最终把它们【折叠成同一个实体】（各 TU 编出自己那份、放进
+      COMDAT/weak 符号，链接时选一份、全程同一地址、static 局部也只有一份）。
+
+      为什么这个函数需要 inline：
+        它定义在头文件 ATen/Dispatch.h 里，会被成百上千个 .cpp #include。
+        若不是 inline，每个包含它的 TU 都产出一份定义 → 链接期「重复定义」报错。
+        加了 inline，这些重复定义被允许并折叠为一，头文件里直接给函数体才合法。
+
+      另外它其实写了【两个】修饰：inline constexpr。
+        - constexpr 函数本身就【隐含 inline】（见本文第四节），所以这里的 inline
+          是【显式冗余】标注——去掉 inline、只留 constexpr，语义完全不变，依旧能
+          安全放进头文件。ATen 把 inline 写出来只是为了表意清晰。
+      ──────────────────────────────────────────────────────────────────────
+
+      移动端定义了 TEMPLATE_SELECTIVE_BUILD 时，改 include 由「追踪模型执行 →
+      代码生成」产出的版本，对没被模型用到的 dtype 返回 false。
+
+  (2) if constexpr 使用处（AT_PRIVATE_CHECK_SELECTIVE_BUILD 宏体）：
+
+        do {
+          if constexpr (!at::should_include_kernel_dtype(
+                            at_dispatch_name, enum_type)) {
+            TORCH_CHECK(false, "dtype '", toString(enum_type),
+                "' not selected for kernel tag ", at_dispatch_name);
+          }
+        } while (0)
+
+      条件三要素都满足编译期常量：
+        - at_dispatch_name：constexpr const char*（dispatch 骨架里声明）
+        - enum_type       ：编译期枚举常量（如 at::ScalarType::Half）
+        - should_include_kernel_dtype：constexpr 函数 → 可编译期求值
+
+  (3) 两种构建下的编译期结果：
+
+      桌面/服务器构建：
+        should_include_kernel_dtype(...) 编译期算出 true
+        → !true == false
+        → if constexpr (false) → 整个 TORCH_CHECK 分支被丢弃
+        → 这段检查【零开销，等于不存在】。
+
+      移动端选择性构建（某 dtype 未被选入）：
+        对该 dtype 算出 false
+        → !false == true
+        → 保留 TORCH_CHECK(false, ...) → 该 dtype 的 case 在构建期被标记/报错，
+          从而把无用 dtype 从二进制里裁掉，缩小体积。
+
+  (4) 为什么必须是 constexpr 函数：
+        if constexpr 的条件【必须】是编译期常量表达式。若 should_include_kernel_dtype
+        是普通函数，就不能放进 if constexpr 的条件，这套「编译期裁剪 dtype」机制
+        根本无法成立。constexpr 是它能工作的前提。
+
+
+================================================================================
+九、一图速记
+================================================================================
+
+    constexpr 函数  ── 提供 ──▶  一个「能在编译期算出的布尔/数值常量」
+                                          │
+                                          ▼
+    if constexpr (该常量)  ── 编译期选定唯一分支，另一支连编译都跳过
+
+    组合效果：在编译期根据常量条件「裁剪代码」，命中支零成本保留，
+              未命中支彻底消失（且无需对当前类型合法）。
+
+    ATen 用它做到：桌面构建里 dtype 检查完全蒸发；移动端按需裁剪 dtype。
+
+
+相关文件：
+    docs/c++/AT_DISPATCH_FLOATING_TYPES_AND2.txt  —— 该宏的完整逐层展开，
+        其 (D7) 节即本文 Part B 第八点所讲的检查。

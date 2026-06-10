@@ -1,0 +1,584 @@
+================================================================================
+AT_DISPATCH_FLOATING_TYPES_AND2：按 tensor 的 dtype 分发到对应类型的 kernel
+================================================================================
+
+背景
+--------------------------------------------------------------------------------
+CUDA kernel 通常写成模板 template<typename T>，但 runtime 拿到的是一个 at::Tensor，
+它的元素类型（fp32 / fp16 / bf16 …）只有在运行时才知道。
+我们需要一座桥：在运行时读出 tensor 的 scalar_type，再选中编译期对应的 T，实例化
+并调用模板 kernel。
+
+AT_DISPATCH_* 系列宏就是这座桥。本质是一个 switch(scalar_type)，每个 case 里把
+模板参数 scalar_t typedef 成具体 C++ 类型，然后执行你传入的 lambda。
+
+本文件聚焦 AT_DISPATCH_FLOATING_TYPES_AND2，并顺带讲清整个命名规律。
+
+
+================================================================================
+一、调用形式与参数
+================================================================================
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        SCALARTYPE1,    // 额外类型 1，例如 at::kHalf
+        SCALARTYPE2,    // 额外类型 2，例如 at::kBFloat16
+        TYPE,           // 运行时的 at::ScalarType，例如 qkv.scalar_type()
+        NAME,           // const char* 标签，用于 trace / 报错信息
+        LAMBDA);        // [&]{ ... } 函数体，内部可用 scalar_t
+
+    参数逐个说明：
+
+    ┌────────────┬──────────────────────────────────────────────────────────┐
+    │ SCALARTYPE1│ 在默认浮点类型(float/double)之外，额外要支持的第 1 个类型。 │
+    │ SCALARTYPE2│ 额外要支持的第 2 个类型。                                   │
+    │            │ 传的是 ScalarType 枚举值：at::kHalf / at::kBFloat16 /      │
+    │            │ at::ScalarType::Half 等（torch::kHalf 也行）。             │
+    ├────────────┼──────────────────────────────────────────────────────────┤
+    │ TYPE       │ 运行时实际的 dtype，类型是 at::ScalarType。                │
+    │            │ 一般写 tensor.scalar_type()。                              │
+    │            │ 注意：是 scalar_type()（返回 ScalarType），               │
+    │            │       不是 dtype()（返回 caffe2::TypeMeta）。             │
+    ├────────────┼──────────────────────────────────────────────────────────┤
+    │ NAME       │ 编译期常量字符串(const char*)，做 kernel 名字 tag。        │
+    │            │ 不能传 std::string。用于性能 trace 与"未实现 dtype"报错。  │
+    │            │ 建议每个 kernel 用唯一名字。                               │
+    ├────────────┼──────────────────────────────────────────────────────────┤
+    │ LAMBDA     │ 可变参数(...)，即你的函数体，通常是 [&]{ ... }。          │
+    │            │ 宏在选中的 case 里 typedef 出 scalar_t 后调用它。          │
+    └────────────┴──────────────────────────────────────────────────────────┘
+
+    末尾数字 "2" 的含义：在 float/double 之外，由你"额外追加"的标量类型个数。
+    所以这个宏一共会生成 4 个 case：Double、Float、SCALARTYPE1、SCALARTYPE2。
+
+
+================================================================================
+二、宏展开后到底长什么样（逐层手动展开，来自 ATen/Dispatch.h）
+================================================================================
+
+下面用一个真实调用，一层一层把宏替换掉，看预处理器最终生成什么代码。
+设我们写的是：
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf,                  //  S1
+        at::kBFloat16,              //  S2
+        qkv.scalar_type(),          //  TYPE
+        "fused_qknorm_rope",        //  NAME
+        [&] { body<scalar_t>(); }   //  __VA_ARGS__（你的 lambda，记作 LAMBDA）
+    );
+
+────────────────────────────────────────────────────────────────────────────
+涉及到的全部底层宏定义（原文照抄，去掉行尾续行符 \ 便于阅读）
+────────────────────────────────────────────────────────────────────────────
+
+    // (D1) 顶层入口：只是把"列 case 的活"和"switch 骨架"拼起来
+    #define AT_DISPATCH_FLOATING_TYPES_AND2(S1, S2, TYPE, NAME, ...)
+        AT_DISPATCH_SWITCH(TYPE, NAME,
+            AT_DISPATCH_CASE_FLOATING_TYPES_AND2(S1, S2, __VA_ARGS__))
+
+    // (D2) 生成 4 个 case：先 float/double，再追加 S1、S2
+    #define AT_DISPATCH_CASE_FLOATING_TYPES_AND2(S1, S2, ...)
+        AT_DISPATCH_CASE_FLOATING_TYPES(__VA_ARGS__)
+        AT_DISPATCH_CASE(S1, __VA_ARGS__)
+        AT_DISPATCH_CASE(S2, __VA_ARGS__)
+
+    // (D3) 基础浮点两件套
+    #define AT_DISPATCH_CASE_FLOATING_TYPES(...)
+        AT_DISPATCH_CASE(at::ScalarType::Double, __VA_ARGS__)
+        AT_DISPATCH_CASE(at::ScalarType::Float,  __VA_ARGS__)
+
+    // (D4) 单个 case 的语法糖：固定把类型别名取名为 scalar_t
+    #define AT_DISPATCH_CASE(enum_type, ...)
+        AT_PRIVATE_CASE_TYPE_USING_HINT(enum_type, scalar_t, __VA_ARGS__)
+
+    // (D5) 真正生成 case 块的地方 —— ★整套机制的心脏
+    #define AT_PRIVATE_CASE_TYPE_USING_HINT(enum_type, HINT, ...)
+        case enum_type: {
+          AT_PRIVATE_CHECK_SELECTIVE_BUILD(enum_type);
+          using HINT [[maybe_unused]] = c10::impl::ScalarTypeToCPPTypeT<enum_type>;
+          return __VA_ARGS__();
+        }
+
+    //   ┌─ c10::impl::ScalarTypeToCPPTypeT<enum_type> 是什么 ─────────────────┐
+    //   │ 一个【编译期类型萃取(type trait)】：把"dtype 枚举值"翻译成"对应的    │
+    //   │ C++ 类型"。代入 enum_type = at::ScalarType::Double 即得 double。      │
+    //   │ 这一行就是把"运行期才知道的 dtype"接回"编译期类型 scalar_t"的关键。 │
+    //   │                                                                      │
+    //   │ ★ 它【不是函数/方法】：没有函数体、没有 return、运行期不执行代码、   │
+    //   │   零开销。它是"类模板 + 别名模板"，输入【编译期枚举常量】、输出【一个 │
+    //   │   类型】。所以用 <...>（模板实参）而非 (...)（函数调用）。           │
+    //   │                                                                      │
+    //   │ 它在 c10/core/ScalarType.h 由三部分组成（完整源码）：               │
+    //   │                                                                      │
+    //   │ (1) 主模板：只【声明】、不定义（占位）                              │
+    //   │       template <c10::ScalarType N>                                  │
+    //   │       struct ScalarTypeToCPPType;            // 无 { } 定义体        │
+    //   │     · 模板参数是【非类型参数】c10::ScalarType N（一个枚举值），     │
+    //   │       不是 typename T。                                             │
+    //   │     · 故意不给定义 → 只有显式特化过的枚举值合法；传别的进来，因为    │
+    //   │       主模板不完整（incomplete），取 ::type 时编译报错。            │
+    //   │                                                                      │
+    //   │ (2) 用 X-macro 为每个 ScalarType 批量生成【全特化】，在 ::type 上    │
+    //   │     绑定对应 C++ 类型：                                             │
+    //   │       #define SPECIALIZE_ScalarTypeToCPPType(cpp_type, scalar_type) \│
+    //   │         template <>                                                 \│
+    //   │         struct ScalarTypeToCPPType<c10::ScalarType::scalar_type> {  \│
+    //   │           using type = cpp_type;     // ★ 枚举 → C++ 类型 的绑定    \│
+    //   │           static type t;             // 绕某 CUDA 编译器 bug，可忽略\│
+    //   │         };                                                          \│
+    //   │       AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(                 │
+    //   │           SPECIALIZE_ScalarTypeToCPPType)                           │
+    //   │       #undef SPECIALIZE_ScalarTypeToCPPType                         │
+    //   │     展开后等价于一大批手写全特化（每个都是 struct，不是函数）：     │
+    //   │       template<> struct ScalarTypeToCPPType<...::Double>  {using type=double;     ...};│
+    //   │       template<> struct ScalarTypeToCPPType<...::Float>   {using type=float;      ...};│
+    //   │       template<> struct ScalarTypeToCPPType<...::Half>    {using type=at::Half;   ...};│
+    //   │       template<> struct ScalarTypeToCPPType<...::BFloat16>{using type=at::BFloat16;...};│
+    //   │       ... Byte/Char/Short/Int/Long/Bool/复数/量化/FP8 等全部类型     │
+    //   │                                                                      │
+    //   │ (3) 别名模板（名字末尾 T = Type）取出该 ::type，省掉 typename：      │
+    //   │       template <c10::ScalarType N>                                  │
+    //   │       using ScalarTypeToCPPTypeT =                                  │
+    //   │           typename ScalarTypeToCPPType<N>::type;                    │
+    //   │     · 带 T 的别名【定义里已含 ::type】→ 用时【不要】再写 ::type！    │
+    //   │         ScalarTypeToCPPTypeT<Double>          == double   ✅         │
+    //   │         ScalarTypeToCPPTypeT<Double>::type    == double::type ❌报错 │
+    //   │     · 不带 T 的类模板才要自己加：                                   │
+    //   │         typename ScalarTypeToCPPType<Double>::type        == double  │
+    //   │     （同 std::remove_const<T>::type 与 std::remove_const_t<T> 之别） │
+    //   │                                                                      │
+    //   │ 代入展开：                                                          │
+    //   │   ScalarTypeToCPPTypeT<at::ScalarType::Double>                      │
+    //   │     → typename ScalarTypeToCPPType<Double>::type                    │
+    //   │     → 命中全特化 { using type = double; }  → double                 │
+    //   │                                                                      │
+    //   │ 配合 (D4)：HINT 被写死为 scalar_t，故这行等价于                     │
+    //   │   using scalar_t = double;（当 enum_type=Double 时）               │
+    //   │ 这正是 lambda 体里能直接用 scalar_t 的根本原因。                   │
+    //   │ 详见 docs/c++/x_macro_scalartype_enum.txt（X-macro 如何生成这些特化）│
+    //   └──────────────────────────────────────────────────────────────────────┘
+
+    // (D6) switch 骨架，整体是一个"立即调用的 lambda" [&]{...}()
+    #define AT_DISPATCH_SWITCH(TYPE, NAME, ...)
+        [&] {
+          const auto& the_type = TYPE;
+          constexpr const char* at_dispatch_name = NAME;
+          at::ScalarType _st = ::detail::scalar_type(the_type);
+          RECORD_KERNEL_FUNCTION_DTYPE(at_dispatch_name, _st);
+          switch (_st) {
+            __VA_ARGS__
+            default:
+              TORCH_CHECK_NOT_IMPLEMENTED(false, '"', at_dispatch_name,
+                  "\" not implemented for '", toString(_st), "'");
+          }
+        }()
+
+    //   ┌─ at::ScalarType _st = ::detail::scalar_type(the_type); 解析 ─────────┐
+    //   │ 作用：把宏参数取到的 dtype【归一成 at::ScalarType】存进局部 _st，    │
+    //   │ 供后面 switch(_st) 分支。一句话：它几乎等价于  _st = the_type;       │
+    //   │                                                                      │
+    //   │ ① ::detail::scalar_type 是个【恒等辅助函数】（ATen/Dispatch.h）：    │
+    //   │       namespace detail {                                            │
+    //   │         inline at::ScalarType scalar_type(at::ScalarType s){return s;}│
+    //   │       }                                                             │
+    //   │     它什么都不算，收一个 ScalarType 原样吐回。为何还要这层间接：     │
+    //   │     · 历史上是【重载归一化点】：老 API 允许把已废弃的"类型对象"      │
+    //   │       (tensor.type() → DeprecatedTypeProperties) 传进 dispatch；当年 │
+    //   │       另有一个重载从该对象提取 ScalarType。现代写 tensor.scalar_type()│
+    //   │       直接给 ScalarType，旧重载已删，只剩这个恒等的，但调用点保留，  │
+    //   │       作为稳定的"定制/扩展点"。                                      │
+    //   │                                                                      │
+    //   │ ② 为什么先 the_type = TYPE 再 scalar_type(the_type)：                │
+    //   │     TYPE 是宏参数，调用方常传 qkv.scalar_type() 这种【带副作用/开销】 │
+    //   │     的表达式。先把它求值【一次】存进 the_type，后续只用 the_type，   │
+    //   │     避免宏展开里 TYPE 出现多次导致【重复求值】（注释原文也写了       │
+    //   │     "don't use TYPE again in case it is an expensive or side-effect op")│
+    //   │                                                                      │
+    //   │ ③ 开头的 :: 为什么不能省（::detail 而非 detail）：                   │
+    //   │     这个 scalar_type 在【全局】命名空间 ::detail 里；而该行身处会在   │
+    //   │     【任意命名空间展开】的宏中。若写不带 :: 的 detail::scalar_type： │
+    //   │       · 先头段 detail 走【非限定查找】→ 若用户也有个 detail 命名空间 │
+    //   │         （极常见）会被【截胡】→ 编译错误甚至静默调错；              │
+    //   │       · 非限定函数调用还触发【ADL】，把实参类型 at::ScalarType 所属  │
+    //   │         的 at/c10 也拉进候选，候选膨胀、行为不可控。                 │
+    //   │     写 ::detail::scalar_type 是【限定调用】：先头从全局钉死（封死    │
+    //   │     截胡）+ 关闭 ADL（候选只 1 个）→ 任意命名空间展开都正确。       │
+    //   │     详见 docs/c++/namespace_lookup.txt。                            │
+    //   └──────────────────────────────────────────────────────────────────────┘
+
+    // (D7) 选择性构建检查：移动端裁剪未用到的 dtype 时才会触发报错，
+    //       桌面/服务器构建里 should_include_kernel_dtype 恒为 true，
+    //       这段 if constexpr 被编译期消除，等于不存在。
+    //
+    //   ┌─ 为什么宏体要用 do { ... } while (0) 包起来？──────────────────────┐
+    //   │ 这是 C/C++ 宏的标准惯用法：把"多条语句"打包成"单条语句"，使宏在     │
+    //   │ 任何语法位置都能安全替换，并能正确吃掉调用处末尾的分号。            │
+    //   │                                                                    │
+    //   │ 反例：若宏体写成裸的 { ... }，在下面这种带分号的调用里             │
+    //   │     if (cond) AT_PRIVATE_CHECK_SELECTIVE_BUILD(x);   else foo();    │
+    //   │ 会展开成 if (cond) { ... };  else foo();                           │
+    //   │ 那个多余的 ; 提前结束了 if，导致 else 悬空 → 编译错误。            │
+    //   │ 而 do{...}while(0) 整体是一条语句，后面正好接调用者的 ;，          │
+    //   │ 既不会多也不会少，放进 if/else、for 体里都安全。                   │
+    //   └────────────────────────────────────────────────────────────────────┘
+    //
+    //   ┌─ 为什么不能用 while (0) { ... }？──────────────────────────────────┐
+    //   │ while 是"先判断后执行"(pre-test)：条件 0 == false，循环体一次都     │
+    //   │ 不会执行 → 宏体形同虚设，检查根本不运行。                          │
+    //   │ do{...}while(0) 是"先执行后判断"(post-test)：循环体先跑一次，再判   │
+    //   │ while(0) 为假退出 → 恰好执行一次，正是我们要的"包成一条语句"语义。 │
+    //   │ （这个假循环没有运行开销，优化器会直接抹掉。）                     │
+    //   │ 另外：C++ 没有 "while do" 这种语法，循环只有 while(){} 和          │
+    //   │ do{}while() 两种。                                                 │
+    //   └────────────────────────────────────────────────────────────────────┘
+    #define AT_PRIVATE_CHECK_SELECTIVE_BUILD(enum_type)
+        do {
+          if constexpr (!at::should_include_kernel_dtype(at_dispatch_name, enum_type)) {
+            TORCH_CHECK(false, "dtype '", toString(enum_type),
+                "' not selected for kernel tag ", at_dispatch_name);
+          }
+        } while (0)
+
+    // (D8) 性能 trace 钩子：默认（未定义 ENABLE_RECORD_KERNEL_FUNCTION_DTYPE）
+    //       直接展开为空。
+    #define RECORD_KERNEL_FUNCTION_DTYPE(NAME, enum_type)   /* 空 */
+
+
+────────────────────────────────────────────────────────────────────────────
+第 0 步：原始调用
+────────────────────────────────────────────────────────────────────────────
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, qkv.scalar_type(),
+        "fused_qknorm_rope", LAMBDA)
+
+────────────────────────────────────────────────────────────────────────────
+第 1 步：套用 (D1)，参数绑定 S1=at::kHalf, S2=at::kBFloat16,
+         TYPE=qkv.scalar_type(), NAME="fused_qknorm_rope", __VA_ARGS__=LAMBDA
+────────────────────────────────────────────────────────────────────────────
+
+    AT_DISPATCH_SWITCH(
+        qkv.scalar_type(),
+        "fused_qknorm_rope",
+        AT_DISPATCH_CASE_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, LAMBDA)
+    )
+
+────────────────────────────────────────────────────────────────────────────
+第 2 步：展开内层 (D2)，得到 4 段"列 case"指令
+────────────────────────────────────────────────────────────────────────────
+
+    AT_DISPATCH_SWITCH(qkv.scalar_type(), "fused_qknorm_rope",
+        AT_DISPATCH_CASE_FLOATING_TYPES(LAMBDA)        // → 给出 Double / Float 两 case
+        AT_DISPATCH_CASE(at::kHalf,     LAMBDA)        // → 追加 Half
+        AT_DISPATCH_CASE(at::kBFloat16, LAMBDA)        // → 追加 BFloat16
+    )
+
+────────────────────────────────────────────────────────────────────────────
+第 3 步：展开 (D3)，把 FLOATING_TYPES 拆成 Double + Float 两个 AT_DISPATCH_CASE
+────────────────────────────────────────────────────────────────────────────
+
+    AT_DISPATCH_SWITCH(qkv.scalar_type(), "fused_qknorm_rope",
+        AT_DISPATCH_CASE(at::ScalarType::Double, LAMBDA)
+        AT_DISPATCH_CASE(at::ScalarType::Float,  LAMBDA)
+        AT_DISPATCH_CASE(at::kHalf,              LAMBDA)
+        AT_DISPATCH_CASE(at::kBFloat16,          LAMBDA)
+    )
+
+────────────────────────────────────────────────────────────────────────────
+第 4 步：(D4)+(D5)，每个 AT_DISPATCH_CASE 变成一个真正的 case 块。
+         注意 (D4) 把 HINT 固定写死成 scalar_t —— 这就是 lambda 里能直接用
+         scalar_t 的根本原因。
+         （省略号 ... 收到的就是 LAMBDA，所以 return __VA_ARGS__() 即 return LAMBDA()）
+────────────────────────────────────────────────────────────────────────────
+
+    AT_DISPATCH_SWITCH(qkv.scalar_type(), "fused_qknorm_rope",
+
+        case at::ScalarType::Double: {
+          AT_PRIVATE_CHECK_SELECTIVE_BUILD(at::ScalarType::Double);
+          using scalar_t [[maybe_unused]] =
+              c10::impl::ScalarTypeToCPPTypeT<at::ScalarType::Double>;   // = double
+          return LAMBDA();
+        }
+        case at::ScalarType::Float: {
+          AT_PRIVATE_CHECK_SELECTIVE_BUILD(at::ScalarType::Float);
+          using scalar_t [[maybe_unused]] =
+              c10::impl::ScalarTypeToCPPTypeT<at::ScalarType::Float>;    // = float
+          return LAMBDA();
+        }
+        case at::ScalarType::Half: {
+          AT_PRIVATE_CHECK_SELECTIVE_BUILD(at::ScalarType::Half);
+          using scalar_t [[maybe_unused]] =
+              c10::impl::ScalarTypeToCPPTypeT<at::ScalarType::Half>;     // = at::Half
+          return LAMBDA();
+        }
+        case at::ScalarType::BFloat16: {
+          AT_PRIVATE_CHECK_SELECTIVE_BUILD(at::ScalarType::BFloat16);
+          using scalar_t [[maybe_unused]] =
+              c10::impl::ScalarTypeToCPPTypeT<at::ScalarType::BFloat16>; // = at::BFloat16
+          return LAMBDA();
+        }
+    )
+
+────────────────────────────────────────────────────────────────────────────
+第 5 步：展开外层骨架 (D6)，把上面四个 case 塞进 switch；
+         同时 (D7) 在普通构建里被 if constexpr 消除、(D8) 展开为空，
+         于是 CHECK_SELECTIVE_BUILD / RECORD 两行实际"蒸发"。
+         把 LAMBDA 还原成真实写的 [&]{ body<scalar_t>(); }。
+────────────────────────────────────────────────────────────────────────────
+
+    [&] {
+      const auto& the_type = qkv.scalar_type();
+      constexpr const char* at_dispatch_name = "fused_qknorm_rope";
+      at::ScalarType _st = ::detail::scalar_type(the_type);   // 就是把 ScalarType 原样返回
+
+      switch (_st) {
+
+        case at::ScalarType::Double: {
+          using scalar_t = double;
+          return [&]{ body<scalar_t>(); }();      // 实例化 body<double>
+        }
+        case at::ScalarType::Float: {
+          using scalar_t = float;
+          return [&]{ body<scalar_t>(); }();      // 实例化 body<float>
+        }
+        case at::ScalarType::Half: {
+          using scalar_t = at::Half;
+          return [&]{ body<scalar_t>(); }();      // 实例化 body<at::Half>
+        }
+        case at::ScalarType::BFloat16: {
+          using scalar_t = at::BFloat16;
+          return [&]{ body<scalar_t>(); }();      // 实例化 body<at::BFloat16>
+        }
+
+        default:
+          TORCH_CHECK_NOT_IMPLEMENTED(false, '"', at_dispatch_name,
+              "\" not implemented for '", toString(_st), "'");
+      }
+    }()      // ← 末尾这对括号：lambda 定义后立刻调用（IIFE）
+
+────────────────────────────────────────────────────────────────────────────
+读懂这段展开后，几个关键结论
+────────────────────────────────────────────────────────────────────────────
+
+  1. 编译期会把 body<scalar_t> 实例化成 4 份（double/float/Half/BFloat16）。
+     你列几个类型，就生成几份实例 —— 这决定了二进制体积，也是 NAME 要唯一、
+     避免重复实例化的原因。
+
+  2. 运行时只有一份会被 switch 选中执行；选中哪份取决于 qkv 的实际 dtype。
+
+  3. scalar_t 这个名字不是魔法，是 (D4) 里写死的 HINT 实参。
+     具体 C++ 类型由 c10::impl::ScalarTypeToCPPTypeT<枚举> 这个 type trait
+     在编译期映射：Double→double、Half→at::Half、BFloat16→at::BFloat16 …
+
+  4. 整体是一个 IIFE（[&]{...}()），所以它是一个"表达式"，能写在 = 右边、
+     能 return。lambda 内 return 的值会原样传出来（本例 body 返回 void）。
+     [&] 按引用捕获，外层局部变量（grid、block、各 data_ptr 实参等）都能用。
+
+  5. default 分支负责"运行时未实现"报错：传进来的 dtype 不在列出的 4 种里，
+     就抛 TORCH_CHECK_NOT_IMPLEMENTED —— 这是运行时异常，不是编译错误。
+
+  6. AT_PRIVATE_CHECK_SELECTIVE_BUILD / RECORD_KERNEL_FUNCTION_DTYPE 只在特定
+     构建配置（移动端裁剪、性能 trace）下才有内容，桌面/服务器默认构建里
+     它们等于不存在，可放心忽略。
+
+
+================================================================================
+三、命名规律：FLOATING_TYPES / _AND / _AND2 / _AND3 …
+================================================================================
+
+    基础浮点集合永远是 {float(kFloat), double(kDouble)}。
+    后缀数字 = 在这之上你"手动追加"的类型个数：
+
+        AT_DISPATCH_FLOATING_TYPES            → float, double
+        AT_DISPATCH_FLOATING_TYPES_AND (T1)   → float, double, T1
+        AT_DISPATCH_FLOATING_TYPES_AND2(T1,T2)→ float, double, T1, T2
+        AT_DISPATCH_FLOATING_TYPES_AND3(...)  → float, double, T1, T2, T3
+        ...一直到 _AND5
+
+    ⚠️ 重点：基础的 AT_DISPATCH_FLOATING_TYPES 不含 half / bf16
+       （历史上它们不被算作 "floating types"）。
+       深度学习要支持混合精度，几乎一定要用 _AND2 把 kHalf + kBFloat16 补进去。
+
+    另有一些"打包好"的便捷宏（语义等价于手动列类型）：
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF     → float, double, half
+        AT_DISPATCH_REDUCED_FLOATING_TYPES      → half, bf16（只这两个，不含 fp32/fp64）
+
+
+================================================================================
+四、在本项目 run_kernel.cu 中的用法
+================================================================================
+
+    目标：qkv 可能是 fp16 / bf16 / fp32，要据此实例化模板 kernel。
+
+        #include <ATen/Dispatch.h>     // 或 torch/extension.h 间接带入
+
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::kHalf, at::kBFloat16,
+            qkv.scalar_type(), "fused_QKNorm_and_ROPE",
+            [&] {
+                // scalar_t = float / double / at::Half / at::BFloat16
+                fused_QKNorm_and_ROPE_kernel<scalar_t><<<grid, block>>>(
+                    qkv.data_ptr<scalar_t>(),
+                    cos.data_ptr<scalar_t>(),
+                    sin.data_ptr<scalar_t>(),
+                    q_weight.data_ptr<scalar_t>(),
+                    k_weight.data_ptr<scalar_t>(),
+                    num_heads_q, num_heads_k, num_heads_v,
+                    head_dim, num_tokens, eps);
+            });
+
+    （前提：fused_QKNorm_and_ROPE_kernel 要改成 template<typename scalar_t>。）
+
+    ─────────────────────────────────────────────────────────────────────────
+    ★ ATen 类型 vs CUDA 原生类型的坑
+    ─────────────────────────────────────────────────────────────────────────
+    lambda 里的 scalar_t，对半精度是 ATen 自己的类型：
+        Half      → at::Half     （不是 CUDA 的 half / __half）
+        BFloat16  → at::BFloat16 （不是 CUDA 的 __nv_bfloat16）
+
+    at::Half 与 __half 二进制布局兼容，但不是同一个 C++ 类型。如果 kernel 内部
+    直接用 CUDA intrinsics（如 __hmul、h2div），有两种处理：
+
+      (a) 在 host 侧 reinterpret_cast 指针再传给 kernel：
+            using cuda_t = std::conditional_t<
+                std::is_same_v<scalar_t, at::Half>,     half,
+                std::conditional_t<
+                std::is_same_v<scalar_t, at::BFloat16>, __nv_bfloat16, scalar_t>>;
+            auto* p = reinterpret_cast<cuda_t*>(qkv.data_ptr<scalar_t>());
+
+      (b) 用 ATen 提供的转换头 <ATen/cuda/CUDAContext.h> 及 at::Half 在 device 上
+          可隐式转 float 的特性，kernel 内统一升到 float 计算再写回。
+          RMSNorm/ROPE 这类对精度敏感的归一化，本来就推荐在 float 累加，
+          所以 (b) 往往更省事也更稳。
+
+
+================================================================================
+五、常见错误与排查
+================================================================================
+
+    1. 传了 dtype() 而非 scalar_type()
+         qkv.dtype() 返回 caffe2::TypeMeta，不是 ScalarType。
+         宏内部 ::detail::scalar_type(TYPE) 期望 ScalarType；TypeMeta 能隐式转，
+         但语义上应直接写 qkv.scalar_type()，更清晰。
+
+    2. "X not implemented for 'Y'" 运行时异常
+         说明传入 tensor 的 dtype 不在你列的 case 里（走了 default）。
+         例如只用了基础 AT_DISPATCH_FLOATING_TYPES 却喂了 half。
+         解法：换成 _AND2(at::kHalf, at::kBFloat16, ...)。
+
+    3. NAME 传了 std::string
+         必须是编译期 const char*，传字面量 "xxx"。
+
+    4. 在 lambda 里忘了用 scalar_t
+         若 body 不依赖 scalar_t，分发就没意义；data_ptr<scalar_t>() 是
+         把"运行时 dtype"接回"编译期类型"的关键一步，别漏。
+
+    5. 误以为漏掉某类型是编译错误
+         不是。未列出的 dtype 是运行时 default 分支报错。编译期只会实例化你
+         列出的那些类型 → 也因此 NAME 唯一可避免重复实例化、控制二进制体积。
+
+
+================================================================================
+六、为什么用宏而不直接写成函数
+================================================================================
+
+  常见误解："用宏是为了把 grid/block/data_ptr 等【变量】传给 lambda 吧？"
+  不是。变量用 [&] 按引用捕获即可，函数同样能做到。真正原因是要传的是【类型】。
+
+  核心：要注入用户代码体的是【类型 scalar_t】，而类型不能当函数参数传
+  --------------------------------------------------------------------------------
+    宏展开后每个 case：
+        case at::ScalarType::Float: {
+            using scalar_t = float;          // 编译期【类型别名】，不是运行期的值
+            return [&]{ kernel<scalar_t>(qkv.data_ptr<scalar_t>(), ...); }();
+        }                                    // ↑ 用户 lambda 体被【文本插入】到这里
+    用户写 kernel<scalar_t> 时，scalar_t 必须在【当前词法作用域】可见。宏（纯文本
+    替换）把用户代码体原样贴进 using scalar_t=float 之后，所以它能看到这个别名。
+    （注：lambda 的 [&] 只捕获【变量】；【类型/using】不需捕获，定义在外层即可直接用，
+      关键是代码体必须被【写在】那个作用域里——这正是宏文本替换做的事。）
+
+  为什么函数做不到
+  --------------------------------------------------------------------------------
+        template<typename F>
+        void dispatch(at::ScalarType st, F&& f) {
+            switch (st) {
+              case at::ScalarType::Float: { using scalar_t = float; f(); }  // scalar_t 只在这
+            }
+        }
+        dispatch(qkv.scalar_type(), [&]{
+            kernel<scalar_t>(...);   // ❌ 编译错误：scalar_t 未声明
+        });
+    用户 lambda 在【调用点】定义，而 scalar_t 只存在于 dispatch 内部的 case 块里，
+    lambda 定义处看不到它。根因：【类型不能作函数实参传】——函数参数只能传值/引用/
+    指针，传不了 "float 这个类型本身"。
+
+  现代 C++ 其实"能"用函数，但宏更顺手
+  --------------------------------------------------------------------------------
+    用泛型 lambda（C++14+）把类型当模板实参/标签运过去，可以绕开（详见
+    docs/c++/generic_lambda.txt）：
+        dispatch(qkv.scalar_type(), [&](auto tag){
+            using scalar_t = decltype(tag);
+            kernel<scalar_t>(...);
+        });
+        // dispatch 内：case Float: f(float{}); ...
+    这能编译。所以"必须用宏"并非绝对。ATen 仍选宏的原因：
+      1. 人体工学：用户直接写 scalar_t 最自然，免去 [&](auto tag){using scalar_t=
+         decltype(tag);...} 的样板。
+      2. 历史：这套宏在 C++11 时代就有，那时泛型 lambda 还不存在。
+      3. NAME 须编译期常量：(D7) 的 should_include_kernel_dtype(at_dispatch_name,...)
+         在 if constexpr 里用，at_dispatch_name 得是 constexpr const char*；宏把字符串
+         字面量直接铺进每个 case 更自然。
+      4. 一次生成多份实例：宏把代码体复制进 N 个 case，天然为 N 种类型各实例化一份
+         kernel<T>——即"静态多态"。
+
+  （另注：D1–D5 那么多【层】宏，不是为了"关联运行期/编译期"——关联只在 D5 一处
+    [switch 选 case + ScalarTypeToCPPTypeT<编译期枚举>]；多层是为了用可复用的原子宏
+    组合出几十个 dispatch 变体[FLOATING_TYPES / ALL_TYPES / _AND / _AND2 …]，避免重复
+    手写。三件事分开：①目的=关联类型；②多层=复用/代码生成；③用宏=注入类型 scalar_t。）
+
+
+================================================================================
+七、用宏比用函数性能更好吗？——不会
+================================================================================
+
+  运行期性能上，宏和（inline/模板）函数【没有差别】。用宏不是为了性能。
+
+  · 具体到 AT_DISPATCH：宏版与"泛型 lambda 函数"版编译出的机器码几乎相同，都生成
+    kernel<float>/kernel<half>… 这些【静态多态、可内联】的实例，优化后无运行期差异；
+    switch 选 case 那点开销两者都有，且微不足道。
+  · 一般"宏 vs 函数"性能（分时代）：
+      C 早期：函数有 call/ret/栈帧开销，函数式宏靠文本展开省下它——那时确有差别。
+      现代 C++：inline/模板函数会被【内联】，零调用开销，和宏一样；优化器(-O2)还常
+      自动内联。所以"宏比函数快"基本不成立。
+  · 宏甚至可能更糟：参数多次求值（MAX(i++,j)）、代码膨胀拖累 i-cache、无类型检查。
+  · 宏真正影响的是【编译期】，不是运行期：文本复制 + 多份实例化 → 编译变慢、二进制
+    变大（每种 dtype 一份 kernel<T>）。这是编译期/体积代价，非运行期收益。
+
+  ┌────────────────────────┬───────────────────────────────────────────────┐
+  │ 宏 vs inline/模板函数  │ 运行期无差别（都内联，零调用开销）            │
+  │ 宏 vs 普通(非内联)函数 │ 宏理论上省一次 call，但优化器一内联即抹平，可忽略│
+  └────────────────────────┴───────────────────────────────────────────────┘
+
+  结论：性能不是用宏的理由。真正带来性能的是 template<typename scalar_t> 这套【静态
+  多态 + 内联】——宏和泛型-lambda 函数都能做到、效果一样。用宏只是为注入类型、
+  人体工学、编译期字符串等。
+
+
+================================================================================
+八、一句话总结
+================================================================================
+AT_DISPATCH_FLOATING_TYPES_AND2(T1, T2, tensor.scalar_type(), "name", lambda)
+  = 一个 switch(scalar_type)，case 覆盖 {double, float, T1, T2}，
+    每个 case 把 scalar_t 设成对应 C++ 类型并执行 lambda，
+    未命中则运行时抛 not_implemented。
+后缀 2 = 在 float/double 之外额外追加的类型数；深度学习里这两个额外类型
+通常就是 at::kHalf 与 at::kBFloat16。
+
+为什么用宏：要把【编译期类型 scalar_t】注入用户代码体，而类型不能当函数参数传
+（变量可 [&] 捕获，类型不行）；现代泛型 lambda 虽能绕过，但宏在人体工学/历史/NAME
+编译期常量上更顺手。性能上宏不比函数快——快是靠"静态多态+内联"，与宏/函数无关。
+
+
+相关文件：
+    docs/c++/macro.txt              —— 第八节同主题；宏是纯文本替换、无类型。
+    docs/c++/generic_lambda.txt     —— 函数版 dispatch（泛型 lambda / C++20 模板 lambda）。
+    docs/c++/static_vs_dynamic_polymorphism.txt —— kernel<scalar_t> 属编译期静态多态。

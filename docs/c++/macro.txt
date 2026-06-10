@@ -1,0 +1,626 @@
+预处理宏 vs 普通变量
+================================================================================
+
+一、处理阶段
+================================================================================
+
+C/C++ 源文件从代码到可执行文件经过四个阶段：
+
+  源文件(.cu/.cpp)
+      │
+      ▼
+  【预处理阶段】← 预处理宏在此处理
+      预处理器（cpp）执行所有 # 指令：
+        #include  → 将头文件内容原样粘贴进来
+        #define   → 注册文本替换规则
+        #ifdef    → 按宏是否存在决定保留哪段代码
+      输出：展开后的纯 C++ 文本，不含任何 # 指令
+      │
+      ▼
+  【编译阶段】← 普通变量在此处理
+      编译器（g++/nvcc）将 C++ 文本翻译为机器指令（.o 目标文件）
+      类型检查、作用域分析、模板实例化均在此阶段
+      │
+      ▼
+  【汇编阶段】
+      汇编器将汇编文本转换为二进制机器码
+      │
+      ▼
+  【链接阶段】
+      链接器合并多个 .o 文件，解析符号地址，生成 .so 或可执行文件
+
+
+二、本质区别
+================================================================================
+
+┌─────────────────┬────────────────────────────┬────────────────────────────┐
+│                 │ 预处理宏 #define            │ 普通变量                   │
+├─────────────────┼────────────────────────────┼────────────────────────────┤
+│ 处理阶段        │ 预处理阶段（编译前）        │ 编译阶段                   │
+│ 有类型吗        │ 没有                        │ 有（int / float / ...）    │
+│ 有内存地址吗    │ 没有                        │ 有                         │
+│ 有作用域吗      │ 没有，定义后全文件可见      │ 有（函数 / 块作用域）      │
+│ 能取地址吗      │ 不能                        │ 能（&var）                 │
+│ 能调试器查看吗  │ 不能（已被替换，不存在了）  │ 能（gdb p var）            │
+│ 本质是什么      │ 预处理器的文本替换规则      │ 编译器管理的具名存储单元   │
+└─────────────────┴────────────────────────────┴────────────────────────────┘
+
+
+三、#define 的工作方式
+================================================================================
+
+#define SOFTMAX_VARIANT 8
+
+  预处理器扫描到这一行时：
+    1. 在符号表中登记：SOFTMAX_VARIANT → 文本 "8"
+    2. 继续扫描后续代码，遇到 SOFTMAX_VARIANT 就原样替换为 8
+
+  编译器看到的是替换后的结果，根本不知道 SOFTMAX_VARIANT 这个名字存在过：
+
+    源码：                         预处理后编译器看到的：
+    ─────────────────────────      ──────────────────────────────────
+    #define SOFTMAX_VARIANT 8      （此行消失）
+    softmax_kernel<SOFTMAX_VARIANT> → softmax_kernel<8>
+    int x = SOFTMAX_VARIANT + 1;  → int x = 8 + 1;
+
+  关键点：
+    - 替换是纯文本操作，不做类型检查
+    - 预处理后宏名消失，调试时无法查询 SOFTMAX_VARIANT 的值
+    - 替换发生在词法层面，不理解 C++ 语义
+
+
+四、#define vs const int
+================================================================================
+
+  #define BLOCK_DIM_Y 1024          // 宏：无类型，文本替换，无地址
+  const int BLOCK_DIM_Y = 1024;     // 常量变量：有类型 int，有地址，有作用域
+
+  两者定义"常量"的效果相似，但：
+    - const int 有类型，编译器能做类型检查和隐式转换检测
+    - const int 有地址，可取地址（&BLOCK_DIM_Y）
+    - const int 有作用域，可放在命名空间 / 函数内部
+    - #define 作用域从定义处到文件末尾（或 #undef），跨越所有函数
+    - #define 可被编译器的 -D 标志从外部覆盖，const int 不能
+
+  现代 C++ 推荐用 constexpr 替代宏常量：
+    constexpr int BLOCK_DIM_Y = 1024;   // 编译期常量，有类型，有作用域
+
+
+五、#ifndef 保护 + 外部覆盖模式
+================================================================================
+
+  本项目 kernels.cu 中的典型写法：
+
+    #ifndef SOFTMAX_VARIANT
+    #define SOFTMAX_VARIANT 8     // 若没有外部传入，使用此默认值
+    #endif
+
+    #ifndef BLOCK_DIM_Y
+    #define BLOCK_DIM_Y 1024
+    #endif
+
+  逻辑：
+    #ifndef SOFTMAX_VARIANT  → "如果 SOFTMAX_VARIANT 还没有被定义"
+    #define SOFTMAX_VARIANT 8 → "则现在定义它为 8"
+    #endif                   → "条件结束"
+
+  若编译器已收到 -DSOFTMAX_VARIANT=6：
+    等价于在文件第一行插入  #define SOFTMAX_VARIANT 6
+    后续 #ifndef SOFTMAX_VARIANT 条件为假（已定义），跳过内部默认值
+    最终使用 6
+
+  若编译器未收到任何 -DSOFTMAX_VARIANT：
+    #ifndef 条件为真（未定义），执行 #define SOFTMAX_VARIANT 8
+    最终使用默认值 8
+
+  优先级总结：
+    编译器 -D（外部传入）  >  #ifndef 保护的默认值
+
+
+六、两个 -D 标志：cmake -D 和 编译器 -D
+================================================================================
+
+  相同写法，不同系统，含义完全不同：
+
+  【cmake -DSOFTMAX_VARIANT=6】
+    - 属于 CMake 变量系统
+    - 作用：在 CMake 配置阶段定义一个名为 SOFTMAX_VARIANT 的 CMake 变量，值为 "6"
+    - 存储：写入 CMakeCache.txt，跨 Reload 持久保存
+    - 此时源代码的 #ifndef 还看不到它，它只是 CMake 的一个字符串变量
+
+  【nvcc/g++ -DSOFTMAX_VARIANT=6】
+    - 属于 C 预处理器系统
+    - 作用：告诉预处理器"在处理源文件前先执行 #define SOFTMAX_VARIANT 6"
+    - 等价于在源文件第一行插入 #define SOFTMAX_VARIANT 6
+    - 此后 #ifndef SOFTMAX_VARIANT 条件为假，跳过默认值
+
+
+  ── 完整流水线（以 cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 为例）──────────
+
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ 阶段一：配置阶段                                                            │
+  │ 触发命令：                                                                  │
+  │   cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512                              │
+  │         -DCMAKE_BUILD_TYPE=Release                                          │
+  │         -DCMAKE_PREFIX_PATH=.venv/lib/.../torch/share/cmake                │
+  │         -DPython3_ROOT_DIR=/home/liam/.../python_venv/.venv                │
+  │         -G Ninja                                                            │
+  │         -S /home/liam/cpp_linux/Fast_Softmax                               │
+  │         -B cmake-build-release                                              │
+  └─────────────────────────────────────────────────────────────────────────────┘
+          │
+          │ cmake 读取 -D 标志，将 CMake 变量写入 CMakeCache.txt：
+          │   SOFTMAX_VARIANT = "6"
+          │   BLOCK_DIM_Y     = "512"
+          │   CMAKE_BUILD_TYPE = "Release"
+          │   CMAKE_PREFIX_PATH = ".venv/.../cmake"
+          │   Python3_ROOT_DIR  = ".venv"
+          │
+          ▼ cmake 开始逐行执行 CMakeLists.txt ───────────────────────────────────
+
+  CMakeLists.txt 命令                      作用（配置阶段执行）
+  ───────────────────────────────────────────────────────────────────────────────
+  set(CMAKE_CUDA_COMPILER "/usr/.../nvcc") 锁定 nvcc 路径，写入 CMakeCache.txt
+  set(CMAKE_CXX_COMPILER  "/usr/bin/g++")  锁定 g++ 路径
+
+  project(Fast_Softmax LANGUAGES CXX CUDA) 探测 g++ / nvcc 可用性，初始化两种语言
+
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)    标记：配置完成后生成 compile_commands.json
+                                           （IDE 用它做头文件跳转）
+
+  find_package(CUDAToolkit REQUIRED)       搜索 CUDA 安装，设置：
+                                             CUDAToolkit_INCLUDE_DIRS = /usr/local/cuda/include
+                                             CUDA::cudart IMPORTED target
+
+  find_package(Python3 REQUIRED            在 -DPython3_ROOT_DIR 指定的 .venv/bin/ 下
+      COMPONENTS Interpreter Development)  找到 python3，设置：
+                                             Python3_EXECUTABLE = .venv/bin/python3
+                                             Python3_INCLUDE_DIRS = .venv/include/python3.13
+
+  execute_process(nvidia-smi ...)          运行 nvidia-smi，得到 _GPU_CC = "8.6"
+  string(REPLACE "." "" ...)               _GPU_CC_NUM = "86"
+
+  set(TORCH_CUDA_ARCH_LIST "8.6")          供 find_package(Torch) 读取 GPU 架构
+  unset(CMAKE_CUDA_ARCHITECTURES CACHE)    清除旧值，避免 PyTorch Warning 2
+
+  find_package(Torch REQUIRED)             从 -DCMAKE_PREFIX_PATH 指定目录读取
+                                           TorchConfig.cmake，设置：
+                                             TORCH_INCLUDE_DIRS   = .venv/.../torch/include
+                                             TORCH_LIBRARIES      = libtorch.so libtorch_cpu.so ...
+                                             TORCH_CXX_FLAGS      = "-D_GLIBCXX_USE_CXX11_ABI=1"
+                                             TORCH_INSTALL_PREFIX = .venv/.../torch
+
+  set(CMAKE_CUDA_ARCHITECTURES 86)         全局 GPU 架构，nvcc 编译时产生：
+                                             -gencode arch=compute_86,code=[sm_86,compute_86]
+
+  find_library(TORCH_PYTHON_LIBRARY ...)   在 TORCH_INSTALL_PREFIX/lib 下找到
+                                           libtorch_python.so，路径存入变量
+
+  check_language(CUDA)                     编译一段最小 CUDA 代码验证 nvcc 正常
+
+  set(CMAKE_CXX_STANDARD 20)              全局 C++20，interface.cpp 继承
+
+  set(SOFTMAX_VARIANT 8 CACHE STRING "")  cache 中已有 "6"（-D 传入），不覆盖
+  set(BLOCK_DIM_Y 1024 CACHE STRING "")   cache 中已有 "512"，不覆盖
+  set(UNROLL_FACTOR 8 CACHE STRING "")    cache 无值，写入默认值 8
+  set(WIDTH 0 CACHE STRING "")            cache 无值，写入默认值 0
+
+  add_compile_options(                     向 build.ninja 写入全局编译标志：
+    -lineinfo                              Release 模式：nvcc -lineinfo
+    --use_fast_math                        Release 模式：nvcc --use_fast_math
+    --ptxas-options=-v                     所有模式：nvcc --ptxas-options=-v
+  )
+
+  separate_arguments(TORCH_CXX_FLAGS_LIST) 将 "-D_GLIBCXX_USE_CXX11_ABI=1" 拆分为 list
+  add_compile_options(${TORCH_CXX_FLAGS_LIST}) 追加到所有文件的编译命令
+
+  aux_source_directory(src/kernels KERNELS) 扫描目录，KERNELS = src/kernels/softmax_kernel.cu
+
+  add_library(softmax_cuda SHARED          注册 target，声明三个源文件：
+      src/interface.cpp                      → 由 g++ 编译
+      src/run_kernels.cu                     → 由 nvcc 编译
+      src/kernels/softmax_kernel.cu)         → 由 nvcc 编译
+
+  execute_process(python3 -c               查询 Python 扩展后缀：
+      "sysconfig.get_config_var(...)")       _PY_EXT_SUFFIX = ".cpython-313-x86_64-linux-gnu.so"
+
+  set_target_properties(softmax_cuda       输出文件名：
+      PREFIX "" SUFFIX ".cpython-...")       softmax_cuda.cpython-313-x86_64-linux-gnu.so
+
+  target_compile_definitions(              ← 关键桥梁：读取 CMake 变量，
+      softmax_cuda PRIVATE                   将其翻译为编译器 -D 标志，写入 build.ninja
+      TORCH_EXTENSION_NAME=softmax_cuda      → -DTORCH_EXTENSION_NAME=softmax_cuda
+      BLOCK_DIM_Y=${BLOCK_DIM_Y}             → -DBLOCK_DIM_Y=512        ← CMake 变量 → 编译器宏
+      UNROLL_FACTOR=${UNROLL_FACTOR}         → -DUNROLL_FACTOR=8
+      SOFTMAX_VARIANT=${SOFTMAX_VARIANT}     → -DSOFTMAX_VARIANT=6      ← CMake 变量 → 编译器宏
+      WIDTH=${WIDTH}                         → -DWIDTH=0
+  )
+
+  target_include_directories(softmax_cuda  写入 -I 标志到 build.ninja：
+      ${CUDAToolkit_INCLUDE_DIRS}            → -I/usr/local/cuda/include
+      ${TORCH_INCLUDE_DIRS}                  → -I.venv/.../torch/include
+      ${Python3_INCLUDE_DIRS}                → -I.venv/include/python3.13
+  )
+
+  target_link_libraries(softmax_cuda       写入链接标志到 build.ninja：
+      CUDA::cudart                           → -lcudart
+      ${TORCH_LIBRARIES}                     → -ltorch -ltorch_cpu -lc10 ...
+      ${TORCH_PYTHON_LIBRARY}                → -ltorch_python
+  )
+
+  set_target_properties(softmax_cuda       写入编译标准到 build.ninja：
+      CXX_STANDARD 20                        → g++ -std=c++20
+      CUDA_STANDARD 20                       → nvcc -std=c++20
+  )
+  ───────────────────────────────────────────────────────────────────────────────
+
+  配置阶段输出（写入 cmake-build-release/ 目录）：
+    CMakeCache.txt          CMake 变量持久化（SOFTMAX_VARIANT=6，BLOCK_DIM_Y=512 ...）
+    build.ninja             完整编译规则，包含所有 -D / -I / -l 标志
+    compile_commands.json   IDE 头文件跳转索引（包含所有 -I 路径）
+
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ 阶段二：编译阶段                                                               │
+  │ 触发命令（二选一，等价）：                                                       │
+  │   ninja -C cmake-build-release softmax_cuda -j 18                           │
+  │   cmake --build cmake-build-release --target softmax_cuda -- -j 18          │
+  └─────────────────────────────────────────────────────────────────────────────┘
+          │
+          │ ninja 读取 build.ninja，并行启动编译任务
+          │
+          ├─ 任务 1：编译 src/interface.cpp ─────────────────────────────────────
+          │
+          │   g++ src/interface.cpp
+          │       -std=c++20
+          │       -I/usr/local/cuda/include
+          │       -I.venv/.../torch/include
+          │       -I.venv/include/python3.13
+          │       -DTORCH_EXTENSION_NAME=softmax_cuda      ← 编译器 -D → 预处理器宏
+          │       -DBLOCK_DIM_Y=512                        ← 编译器 -D → 预处理器宏
+          │       -D_GLIBCXX_USE_CXX11_ABI=1
+          │       -o interface.cpp.o
+          │
+          │   预处理步骤（g++ 内部）：
+          │     -DTORCH_EXTENSION_NAME=softmax_cuda
+          │       等价于在文件顶部插入 #define TORCH_EXTENSION_NAME softmax_cuda
+          │       PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) 展开为
+          │       PYBIND11_MODULE(softmax_cuda, m) → PyInit_softmax_cuda 入口
+          │
+          ├─ 任务 2：编译 src/run_kernels.cu ────────────────────────────────────
+          │
+          │   nvcc src/run_kernels.cu
+          │        -std=c++20
+          │        -gencode arch=compute_86,code=[sm_86,compute_86]
+          │        -I/usr/local/cuda/include
+          │        -I.venv/.../torch/include
+          │        -lineinfo --use_fast_math --ptxas-options=-v
+          │        -DSOFTMAX_VARIANT=6                     ← 编译器 -D → 预处理器宏
+          │        -DBLOCK_DIM_Y=512                       ← 编译器 -D → 预处理器宏
+          │        -DUNROLL_FACTOR=8
+          │        -DWIDTH=0
+          │        -DTORCH_EXTENSION_NAME=softmax_cuda
+          │        -D_GLIBCXX_USE_CXX11_ABI=1
+          │        -o run_kernels.cu.o
+          │
+          │   预处理步骤（nvcc 内部）：
+          │     -DSOFTMAX_VARIANT=6
+          │       等价于在文件顶部插入 #define SOFTMAX_VARIANT 6
+          │       #ifndef SOFTMAX_VARIANT → 已定义，条件为假，跳过 #define SOFTMAX_VARIANT 8
+          │       代码中 softmax_kernel<SOFTMAX_VARIANT> → softmax_kernel<6>
+          │
+          │     -DBLOCK_DIM_Y=512
+          │       等价于插入 #define BLOCK_DIM_Y 512
+          │       #ifndef BLOCK_DIM_Y → 已定义，跳过默认值 1024
+          │       dim3 block_size(1, BLOCK_DIM_Y, 1) → dim3 block_size(1, 512, 1)
+          │
+          │   设备代码编译（nvcc 内部）：
+          │     PTX 生成   → SASS 汇编（sm_86，在本机 GPU 直接执行）
+          │                  PTX 保留（compute_86，嵌入 .o 供未来 GPU JIT 编译）
+          │
+          ├─ 任务 3：编译 src/kernels/softmax_kernel.cu（同任务 2，略）──────────
+          │
+          └─ 链接：所有 .o 就绪后 ────────────────────────────────────────────────
+
+              ld -shared
+                 interface.cpp.o
+                 run_kernels.cu.o
+                 src/kernels/softmax_kernel.cu.o
+                 -lcudart -ltorch -ltorch_cpu -lc10 -ltorch_python ...
+                 -o softmax_cuda.cpython-313-x86_64-linux-gnu.so
+
+  编译阶段输出：
+    cmake-build-release/softmax_cuda.cpython-313-x86_64-linux-gnu.so
+
+  Python 加载：
+    import sys
+    sys.path.insert(0, 'cmake-build-release')
+    import softmax_cuda          # dlopen(softmax_cuda.cpython-313-...so)
+    y = softmax_cuda.softmax_cu(x)
+
+
+七、本项目中的宏列表
+================================================================================
+
+  通过 target_compile_definitions 注入，均可由 cmake -D 从外部覆盖：
+
+  ┌──────────────────────┬──────────────┬──────────────────────────────────────┐
+  │ 宏名                 │ 默认值       │ 用途                                 │
+  ├──────────────────────┼──────────────┼──────────────────────────────────────┤
+  │ SOFTMAX_VARIANT      │ 8            │ 选择 kernel 实现（1~9）              │
+  │ BLOCK_DIM_Y          │ 1024         │ 每 block Y 维线程数，必须是 2 的幂   │
+  │ UNROLL_FACTOR        │ 8            │ 循环展开因子（1/2/4/8）              │
+  │ WIDTH                │ 0            │ 行宽静态提示，0 = 运行时参数决定     │
+  │ TORCH_EXTENSION_NAME │ softmax_cuda │ Python 模块名，PYBIND11_MODULE 使用  │
+  │ _GLIBCXX_USE_CXX11_ABI│ 1           │ GCC ABI 版本，由 TORCH_CXX_FLAGS 注入│
+  └──────────────────────┴──────────────┴──────────────────────────────────────┘
+
+  使用示例（选择 variant=6，block_y=512）：
+    cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 ..
+
+
+八、为什么 AT_DISPATCH_FLOATING_TYPES 必须是宏而非函数
+================================================================================
+
+  AT_DISPATCH_FLOATING_TYPES 展开后的结构（简化）：
+
+    case at::ScalarType::Float: {
+        using scalar_t = float;        // ← 宏注入的类型别名
+        softmax_kernel<scalar_t><<<...>>>(x.data_ptr<scalar_t>(), ...);  // ← lambda 体原样内联
+    }
+
+  核心问题：using scalar_t = float 是编译期的类型别名，不是运行时值：
+    - 没有内存地址，无法被 lambda [&] 捕获
+    - 只存在于当前词法作用域（{}块）内
+    - lambda 体和 using 声明必须在同一 {} 块内，scalar_t 才可见
+
+  若改为函数：
+
+    void dispatch(std::function<void()> fn) {
+        using scalar_t = float;    // 定义在函数体内
+        fn();                      // fn 是另一个函数，scalar_t 对 fn 不可见
+    }
+    dispatch([&]{ softmax_kernel<scalar_t><<<...>>>(...); });
+    //                            ^ 编译错误：scalar_t 未定义
+
+  只有宏（预处理器文本替换）才能将 using scalar_t = float 和调用代码
+  放入同一个词法作用域，这是 AT_DISPATCH 必须是宏的根本原因。
+
+  详细说明见：docs/AT_DISPATCH_FLOATING_TYPES.txt 【3.2 scalar_t 的可见性】
+
+
+九、宏的参数没有编译期常量限制
+================================================================================
+
+  【结论】宏的参数可以是任何文本，无类型、无编译期要求。
+
+  宏是预处理器的纯文本替换，不解析参数的类型或值，
+  只把参数原样贴入展开结果，编译器之后才看到替换结果：
+
+    #define PRINT(x) std::cout << x
+
+    PRINT(42);               // → std::cout << 42;           整数字面量
+    PRINT(a + b);            // → std::cout << a + b;        表达式
+    PRINT(x.scalar_type());  // → std::cout << x.scalar_type();  运行时函数调用
+    PRINT("hello");          // → std::cout << "hello";      字符串
+    PRINT(float);            // → std::cout << float;        类型名
+
+  预处理器看到 PRINT(x.scalar_type()) 时，不知道也不关心
+  x.scalar_type() 是什么，直接把它当字符串贴进去。
+
+  AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), ...) 就是这个原理：
+    x.scalar_type() 是运行时函数调用，但宏展开时只是文本替换，
+    最终贴进 switch (x.scalar_type()) 里，由编译器处理运行时求值。
+
+  【需要编译期常量的是模板参数和数组大小，不是宏参数】
+
+    template<int N> void foo();
+    foo<42>();          // 合法：42 是编译期常量
+    foo<x.size()>;      // 编译错误：运行时值不能做模板参数
+
+    int arr[8];         // 合法：8 是编译期常量
+    int arr[x.size()];  // 编译错误（C++ 标准不允许 VLA，变长数组）
+
+  三者对比：
+
+  ┌──────────────┬──────────────────────────────┬───────────────────────┐
+  │              │ 能否接受运行时值              │ 原因                  │
+  ├──────────────┼──────────────────────────────┼───────────────────────┤
+  │ 宏参数       │ 能                           │ 纯文本替换，不做解析  │
+  │ 模板参数     │ 不能（需编译期常量）         │ 编译器实例化需确定值  │
+  │ 数组大小     │ 不能（需编译期常量）         │ 栈帧大小编译期确定    │
+  └──────────────┴──────────────────────────────┴───────────────────────┘
+
+
+十、无值宏：只定义不赋值
+================================================================================
+
+  【结论】宏可以只定义不赋值，这是 C/C++ 预处理器的正常用法，
+         专门用于"存在性"判断，当编译开关/标志位使用。
+
+  两种宏定义方式
+  ──────────────────────────────────────────────────────────────────────────────
+
+  # 方式一：只定义，无值
+  target_compile_definitions(my_target PRIVATE USE_CUDA)
+  → 编译命令写入 build.ninja：  -DUSE_CUDA
+  → 等价于在源文件顶部插入：   #define USE_CUDA
+  → 宏的"替换文本"为空
+
+  # 方式二：定义并赋值
+  target_compile_definitions(my_target PRIVATE TORCH_TARGET_VERSION=0x020A...)
+  → 编译命令写入 build.ninja：  -DTORCH_TARGET_VERSION=0x020A...
+  → 等价于在源文件顶部插入：   #define TORCH_TARGET_VERSION 0x020A...
+  → 宏的"替换文本"为 0x020A...
+
+  无值宏的用途：只做"存在性"判断
+  ──────────────────────────────────────────────────────────────────────────────
+
+  USE_CUDA 这类宏作为开关/标志位，代码只关心它"有没有被定义"，不关心它的值：
+
+    #ifdef USE_CUDA              // 只问"USE_CUDA 定义了吗？"，不看值
+        cudaGetDevice(&device);
+    #elif defined(USE_ROCM)
+        hipGetDevice(&device);
+    #endif
+
+  配套的预处理指令均为判断存在性，不涉及值：
+
+    #ifdef USE_CUDA          // 定义了 → 条件为真
+    #ifndef USE_CUDA         // 没定义 → 条件为真
+    #if defined(USE_CUDA)    // 定义了 → 条件为真（等价于 #ifdef，但可组合）
+    #if defined(USE_CUDA) && defined(USE_NCCL)   // 多条件组合时常用此形式
+
+  有值宏 vs 无值宏的对比
+  ──────────────────────────────────────────────────────────────────────────────
+
+    // 无值宏：当布尔开关，只配合 #ifdef 使用
+    #define USE_CUDA
+    #ifdef USE_CUDA          // 走这里 → 编译 CUDA 路径
+
+    // 有值宏：当常量，可参与运算或比较
+    #define TORCH_TARGET_VERSION 0x020A000000000000ULL
+    #if TORCH_TARGET_VERSION >= 0x0209...   // 比较数值，选择 API 版本
+        ...
+    #endif
+
+  ┌──────────────────┬─────────────────────────────┬─────────────────────────┐
+  │                  │ 无值宏                       │ 有值宏                  │
+  ├──────────────────┼─────────────────────────────┼─────────────────────────┤
+  │ CMake 写法       │ PRIVATE USE_CUDA             │ PRIVATE VERSION=0x020A  │
+  │ 编译命令         │ -DUSE_CUDA                   │ -DVERSION=0x020A        │
+  │ 替换文本         │ 空                           │ 0x020A                  │
+  │ 配套指令         │ #ifdef / #ifndef             │ #if 值比较              │
+  │ 典型用途         │ 后端开关、功能开关           │ 版本号、阈值常量        │
+  └──────────────────┴─────────────────────────────┴─────────────────────────┘
+
+  注意：无值宏的"值"是空，不能当普通常量用
+  ──────────────────────────────────────────────────────────────────────────────
+
+    #define USE_CUDA
+    int x = USE_CUDA;        // 展开成：int x = ;  → 编译错误！
+
+    // 无值宏只能配合 #ifdef / #if defined() 使用，不能参与运算或赋值
+
+  若想让宏有默认值 1（更明确的 true 语义）：
+    target_compile_definitions(my_target PRIVATE USE_CUDA=1)   # -DUSE_CUDA=1
+
+    // 此时两种写法都能判断：
+    #ifdef USE_CUDA         // 有没有定义 → true
+    #if USE_CUDA            // 值是否非零 → true（1 非零）
+    // 但 vLLM/PyTorch 传统只用 #ifdef，所以无值写法更简洁
+
+  对比 vLLM / PyTorch 中的几个宏
+  ──────────────────────────────────────────────────────────────────────────────
+
+    target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
+    # → -DUSE_CUDA（无值，开关），代码用 #ifdef USE_CUDA 判断是否编译 CUDA 后端
+
+    target_compile_definitions(_C_stable_libtorch PRIVATE TORCH_TARGET_VERSION=0x020A...)
+    # → -DTORCH_TARGET_VERSION=0x020A...（有值），代码用 #if 比较版本号选 API
+
+    target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+    # → -DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1（有值 1，也当开关用，=1 更明确）
+
+  总结：-DUSE_CUDA 是光秃秃的无值宏，"被定义"这一事实本身就是其全部信息，
+        供代码用 #ifdef USE_CUDA 判断当前编译的是 CUDA 后端。无值是 C/C++
+        条件编译开关的标准写法，不需要赋值。
+
+
+十一、宏的【参数没有类型】：纯文本替换的本质与四个后果
+================================================================================
+
+  【结论】对，宏（#define）的参数【没有类型】。因为宏是预处理器的【纯文本(token)
+         替换】，在编译【之前】完成，根本不参与 C++ 类型系统——参数只是"文本占位符"。
+
+  （第九节讲的是"宏参数能接收运行时值"，本节聚焦"无类型"这一本质本身及其后果。）
+
+  本质：参数 = 文本占位符
+  ──────────────────────────────────────────────────────────────────────────────
+
+    #define SQUARE(x) ((x) * (x))
+
+  这里的 x 【不是 int、不是任何类型】，只是个名字，代表"调用时填进来的那段文本"。
+  预处理器看到 SQUARE(a + 1)，做的只是把 x 这段文本【原样替换】成 a + 1：
+
+    SQUARE(a + 1)   →   ((a + 1) * (a + 1))
+
+  它不检查 a + 1 是什么类型、能不能相乘、合不合法——这些【到编译阶段】（替换之后）
+  才由编译器判断。
+
+
+  ── 后果 1：参数能接收"任何东西"，包括【类型名】本身 ─────────────────────────
+
+  正因没类型约束，宏参数可以是值、表达式、【类型】、甚至代码片段。本仓库的 X-macro
+  （见 x_macro_scalartype_enum.txt）正是利用这点：
+
+    #define DEFINE_ST_ENUM_VAL_(_1, n) n,
+    //                          ↑ _1 接收的是 "uint8_t" "double" 这种【类型名文本】
+    //                            普通函数参数做不到——函数参数必须是某具体类型的值
+
+  _1 接 double / at::Half 这种【类型名】，n 接 Double / Half 这种【枚举名】。
+  函数参数永远无法"把类型名当参数传"，宏可以，因为它只是文本。
+
+
+  ── 后果 2：必须给参数加括号（无类型 → 无优先级保护）─────────────────────────
+
+  函数调用 f(a + 1) 会先把 a + 1 算成一个值再传进去；宏是文本替换，【不会】先算：
+
+    #define BAD(x)  x * x
+    BAD(a + 1)   →   a + 1 * a + 1        // 变成 a + (1*a) + 1，完全错了！
+
+    #define SQUARE(x) ((x) * (x))         // 给每个参数和整体都加括号
+    SQUARE(a + 1) →  ((a + 1) * (a + 1))  // ✅ 正确
+
+  这是宏"无类型、纯文本"最经典的坑。
+
+
+  ── 后果 3：参数可能被【多次求值】──────────────────────────────────────────
+
+  文本替换会把参数【重复展开】，参数有副作用就出事：
+
+    #define MAX(a, b) ((a) > (b) ? (a) : (b))
+    MAX(i++, j)   →   ((i++) > (j) ? (i++) : (j))   // i++ 可能执行两次！
+
+  函数 max(i++, j) 没有这个问题（实参先求值一次）。
+  本仓库 AT_DISPATCH_SWITCH 里写 `const auto& the_type = TYPE;` 先把 TYPE 存一次再用，
+  正是为了【避免宏参数 TYPE 被多次求值】（见 AT_DISPATCH_FLOATING_TYPES_AND2.txt 的 D6）。
+
+
+  ── 后果 4：没有类型检查，错误推迟到编译期、信息更差 ───────────────────────
+
+    SQUARE("hello")  →  (("hello") * ("hello"))   // 预处理器照样替换，不报错
+                                                  // 编译器才报"字符串不能相乘"
+
+  宏自己不挡，错误要等替换完由编译器发现，报错位置/信息往往更难懂。
+
+
+  宏 vs 模板 / inline 函数（这正是分界线）
+  ──────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────────────┬──────────────────────┬──────────────────────────────┐
+  │                  │ 宏 #define           │ 模板 / inline 函数           │
+  ├──────────────────┼──────────────────────┼──────────────────────────────┤
+  │ 工作阶段         │ 预处理（编译前）     │ 编译期                       │
+  │ 参数             │ 无类型，纯文本       │ 有类型（模板有类型参数但仍   │
+  │                  │                      │ 受类型系统约束）             │
+  │ 类型检查         │ 无                   │ 有                           │
+  │ 能否传"类型名"   │ 能                   │ 模板用 typename T 能，函数不能│
+  │ 括号 / 多次求值坑│ 有                   │ 无                           │
+  └──────────────────┴──────────────────────┴──────────────────────────────┘
+
+  现代 C++ 建议：能用模板 / inline constexpr 函数就【别用宏】——它们有类型安全、
+  无重复求值坑。宏只在"需要操作类型名、生成代码、字符串化(#)、拼接标识符(##)"这类
+  函数/模板【做不到】的场景才用（如本仓库的 X-macro、AT_DISPATCH_*）。
+
+
+  一句话总结
+  ──────────────────────────────────────────────────────────────────────────────
+  宏参数【没有类型】，因为宏是预处理器的【纯文本替换】，编译前完成、不参与类型系统。
+  好处：能接收类型名/代码片段（X-macro 靠这个）；代价：无类型检查、要小心加括号、
+  防多次求值。能用模板/inline 函数替代时优先用后者，宏留给"操作文本/类型名/拼接"
+  这类它独有的活。
+
+
+相关文件：
+    docs/c++/x_macro_scalartype_enum.txt          —— 宏参数接收"类型名"的实例。
+    docs/c++/AT_DISPATCH_FLOATING_TYPES_AND2.txt   —— D6 用 the_type 缓存避免 TYPE 多次求值。

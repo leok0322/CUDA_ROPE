@@ -1,0 +1,290 @@
+================================================================================
+静态多态 vs 动态多态：模板 / CRTP 与虚函数的区别、用法与对比
+================================================================================
+
+本文件涵盖：
+  一、两类多态的概念（绑定时机）
+  二、动态多态（虚函数 + vtable）回顾
+  三、静态多态的实现：模板、CRTP
+  四、核心区别对比表
+  五、选用原则
+  六、CRTP 专题 1：为什么 area() 引用 Circle 时不会"用到未定义的 Circle"
+       —— 模板成员函数体的延迟实例化
+  七、CRTP 专题 2：既然基类只是转发，为什么还要继承？直接写 struct 不行吗？
+       —— CRTP 的真正价值是"共享骨架代码复用 + 静态契约"
+
+
+================================================================================
+一、什么是多态：按绑定时机分两类
+================================================================================
+
+多态 = 同一段调用代码，对不同类型表现出不同行为。按"决定调哪个函数"的时机分：
+
+  静态多态（static / compile-time，早绑定）
+      编译期就决定调用哪个函数。靠【模板、函数重载、CRTP、if constexpr】实现。
+
+  动态多态（dynamic / runtime，晚绑定）
+      运行期才决定。靠【虚函数 + vtable】实现。
+
+  CUDA/高性能场景几乎都用静态多态：虚函数在 device 上代价高、还有 vtable 跨设备
+  问题，所以 kernel 普遍用 template<typename T> 而非虚函数。
+  （本项目 AT_DISPATCH_FLOATING_TYPES_AND2 + template<typename scalar_t> 即静态多态：
+    编译期为每种 dtype 实例化一份 kernel。）
+
+
+================================================================================
+二、动态多态（虚函数）回顾
+================================================================================
+
+    struct Shape {
+        virtual double area() const = 0;     // 虚函数
+        virtual ~Shape() = default;
+    };
+    struct Circle : Shape {
+        double r;
+        double area() const override { return 3.14159 * r * r; }
+    };
+    struct Square : Shape {
+        double s;
+        double area() const override { return s * s; }
+    };
+
+    double total(const std::vector<Shape*>& shapes) {
+        double sum = 0;
+        for (auto* p : shapes)
+            sum += p->area();   // 运行期通过 vtable 找到真实类型的 area
+        return sum;
+    }
+
+  p->area() 处编译器不知道 p 实际指向 Circle 还是 Square；运行期每次调用查对象里的
+  vptr → vtable → 函数地址 → 跳转。这是运行期（晚）绑定。
+  代价：每次调用一次间接寻址、通常无法内联；每个对象多一个 vptr（8 字节）。
+  好处：一个 Shape* 运行期可指向任意派生类，可把异构对象放进同一容器统一处理。
+
+
+================================================================================
+三、静态多态的实现
+================================================================================
+
+(1) 模板（最常见）—— 隐式接口 / 鸭子类型，无需继承
+--------------------------------------------------------------------------------
+
+    struct Circle { double r; double area() const { return 3.14159 * r * r; } };
+    struct Square { double s; double area() const { return s * s; } };
+    // 没有共同基类，没有 virtual
+
+    template <typename T>
+    double describe(const T& shape) {
+        return shape.area();    // 编译期就知道 T 是谁，直接调对应 area
+    }
+
+    describe(Circle{2.0});      // 实例化 describe<Circle> → 直接调 Circle::area
+    describe(Square{3.0});      // 实例化 describe<Square> → 直接调 Square::area
+
+  shape.area() 在编译期绑定到具体类型的 area，无 vtable、无运行期查找、可内联。
+  约束只是"该类型有一个能调的 area()"——隐式接口，不需要继承。
+
+
+(2) CRTP（Curiously Recurring Template Pattern，奇异递归模板模式）
+--------------------------------------------------------------------------------
+想要"基类定共同接口/骨架、派生类填实现"这种虚函数式结构，又不要运行期开销时用它。
+特征：基类是模板，派生类继承时把【自己】作为模板实参传进去。
+
+    template <typename Derived>
+    struct Shape {
+        double area() const {
+            // 静态分派：把 this 转成派生类型，调它的 areaImpl —— 编译期绑定
+            return static_cast<const Derived*>(this)->areaImpl();
+        }
+    };
+    struct Circle : Shape<Circle> {        // ★ 基类的模板参数就是自己
+        double r;
+        double areaImpl() const { return 3.14159 * r * r; }
+    };
+    struct Square : Shape<Square> {
+        double s;
+        double areaImpl() const { return s * s; }
+    };
+
+  Shape<Derived>::area 把 this 静态转成 Derived* 调 areaImpl —— 编译期解析，
+  效果像虚函数（基类统一入口、派生类各自实现），但零运行期开销、可内联。
+  代价：失去"用一个 Shape* 装不同派生对象、放进同一容器"的能力（类型编译期定死）。
+
+  ⚠️ 注意：上面这个 area 只是"转发去调 areaImpl"，本身是【退化】示例，仅演示语法；
+     这种情况其实直接在 Circle 里写 area 就够，不需要 CRTP。CRTP 的真正价值见第七节。
+
+
+================================================================================
+四、核心区别对比表
+================================================================================
+
+  ┌──────────────────┬───────────────────────────┬───────────────────────────┐
+  │ 维度             │ 静态多态（模板 / CRTP）   │ 动态多态（虚函数）        │
+  ├──────────────────┼───────────────────────────┼───────────────────────────┤
+  │ 绑定时机         │ 编译期（早绑定）          │ 运行期（晚绑定）          │
+  │ 实现机制         │ 模板实例化 / CRTP cast    │ vtable + vptr 间接跳转     │
+  │ 运行期开销       │ 无，且可内联              │ 每次调用一次间接寻址      │
+  │ 对象内存         │ 无额外开销                │ 每对象多一个 vptr(8B)     │
+  │ 接口约束         │ 隐式（鸭子类型）          │ 显式（继承基类 + override)│
+  │ 运行期换类型     │ 不能（类型编译期定死）    │ 能（Base* 可指任意派生）  │
+  │ 异构容器         │ 不行                      │ 行（vector<Base*>）       │
+  │ 代码膨胀         │ 每类型一份实例 → 变大     │ 一份代码，所有类型共用    │
+  │ 错误提示         │ 模板报错冗长难读          │ 较清晰                    │
+  │ 编译依赖         │ 实现通常要放头文件        │ 声明/实现可分离           │
+  └──────────────────┴───────────────────────────┴───────────────────────────┘
+
+
+================================================================================
+五、选用原则
+================================================================================
+
+  用静态多态（模板 / CRTP），当：
+    - 类型编译期已知（绝大多数算法、容器、数值计算）。
+    - 性能敏感、要内联、要避免 vtable 间接跳转 —— CUDA device 代码尤其如此。
+    - 接口是"有某个成员/操作"即可，不必强制继承。
+
+  用动态多态（虚函数），当：
+    - 类型运行期才确定（插件、按配置/输入选实现、工厂模式）。
+    - 需要把不同类型对象放进同一个容器统一处理（异构集合）。
+    - 想要稳定接口边界、分离编译、控制二进制体积。
+
+  口诀：类型编译期已知、要性能 → 模板；类型运行期才定、要灵活 → 虚函数。
+
+
+================================================================================
+六、CRTP 专题 1：基类 area() 引用 Circle，为什么不是"用到未定义的 Circle"？
+================================================================================
+
+疑问：解析到 `struct Circle : Shape<Circle>` 时 Circle 还没定义完，而 Shape<Circle>
+      的 area() 里 static_cast<const Circle*>(...) 用到了 Circle，这不会出错吗？
+
+不会。关键：【模板成员函数体是"延迟实例化(lazy instantiation)"的】—— area() 的
+函数体不在"Circle 还没定义完"时编译，而是等到【真正调用 area() 时】才编译，那时
+Circle 已是完整类型。
+
+编译器处理顺序：
+
+  第1步：要把 Shape<Circle> 当基类，须先实例化类模板 Shape<Circle>。
+         但标准规定：实例化类模板时，只实例化成员函数的【声明】，不实例化【函数体】
+         （[temp.inst]，on-demand 实例化）。于是此刻只生成：
+             struct Shape<Circle> { double area() const; };   // 只要声明
+
+  第2步：声明 `double area() const;` 不含 Circle（返回 double、无参），所以即便此刻
+         Circle 不完整也没问题。
+
+  第3步：继续解析 Circle 的 double r; double areaImpl();，到 } 时 Circle 变完整。
+
+  第4步：程序某处真正调用 c.area() —— 此时才实例化 area() 的【函数体】：
+             return static_cast<const Circle*>(this)->areaImpl();
+         此刻 Circle 早已完整，cast 与 areaImpl() 都合法 → 没有"调用未定义的 Circle"。
+
+  时间线：
+      "struct Circle : Shape<Circle>"
+            └─ 实例化 Shape<Circle> ── 只要成员【声明】(不含 Circle，OK)
+                  └─ Circle 此刻不完整，但没人碰 area() 函数体 → 无碍
+                        └─ 解析到 Circle 的 } ── Circle 变【完整】
+                              └─ 某处调用 c.area() ── 此刻才实例化 area() 函数体
+                                    （body 用到 Circle，而 Circle 已完整 ✅）
+
+  核心一句：依赖 Circle【完整性】的代码（函数体）被推迟到 Circle 已完整之后才实例化。
+
+  反例：若在基类里【立即】用到 Derived 的完整性（不是放在延迟的函数体里），就会
+        真的报错，因为类实例化阶段 Derived 还不完整：
+
+            template <typename Derived>
+            struct Shape {
+                Derived d;                              // ❌ 数据成员：需 Derived 完整
+                static constexpr int n = sizeof(Derived);// ❌ sizeof 需完整类型
+                using X = typename Derived::Foo;        // ❌ 类作用域立即用 Derived 成员
+            };
+
+  规律：CRTP 中对 Derived 成员/完整性的依赖，必须写在【成员函数体】（或默认实参、
+        decltype 等延迟语境）里，不能写在【随类立即实例化】的位置（数据成员、基类
+        列表、sizeof、类作用域的 using / static 初始化等）。
+        area() 把 static_cast<Derived*> 放在函数体内，正好在"延迟"这一侧，故安全。
+
+
+================================================================================
+七、CRTP 专题 2：既然基类只是转发，为什么还要继承？直接写 struct 不行吗？
+================================================================================
+
+诚实地说：若基类的 area() 只是转发去调 areaImpl()（第三节那个退化示例），继承确实
+【多余】—— 直接在 Circle 里写 area() 更简单。
+
+CRTP 的真正价值不在"转发一个函数"，而在：
+    基类持有一份【用派生类原语拼出来的、可复用的骨架代码】，继承把这份代码注入
+    每个派生类；派生类只实现少数几个原语，就白白获得整套功能 —— 即【代码复用】。
+
+能体现价值的例子：比较运算符（CRTP 最经典用途）
+--------------------------------------------------------------------------------
+很多类要支持 == != < > <= >= 六个运算符。没 CRTP 就得在【每个类】写全 6 个。
+用 CRTP，派生运算符只在基类写【一次】：
+
+    template <typename Derived>
+    struct Comparable {
+        // 下面 4 个全部用 Derived 的 == 和 < 拼出来，写一次
+        bool operator!=(const Derived& o) const {
+            return !static_cast<const Derived&>(*this).operator==(o);
+        }
+        bool operator>(const Derived& o) const {
+            return o < static_cast<const Derived&>(*this);
+        }
+        bool operator<=(const Derived& o) const {
+            return !(o < static_cast<const Derived&>(*this));
+        }
+        bool operator>=(const Derived& o) const {
+            return !(static_cast<const Derived&>(*this) < o);
+        }
+    };
+
+    struct Money : Comparable<Money> {
+        int cents;
+        bool operator==(const Money& o) const { return cents == o.cents; } // 只写 2 个
+        bool operator<(const Money& o)  const { return cents <  o.cents; }
+        // != > <= >= 四个【白送】，无需重写
+    };
+    struct Date : Comparable<Date> {
+        int y, m, d;
+        bool operator==(const Date& o) const { return y==o.y && m==o.m && d==o.d; }
+        bool operator<(const Date& o)  const { /* ... */ }
+        // 同样白送 4 个
+    };
+
+  Money / Date 各只写 2 个原语，却都得到 6 个运算符：共享逻辑在基类写一份，而不是
+  每个类抄一遍。这就是"为什么要继承"——继承是把那份复用代码【注入】各派生类的手段。
+
+  对比：
+      ❌ 不用 CRTP：Money、Date 及未来每个类都重复手写 != > <= >=
+      ✅ 用 CRTP：派生运算符基类写一次，派生类各写 2 个原语即可
+
+为什么用 CRTP 继承而非"虚函数基类"做复用
+--------------------------------------------------------------------------------
+  1. 零运行期开销：基类调 static_cast<Derived&>(*this).operator==() 是编译期绑定、
+     可内联；虚函数每次走 vtable。
+  2. 参数类型精确为 Derived：operator<(const Derived&) 直接拿到派生类型；虚函数基类
+     只能用 const Base&，实现里还得 dynamic_cast 回去。
+  3. 对象不需 vptr，无额外内存。
+
+CRTP 的第二个用途：给模板一个"共同上层类型"做静态契约
+--------------------------------------------------------------------------------
+    template <typename T>
+    void sort_and_print(std::vector<T>& v) {
+        static_assert(std::is_base_of_v<Comparable<T>, T>);  // 要求 T 是 Comparable 派生
+        // ... 可放心用 < > 等
+    }
+  继承 Comparable<T> 在此充当编译期标记/契约，让泛型代码能要求"该类型确实提供了比较
+  能力"。
+
+小结
+--------------------------------------------------------------------------------
+  若基类无共享逻辑，CRTP 的继承确实多余（退化的 area 例子就是）。CRTP 真正意义是：
+  基类持有"用派生类原语拼出的可复用骨架"，继承把它注入每个派生类；派生类只实现少数
+  原语（==、<、areaImpl…）即获得整套功能，且全程编译期绑定、零运行期开销。
+  这里的继承不是为了多态调用，而是为了【复用 + 静态契约】。
+
+
+相关文件：
+    docs/c++/constexpr_function_and_if_constexpr.txt   —— if constexpr 也是一种
+        编译期分支选择，可视作"静态多态"的一种轻量形式。
+    docs/c++/AT_DISPATCH_FLOATING_TYPES_AND2.txt       —— 本项目用 template<scalar_t>
+        做 dtype 静态多态（编译期为每种 dtype 实例化一份 kernel）。
