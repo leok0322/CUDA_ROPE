@@ -1,0 +1,206 @@
+================================================================================
+QKV 输入布局：扁平变长(ragged 2D) vs 填充批次(padded 4D)
+——两种主流格式的形状、优缺点、采用框架，以及本项目的选择
+================================================================================
+
+  目录：
+    一、两种格式总览
+    二、格式 A：填充批次 [batch, seq_len, num_heads, head_dim]（4D）
+    三、格式 B：扁平变长 [num_tokens, H*head_dim]（ragged 2D，本项目采用）
+    四、关键区别：乘法 ≠ padding
+    五、num_tokens 与 positions 的构造（本项目实现）
+    六、各框架采用情况
+    七、优缺点对照表
+    八、本项目为何选 ragged 2D
+    九、小结
+
+
+================================================================================
+一、两种格式总览
+================================================================================
+
+  Transformer 的注意力输入(Q/K/V)在工程上有两类主流内存布局，区别只在于
+  「batch 与 seq_len 是否被显式保留、是否需要 padding 对齐」：
+
+    格式 A（padded 4D）  : [batch, seq_len, num_heads, head_dim]
+                           显式保留 batch 与 seq_len，短序列补齐到 max_seq_len。
+                           训练 / HuggingFace 建模代码主流。
+
+    格式 B（ragged 2D）  : [num_tokens, (Hq+Hk+Hv)*head_dim]
+                           把 batch 与各序列长度拍平成一个 token 维，无 padding。
+                           推理引擎(vLLM / SGLang / TensorRT-LLM)主流。
+
+  两者描述的是同一批数据，只是「要不要为对齐而填充」不同。本项目的 CUDA RoPE
+  融合算子面向推理场景，采用格式 B。
+
+
+================================================================================
+二、格式 A：填充批次 [batch, seq_len, num_heads, head_dim]（4D）
+================================================================================
+
+  含义：
+    batch      = 一个 batch 内的序列条数
+    seq_len    = 统一对齐后的序列长度，通常取 max_seq_len（最长序列长度）
+    num_heads  = 注意力头数
+    head_dim   = 每个头的特征维（RMSNorm / RoPE 作用维）
+
+  token 总数 = batch * seq_len，其中包含【padding token】：
+
+      实际序列   : [t0, t1, t2]               长度 3
+      对齐到 max=5: [t0, t1, t2, PAD, PAD]     补 2 个填充位
+
+  padding 的代价：
+    - 算力浪费：PAD 位也参与矩阵乘 / norm / rope，结果被丢弃。
+    - 显存浪费：按 max_seq_len 分配，短序列占用同样大小。
+    - batch 内长度差越大，浪费越严重（长尾序列拉高 max）。
+
+  优点：
+    - 形状规整、逻辑直观，batch / seq 维显式存在，便于教学与训练实现。
+    - 反向传播、mask、相对位置等在规整张量上更易表达。
+
+
+================================================================================
+三、格式 B：扁平变长 [num_tokens, H*head_dim]（ragged 2D，本项目采用）
+================================================================================
+
+  含义：
+    num_tokens = 一个 batch 内【所有序列真实长度之和】（不含任何 padding）
+    H          = Hq + Hk + Hv（合并 qkv 后的总头数）
+    每个 token 行内按 [Q 头… | K 头… | V 头…] 连续排布（fused-QKV 布局）
+
+  把变长的多条序列首尾相接，拍平成一个 token 维：
+
+      序列0(len=3): t00 t01 t02
+      序列1(len=5): t10 t11 t12 t13 t14
+      拼接(ragged): [t00 t01 t02 t10 t11 t12 t13 t14]   num_tokens = 3+5 = 8
+
+  无 padding：每一行都是真实 token，全部参与有效计算。
+  序列边界由额外的元信息标记（positions / cu_seqlens / seq_lens），而非 padding。
+
+  最后一维 H*head_dim 的合并 qkv 布局，对应一次 QKV projection 的输出直接喂入，
+  省去 split；vLLM 的 QKVParallelLinear 输出即此形状。
+
+
+================================================================================
+四、关键区别：乘法 ≠ padding
+================================================================================
+
+  常见误解：「num_tokens = batch * token_size 仍是乘法，不也得 padding 吗？」
+
+  不对。padding 浪费只发生在【短序列被补齐到 max_seq_len】这一动作，补出来的
+  位置是假 token。而乘法本身不产生 padding：
+
+    - 若所有序列【等长】token_size，则 sum(各序列长度) 恰好 = 条数 * token_size，
+      乘法只是「等长求和」的快捷写法，每个 token 仍真实，无 padding。
+    - 若序列【变长】(ragged)，长度不等，只能用 sum() 逐条相加，无法用乘法。
+
+  对照：
+
+    场景                    num_tokens 怎么来          有无 padding
+    ----------------------  -------------------------  -----------------------
+    padded 4D 训练          batch * max_seq_len        有，短序列补到 max
+    ragged 2D 推理(等长特例) sum = 条数 * token_size    无，每 token 真实
+    ragged 2D 推理(变长)     sum(各序列真实长度)         无，每 token 真实
+
+  结论：ragged 格式「省 padding」的优势只有在【序列变长】时才体现；等长只是它的
+  一个特例，看起来像 4D 的乘法，但 token_size 是【真实长度】而非【max 上限】，
+  二者意义不同。
+
+
+================================================================================
+五、num_tokens 与 positions 的构造（本项目实现）
+================================================================================
+
+  配置（config.yaml）：
+    token_size: [4, 4]        # 每条序列的真实 token 数列表(ragged)；条目数=序列条数
+                              # 可写 [3, 5, 2] 等任意变长；已移除单独的 batch 字段
+
+  Runner.__init__：
+    self.token_size = list(token_size)
+    self.num_tokens = sum(self.token_size)              # 逐条真实相加，无 padding
+    assert max(self.token_size) <= self.max_position    # 任一序列不得超过 cache 行数
+
+  util.make_inputs_qkv（造测试输入）：
+    num_tokens = sum(token_size)
+    qkv = randn(num_tokens, H*head_dim)
+    # positions：各序列各自 arange(len)，按序列顺序拼接
+    positions = cat([arange(n) for n in token_size])
+
+  示例：
+    token_size = [3, 5]
+      num_tokens = 8
+      positions  = [0,1,2,  0,1,2,3,4]    ← 每条序列各自从 0 重新计位
+
+  RoPE 的 cos/sin 据 positions 从 cache gather 出 [num_tokens, half]（方案 A：
+  gather 在算子外、即 model.forward 内完成，融合算子只接收已 gather 的 cos/sin）。
+
+  越界保护：positions 含每条序列的 0..len-1，故 max(token_size) 必须 <=
+  max_token_size（cos/sin cache 的行数 max_position），否则 cache[positions] 越界。
+
+
+================================================================================
+六、各框架采用情况
+================================================================================
+
+  padded 4D [batch, seq_len, num_heads, head_dim]：
+    - HuggingFace Transformers 的 modeling_*.py（训练 + 朴素推理）
+    - 绝大多数训练框架的默认布局
+    - 教学 / 论文参考实现
+
+  ragged 2D [num_tokens, H*head_dim]（flatten，无 padding）：
+    - vLLM            ← continuous batching，输入即拍平的 num_tokens
+    - SGLang          ← 同样 ragged，配 cu_seqlens
+    - TensorRT-LLM    ← packed / remove-padding 模式
+    - FlashAttention  ← varlen 接口(flash_attn_varlen_*)用 cu_seqlens 表达边界
+
+  边界元信息的两种常见表达：
+    - positions  : 每个 token 在其所属序列中的位置（RoPE 用），本项目采用。
+    - cu_seqlens : 前缀和数组 [0, len0, len0+len1, ...]，标记每条序列的起止
+                   （attention kernel 常用）。
+  二者可并存：positions 供 RoPE 计角度，cu_seqlens 供 attention 限定范围。
+
+
+================================================================================
+七、优缺点对照表
+================================================================================
+
+    维度              padded 4D                 ragged 2D（本项目）
+    ----------------  ------------------------  ----------------------------
+    形状              [B, S, H, hd]             [num_tokens, H*hd]
+    num_tokens        B * max_seq_len           sum(各序列真实长度)
+    padding           有（补到 max_seq_len）     无
+    算力/显存          长度差大时浪费严重         无浪费，逐 token 真实
+    序列边界           靠 padding + attn mask     靠 positions / cu_seqlens
+    实现直观度         高（batch/seq 显式）       中（需元信息还原边界）
+    典型场景           训练、HF 建模              推理引擎、融合 kernel
+    变长支持           需 padding 才能 batch      天然支持（首尾相接）
+
+
+================================================================================
+八、本项目为何选 ragged 2D
+================================================================================
+
+  1. 面向推理融合算子：贴近 vLLM / SGLang 真实输入约定，kernel 可直接对接。
+  2. 无 padding 浪费：每个 token 都真实参与，吞吐与显存利用率更高。
+  3. 与 fused-QKV 配套：最后一维 [Q|K|V] 合并布局对应一次 projection 输出。
+  4. RoPE 友好：positions 直接索引 cos/sin cache，gather 留在算子外（方案 A），
+     融合算子只收已 gather 的 [num_tokens, half]，pattern 边界清晰。
+  5. 变长可测：token_size 改为列表后，可用 [3,5,2] 等真实变长输入验证 kernel，
+     而非只测等长合成数据。
+
+  reshape 提示：kernel / forward 内部会把 [num_tokens, H*hd] view 成
+  [num_tokens, H, head_dim] 按头索引——这只是 view，不是另一种存储格式，
+  内存仍是连续的扁平 2D，索引为 token*H*head_dim + head*head_dim + d。
+
+
+================================================================================
+九、小结
+================================================================================
+
+  - 两种布局描述同一数据，差异在「是否为对齐而 padding」。
+  - padded 4D：训练/HF 主流，规整但有 padding 浪费。
+  - ragged 2D：推理引擎主流，无 padding，靠 positions/cu_seqlens 标记边界。
+  - num_tokens = sum(各序列真实长度)，乘法只是等长特例，乘法本身不产生 padding。
+  - 本项目采用 ragged 2D + fused-QKV + 方案 A 的 RoPE，token_size 用列表表达
+    变长序列；num_tokens=sum(token_size)，positions 按各序列 arange 拼接。
+  - 越界约束：max(token_size) <= max_token_size（cos/sin cache 行数）。

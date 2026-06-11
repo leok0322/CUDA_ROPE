@@ -3,19 +3,22 @@ import os
 import torch
 import yaml
 
-# YAML 里 dtype 是字符串，这里映射到真正的 torch.dtype
-_DTYPE_MAP = {
-    "float32": torch.float32, "float": torch.float32,
-    "float16": torch.float16, "half": torch.float16,
-    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-}
+
+def _build_dtype_map(raw_map):
+    """把 YAML 里的 dtype_map（别名 -> torch dtype 名字符串）解析成 别名 -> torch.dtype。
+
+    YAML 存不了 torch.float32 这类对象，故配置里存的是属性名字符串（如 "float32"），
+    这里逐项 getattr(torch, 名) 还原成真正的 torch.dtype；键统一小写，便于大小写不敏感查表。
+    """
+    return {str(k).lower(): getattr(torch, str(v)) for k, v in raw_map.items()}
 
 
 def load_config(path=None):
     """读取 YAML 配置文件，返回可直接 Runner(**cfg) 展开的配置字典。
 
-    path 缺省为本文件同目录下的 config/config.yaml。dtype 字段是字符串，经 _DTYPE_MAP
-    映射到 torch.dtype；device 为 null 时保留 None，交给 Runner.__init__ 自动选。
+    path 缺省为本文件同目录下的 config/config.yaml。dtype 字段是字符串，经 YAML 里的
+    dtype_map（_build_dtype_map 解析）映射到 torch.dtype；device 为 null 时保留 None，
+    交给 Runner.__init__ 自动选。
     放在 util(而非 Runner.classmethod)里：避免 util 反向 import Runner 造成循环导入，
     故只负责"解析配置"，构造 Runner 留给调用方。
     """
@@ -29,9 +32,10 @@ def load_config(path=None):
     model_arch = raw.get("model_arch", {}) or {}
     cfg = {**run_params, **model_arch}
     # 仅当对应键存在时才做类型转换（缺省则交给 Runner.__init__ 的默认值）
-    # dtype 字符串 → torch.dtype
+    # dtype 字符串 → torch.dtype：映射表 dtype_map 也来自 YAML（顶层键），不再写死在代码里
     if "dtype" in cfg:
-        cfg["dtype"] = _DTYPE_MAP[str(cfg["dtype"]).lower()]
+        dtype_map = _build_dtype_map(raw.get("dtype_map", {}) or {})
+        cfg["dtype"] = dtype_map[str(cfg["dtype"]).lower()]
     # eps/base 显式转 float（防止 YAML 把它们写成字符串时出错）
     if "eps" in cfg:
         cfg["eps"] = float(cfg["eps"])
@@ -62,6 +66,12 @@ def build_cos_sin_cache(max_position, rotary_dim, base=10000.0,
              cache[:, :half] = cos，cache[:, half:] = sin
     """
     assert rotary_dim % 2 == 0, "rotary_dim 必须为偶数"
+    # ★ 中间全程用 float32 计算，最后一步才 cast 到目标 dtype（return 的 cache.to(dtype)）。
+    #   不能用参数 dtype 算 arange/幂/三角：低精度会坏精度甚至坏正确性——
+    #   - positions=arange(max_position)：fp16 连续整数仅精确到 2048、bf16 仅到 256，
+    #     max_position 一大(如 4096)，position 被量化、角度 pos*inv_freq 全错(eager 也错)；
+    #   - inv_freq 跨 ~4 个数量级、cos/sin 角度大，低精度有效位不够，误差被放大。
+    #   这也是 HF/vLLM 的标准做法：cache 在 fp32 上构造，仅最终结果转模型精度。
     # 频率 inv_freq[i] = 1 / base^(2i/rotary_dim)，长度 half = rotary_dim/2
     inv_freq = 1.0 / (
         base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
@@ -75,15 +85,21 @@ def build_cos_sin_cache(max_position, rotary_dim, base=10000.0,
     return cache.to(dtype)
 
 
-def make_inputs_qkv(seed, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
-                    device, dtype, token_size, batch):
+def make_inputs_qkv(seed, num_heads_q, num_heads_k, num_heads_v, head_dim,
+                    device, dtype, token_size):
     """合并 qkv 输入: [num_tokens, (Hq+Hk+Hv)*head_dim]，及每 token 的 position。
-    每 token 内按 [Q 头…|K 头…|V 头…] 连续排布(与 FusedQKVNormRope / 真实 kernel 一致)。"""
+    每 token 内按 [Q 头…|K 头…|V 头…] 连续排布(与 FusedQKVNormRope / 真实 kernel 一致)。
+
+    token_size: 每条序列的【真实 token 数】列表(ragged，变长)。
+      num_tokens = sum(token_size)，逐条真实相加、无 padding(取代旧的 batch*token_size)。
+      positions = 把各序列各自的 arange(len) 按顺序拼接 → [num_tokens]，
+                  例 token_size=[3,5] → positions=[0,1,2, 0,1,2,3,4]。"""
     torch.manual_seed(seed)
     total = num_heads_q + num_heads_k + num_heads_v
+    num_tokens = sum(token_size)
     qkv = torch.randn(num_tokens, total * head_dim, device=device, dtype=dtype)
-    # 每条序列各自 0..token_size-1 的位置，再按 batch 拼接 → [num_tokens]
-    positions = torch.arange(token_size, device=device).repeat(batch)
+    # 变长(ragged)：每条序列各自 0..len-1，按序列顺序拼接成 [num_tokens]，无 padding
+    positions = torch.cat([torch.arange(n, device=device) for n in token_size])
     return qkv, positions
 
 

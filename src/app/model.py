@@ -27,7 +27,10 @@ class FusedQKVNormRope(nn.Module):
       （与 src/inference/fused_qknorm_rope_kernel.cu 的 qkv 布局一致）。
     - 仅 Q、K 头做 RMSNorm(QK-Norm) + RoPE；V 头原样透传。
     - Q、K 各用一份独立的 γ：q_weight / k_weight（均 [head_dim]）。
-    forward(qkv, positions)：positions 缺省 arange(num_tokens)。
+    forward(qkv, positions)：positions 为【必传】的每 token 位置 [num_tokens]。
+      （由调用方/Runner 构造并经 _validate_inputs 校验非空；不再内部 arange 兜底，
+        既避免重复，又让 positions 在编译图里始终是干净的输入节点——便于 RoPE
+        子图把 cos/sin gather 纳入 pattern 时稳定匹配。）
     """
 
     def __init__(self, num_heads_q, num_heads_k, num_heads_v, head_dim,
@@ -90,7 +93,7 @@ class FusedQKVNormRope(nn.Module):
         rot = util.rope_pure(rot, cos, sin, self.interleave)
         return torch.cat([rot, pass_through], dim=-1)
 
-    def forward(self, qkv, positions=None):
+    def forward(self, qkv, positions):
         Hq, Hk, Hv = self.num_heads_q, self.num_heads_k, self.num_heads_v
         H = Hq + Hk + Hv
         num_tokens = qkv.shape[0]
@@ -104,8 +107,8 @@ class FusedQKVNormRope(nn.Module):
         v_pass = v[:, Hq + Hk:]             # [num_tokens, Hv, head_dim] —— 透传
 
         # 2) 取 cos/sin（gather 在此处、即 op 外完成 → 方案 A）
-        if positions is None:
-            positions = torch.arange(num_tokens, device=qkv.device)
+        # positions 必传（由 Runner._validate_inputs 保证非空）：不再 arange 兜底，
+        #   既去掉死代码，又让 positions 在编译图里保持为干净的输入节点。
         cos = self.cos_sin_cache[positions, :self.half].to(qkv.dtype)   # [num_tokens, half]
         sin = self.cos_sin_cache[positions, self.half:].to(qkv.dtype)
 

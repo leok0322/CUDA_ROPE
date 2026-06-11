@@ -67,13 +67,14 @@ except ImportError:
 class Runner:
     """封装 FusedQKVNormRope 的 eager 运行与 torch.compile 融合替换全流程。"""
 
-    def __init__(self, batch=2, token_size=4, head_dim=128,
+    def __init__(self, token_size=(4, 4), head_dim=128,
                  eps=1e-6, base=10000.0, max_token_size=4096, device=None, dtype=torch.float32,
                  seed=0, interleave=False,
                  num_heads_q=8, num_heads_k=8, num_heads_v=8):
         # ---- 配置 ----
-        self.batch = batch
-        self.token_size = token_size
+        # token_size：每条序列的【真实 token 数】列表(ragged，变长)。不再有单独的 batch——
+        #   序列条数 = len(token_size)，每条长度可不同；num_tokens 由各条真实长度求和而来(无 padding)。
+        self.token_size = list(token_size)
         self.head_dim = head_dim          # = 最后一维（RMSNorm/RoPE 作用维），须为偶数
         self.eps = eps
         self.base = base
@@ -93,12 +94,17 @@ class Runner:
         #   - "cuda" if cond else "cpu"：三元表达式，is_available() 探测本机有无可用 GPU。
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 把 (batch, token) 折叠成一个 token 维 → 与 CUDA kernel 的
-        # [num_tokens, num_heads, head_dim] 对齐
-        self.num_tokens = batch * token_size
+        # num_tokens = 各序列真实长度之和(ragged 拍平成一个 token 维，无 padding) → 与 CUDA
+        # kernel 的 [num_tokens, num_heads, head_dim] 对齐。等长是这里的特例，不再写死乘法。
+        self.num_tokens = sum(self.token_size)
         self.half = head_dim // 2
         # 模型的上下文最大token
         self.max_position = max_token_size
+        # 边界校验：任一序列长度都不得超过 cos/sin cache 的行数上限(max_position)，
+        # 否则 model.forward 里 cos_sin_cache[positions] 会越界(positions 含 0..len-1)。
+        assert max(self.token_size) <= self.max_position, (
+            f"序列最长 {max(self.token_size)} 超过 max_token_size={self.max_position}，"
+            f"cos/sin cache 行数不足，positions 会越界")
 
         # ---- 运行期状态（惰性构建）----
         self.model = None
@@ -134,7 +140,7 @@ class Runner:
         with torch.no_grad():                 # 只前向，不反向
             y_ref = self.model(x, positions)
         print(f"[eager] x: {tuple(x.shape)} -> y: {tuple(y_ref.shape)}  "
-              f"(num_tokens={self.num_tokens}=batch*token_size)")
+              f"(num_tokens={self.num_tokens}=sum(token_size={self.token_size}))")
         return y_ref
 
     # ------------------------------------------- 第 5 步：torch.compile 执行
@@ -194,19 +200,31 @@ if __name__ == "__main__":
     # 从 config.yaml 读取配置(util.load_config 已把 dtype 字符串映射成 torch.dtype)
     cfg = util.load_config()
     runner = Runner(**cfg)                     # 配置键与 Runner.__init__ 形参一一对应
-    # 用 runner 自身的配置造【合并 qkv】输入，避免与 YAML 不一致
+    # 造【合并 qkv】测试输入。一律从 runner 的属性取参(而非再读一遍 cfg/YAML)：
+    # Runner.__init__ 已把 YAML 配置落成实例属性，并据此推导出 num_tokens=sum(token_size)，
+    # 这里复用同一份属性，保证输入规格与模型/编译期(example_inputs)用的是【同一套配置】，不漂移。
+    # 返回：
+    #   x         = 合并 qkv，形状 [num_tokens, (Hq+Hk+Hv)*head_dim]，每 token 内 [Q…|K…|V…] 连续
+    #   positions = 每 token 的 RoPE 位置 [num_tokens]：每条序列各自 0..len-1，按序列顺序拼接(ragged)
+    # token_size(各序列真实长度列表)既定 qkv 的行数(求和)，又定 positions 的分段，故直接传它。
     x, positions = util.make_inputs_qkv(
-        runner.seed, runner.num_tokens, runner.num_heads_q, runner.num_heads_k,
+        runner.seed, runner.num_heads_q, runner.num_heads_k,
         runner.num_heads_v, runner.head_dim, runner.device, runner.dtype,
-        runner.token_size, runner.batch,
+        runner.token_size,
     )
     y, y_ref = runner.run(x, positions)        # run 内部已跑 eager，统一返回 (y, y_ref)
     # 用 allclose 比对 compiled 输出与 eager 参考输出是否一致
     if y is not None:
         # allclose 逐元素判 |y_ref - y| <= atol + rtol*|y|，全部满足才返回 True：
-        #   atol(绝对容差)主导接近 0 的值；rtol(相对容差)按量级放宽、主导大数值。
-        #   两者结合覆盖全量级。这里设 1e-3 是较宽松的千分级容差，容忍融合 kernel 与
-        #   eager 在浮点累加顺序/实现/精度上的微小偏差(右边的 |y| 用第二参数 y，不对称)。
+        #   ★【绝对+相对一起看】：atol(绝对容差)与 rtol*|y|(相对容差)相加，每个元素落进二者中较宽松
+        #     的那个即放行。为何两个都要：一个张量里各元素量级不同——
+        #       · |y| 接近 0：rtol*|y|→0，靠 atol 兜底(否则近 0 值微小偏差→相对误差炸，全过不了)；
+        #       · |y| 很大：rtol*|y| >> atol，靠 rtol 主导(大值绝对偏差天然大，按百分比衡量才合理)。
+        #     ⟹ 相加即覆盖全量级。交叉点 atol=rtol*|y| → |y|=atol/rtol=1：|y|<1 实为绝对判据、
+        #       |y|>1 实为相对(千分之一)判据。
+        #   这里设 1e-3 是较宽松的千分级容差，容忍融合 kernel 与 eager 在浮点累加顺序/实现/精度上的
+        #   微小偏差(右边的 |y| 用第二参数 y，故 allclose(a,b)≠allclose(b,a)，不对称)。
+        #   (绝对 vs 相对误差、为何按量级选，详见 docs/algorithm/float_binary_representation.txt 八点五)
         same = torch.allclose(y_ref, y, atol=1e-3, rtol=1e-3)
         print(f"[compiled] 与 eager 是否一致(allclose): {same}")
     else:
