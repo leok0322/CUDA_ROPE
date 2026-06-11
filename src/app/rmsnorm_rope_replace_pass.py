@@ -100,16 +100,17 @@ class RMSNormRoPEreplacePass:
         是【配置常量/可从形状推】，不进 pattern，作为常量从 self 读出、烤进【算子调用实参】：
 
             op(qkv, q_weight, k_weight, cos, sin, num_heads_q, num_heads_k, num_heads_v,
-               head_dim, eps)
+               head_dim, rotary_dim, eps)
 
         is_neox/interleave 不作为算子入参，而是【在 Runner 里按其值选不同的算子】
         (Runner 据 interleave 传入不同的 op_name)，此处只按 op_name 解析出对应算子。
 
         ★ 依赖：interface.cpp 里对应算子的 schema 需为
-           <op_name>(Tensor qkv, Tensor q_weight, Tensor k_weight, Tensor cos, Tensor sin,
+           <op_name>(Tensor(a!) qkv, Tensor q_weight, Tensor k_weight, Tensor cos, Tensor sin,
                      int num_heads_q, int num_heads_k, int num_heads_v,
-                     int head_dim, float eps) -> Tensor
-           且 neox / interleave 各注册一个算子；否则此调用会 schema 不匹配。"""
+                     int head_dim, int rotary_dim, float eps) -> ()
+           且 neox / interleave 各注册一个算子；否则此调用会 schema 不匹配。
+           (rotary_dim：旋转维度<=head_dim，kernel 据此算 half=rotary_dim/2、定旋转/透传区。)"""
         op = self._resolve_op()
         # 前 5 个是【张量通配符】(matcher 绑定)，后 5 个是【常量】(从 self 烤入)：
         #   qkv      : [num_tokens, (Hq+Hk+Hv)*head_dim]   合并 qkv，每 token 内 [Q…|K…|V…]
@@ -118,10 +119,11 @@ class RMSNormRoPEreplacePass:
         #   cos      : [num_tokens, rotary_dim//2]         已 gather(方案 A)
         #   sin      : [num_tokens, rotary_dim//2]
         #   num_heads_q/k/v, head_dim : int 常量(切 Q/K/V、定形状)
+        #   rotary_dim : int 常量(旋转维度<=head_dim；kernel 据此算 half、定旋转/透传区)
         #   eps      : float 常量(RMSNorm 数值稳定项)
         op(qkv, q_weight, k_weight, cos, sin,          # [nt,H*hd] [hd] [hd] [nt,r/2] [nt,r/2]
                 self.num_heads_q, self.num_heads_k, self.num_heads_v,  # int Hq, Hk, Hv
-                self.head_dim, self.eps)                    # int head_dim, float eps
+                self.head_dim, self.rotary_dim, self.eps)   # int head_dim, int rotary_dim, float eps
         return qkv
 
     # --------------------------------- 本算子的 fake/meta（随 op 语义而定，注入给 Installer 注册）

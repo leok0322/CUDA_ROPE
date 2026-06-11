@@ -23,7 +23,7 @@ void fused_QKNorm_and_ROPE_interleave(
     const at::Tensor& cos,            // [num_tokens, rotary_dim/2]  已 gather
     const at::Tensor& sin,            // [num_tokens, rotary_dim/2]
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
-    int64_t head_dim, double eps);
+    int64_t head_dim, int64_t rotary_dim, double eps);  // rotary_dim: 旋转维度(<=head_dim)，half=rotary_dim/2
 
 // CUDA 后端封装函数：算子分发到 CUDA 时实际执行它，内部转调真正的 kernel 入口。
 // 形参类型必须与 schema 对应(见下方“schema 类型 ↔ C++ 类型”说明)：
@@ -36,11 +36,11 @@ void run_fused_QKNorm_and_ROPE_cuda_interleave(
     at::Tensor qkv, at::Tensor q_weight, at::Tensor k_weight,
     at::Tensor cos, at::Tensor sin,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
-    int64_t head_dim, double eps) {
+    int64_t head_dim, int64_t rotary_dim, double eps) {
     // ★ 必须把【全部参数转发】给真正的 kernel，否则 kernel 收不到数据、什么也算不了。
     fused_QKNorm_and_ROPE_interleave(qkv, q_weight, k_weight, cos, sin,
                                      num_heads_q, num_heads_k, num_heads_v,
-                                     head_dim, eps);
+                                     head_dim, rotary_dim, eps);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ TORCH_LIBRARY(ROPE_cuda, m) {   // ROPE_cuda = 命名空间(namespace)
     //     否则 _resolve_op 的 getattr 找不到 → AttributeError。
     m.def("fused_qkv_norm_rope_interleave(Tensor(a!) qkv, Tensor q_weight, Tensor k_weight, "
           "Tensor cos, Tensor sin, int num_heads_q, int num_heads_k, int num_heads_v, "
-          "int head_dim, float eps) -> ()");
+          "int head_dim, int rotary_dim, float eps) -> ()");
     // 注：neox 风格需另注册一个 fused_qkv_norm_rope_neox(签名相同)，由 Runner 据 interleave 选用。
 }
 
