@@ -30,62 +30,731 @@ register_replacement 的工作流程：
 
 
 ================================================================================
-二、为什么不能直接用 model._apply_rope 当 search_fn
+二、search_fn / replace_fn 的【通用规则】(vLLM 与本项目都适用)
 ================================================================================
 
-技术上可以“复用 model 的代码”，但【不能直接拿 _apply_rope 顶替 search_fn】，原因：
+register_replacement(search_fn, replace_fn, example_inputs, fwd_only, pm_pass) 要求：
 
-(1) 签名 / 覆盖范围对不上（最硬的障碍）
-    - 融合算子 replace_fn(x, weight, cos, sin) 一次吃掉【RMSNorm + RoPE】整段，
-      需要 weight、cos、sin 三个张量作为输入。
-    - register_replacement 要求 search 和 replace 【输入签名一致】：matcher 匹配到
-      pattern 后，会把“绑定到的那几个节点”按位置传给 replace_fn。
-    - 而 model._apply_rope(self, x, cos, sin) 只做 RoPE 的一半：
-        * 不含 RMSNorm；
-        * 不接收 weight。
-      用它，匹配到的子图缺了 RMSNorm 那段，与算子语义对不上；签名也不符。
+(1) 两个函数【都必须 return】，且【返回值的个数/结构一致】。
+    - 返回值 = pattern 的“输出锚点”：matcher 据此定位“替换谁的输出”，并把原来用
+      search 输出的下游节点改接到 replace 的输出。
+    - 不 return → 没有输出节点 → 匹配/替换都无从谈起。
+    - 这条与“模型函数式还是 custom op”无关，谁都要 return。
 
-(2) _apply_rope 里有 pattern 不想要的额外算子
-        rot = x[..., :self.rotary_dim]          # slice（在链路内部）
-        pass_through = x[..., self.rotary_dim:] # slice
-        return torch.cat([rot, pass_through], dim=-1)  # cat
-    即便 rotary_dim==head_dim 让 pass_through 为空、cat 成 no-op，这些 slice/cat
-    仍会出现在 trace 的图里。pattern 按结构精确匹配，链路内部多余节点会让匹配更脆/失败。
+(2) “void”指的是【算子(op)的 C++ 签名 -> ()】，不是函数。
+    - void in-place 算子也要在函数里把被改写的张量交出去：op(qkv,…); return qkv。
+    - 函数本身永远不是 void。
 
-(3) search_fn 会被 trace 成 pattern，最好是“输入清晰的纯函数”
-    - matcher 期望输入就是那几个张量参数(x,weight,cos,sin)，好把图里对应张量绑定上去。
-    - _apply_rope 是绑定方法，闭包 self；其参数表(x,cos,sin)与算子入参表(x,weight,cos,sin)
-      不是一回事。让“待匹配模板”依赖一个活的模块实例及其状态，不如自洽小函数清晰可控。
+(3) 张量入参 = pattern 的【通配符】(matcher 绑定)；标量/int(num_heads/head_dim/eps)
+    是【常量】，不进 pattern，由 replace_fn 从 self 烤进算子调用实参。
 
-(4) 职责解耦
-    - model.py：人读的、可训练的 eager 参考实现（带 pass_through、interleave 完整分支等）。
-    - search_fn：喂给 matcher 的【规范化匹配模式】，只保留要融合的核心算子序列。
-    - 让 pattern 直接依赖 model 内部方法 → 强耦合：model 内部重构可能悄悄破坏匹配。
+(4) search_fn 必须复刻【模型图里那段】的形态(本项目复用 util.rms_norm_pure/rope_pure，
+    与 FusedQKVNormRope.forward 逐步同构，避免漂移)。
 
-(5) 代价：另写一份有“重复/漂移”风险
-    - search_fn 必须和 model.py 的数学保持同步，否则 model 改了、pattern 没改 → 匹配不上。
+================================================================================
+一·案：方案 A / 方案 B 的子图对照（search_fn 形参、example_inputs、replace_fn 入参）
+================================================================================
 
-正确的“复用”姿势 —— 把核心数学抽成【不依赖 self 的纯函数】，两边共用：
-    def rmsnorm_rope_neox(x, weight, cos, sin, eps):
-        xf = x.float()
-        xn = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype) * weight
-        c2 = torch.cat([cos[:,None,:], cos[:,None,:]], -1)
-        s2 = torch.cat([sin[:,None,:], sin[:,None,:]], -1)
-        return xn * c2 + rotate_half(xn) * s2
-    - model.forward：自己查好 cos/sin，再调 rmsnorm_rope_neox(x, self.weight, cos, sin, self.eps)
+把贯穿全文的【方案 A(gather 在 op 外)】与【方案 B(gather 进 op)】落到代码：同一段
+QK-Norm+RoPE，唯一差别是【cos/sin 的 gather(cos_sin_cache[positions]) 放在子图外还是子图内】。
+形态为合并 qkv(FusedQKVNormRope)：qkv[num_tokens,(Hq+Hk+Hv)*head_dim]，仅 Q/K 处理、V 透传、
+Q/K 分离权重。两方案共同点：num_heads_q/k/v、head_dim、eps、half 都是【标量常量】(烤死)；
+张量才作形参(通配符)；replace_fn 形参恒与 search_fn 一致；输出形状与输入 qkv 等价。
+
+────────────────────────────────────────────────────────────────────────────
+方案 A：gather 在 op 外（本仓库当前实现）—— 形参【不含】positions、cos_sin_cache
+────────────────────────────────────────────────────────────────────────────
+子图【不含】cache 索引；cos/sin 是【已 gather 好的、每 token 一行】([num_tokens, half])，作为
+形参传入。下面这两行在 model.forward 里、即【子图外】完成，不进 search_fn：
+    cos = self.cos_sin_cache[positions, :self.half].to(qkv.dtype)   # [num_tokens, half]
+    sin = self.cos_sin_cache[positions, self.half:].to(qkv.dtype)
+
+  (1) search_fn 形参 = 张量通配符(5 个)：(qkv, q_weight, k_weight, cos, sin)
+      def search_fn(self, qkv, q_weight, k_weight, cos, sin):
+          # view→切 Q/K/V → Q/K 各自 RMSNorm(分离权重) → 前 rotary_dim 维 RoPE → V 透传 → cat→reshape
+          # 【不含】cos_sin_cache[positions] 的 gather；cos/sin 直接是入参
+          ...
+      ⟹ 形参【不含】positions、cos_sin_cache。
+
+  (2) example_inputs(5 个张量，与 5 个形参一一对应)：
+      qkv      : randn[num_tokens, (Hq+Hk+Hv)*head_dim]
+      q_weight : randn[head_dim]
+      k_weight : randn[head_dim]
+      cos      : randn[num_tokens, half]        # 【已 gather】的形态
+      sin      : randn[num_tokens, half]
+      全用 qkv 的 dtype；无需 positions(整数张量)、无需 max_position / rotary_dim。
+
+  (3) replace_fn 入参(与 search_fn 一致的 5 个通配符)，内部调 op 时再烤入标量常量：
+      def replace_fn(self, qkv, q_weight, k_weight, cos, sin):
+          op(qkv, q_weight, k_weight, cos, sin,                      # 5 个张量通配符
+             self.num_heads_q, self.num_heads_k, self.num_heads_v,   # 标量常量(从 self 烤入)
+             self.head_dim, self.eps)
+          return qkv
+      op schema：
+          op(Tensor qkv, Tensor q_weight, Tensor k_weight, Tensor cos, Tensor sin,
+             int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps) -> ()
+      ⟹ op【不需要】positions、不需要完整 cache(查表已在 op 外做完)，只吃现成 cos/sin。
+
+  (4) 为什么 forward 里 gather 夹在子图代码【中间】也不影响匹配？(常见疑问)
+      model.forward 的写法是：
+          # step1: v = qkv.view(...); q=v[:,:Hq]; k=v[:,Hq:Hq+Hk]; v_pass=v[:,Hq+Hk:]   ← 在子图内
+          # step2: cos = cos_sin_cache[positions,:half].to(...); sin = ...[half:].to(...) ← gather
+          # step3: q=_qk_norm_rope(q,q_weight,cos,sin); k=_qk_norm_rope(k,k_weight,cos,sin) ← 在子图内
+      gather(step2) 在源码里【夹在 step1 与 step3 之间】，但不影响匹配，两层原因：
+      (a) 代码不是图：matcher 匹配的是【FX 数据流图】，图按【数据依赖】构建、【不按源码行号】。
+          图里其实是两条【并行的上游分支】，谁先写、夹在哪儿都生成同一张图：
+              分支甲: qkv ─view─► v ─slice─► q, k, v_pass          (step1，【在子图内】)
+              分支乙: cache, positions ─gather─► cos, sin           (step2，【在子图外】)
+                                  q,k ┐  cos,sin ┘ → _qk_norm_rope → cat → reshape  (step3，在子图内)
+          把 step2 挪到 step1 前或 step3 后，生成的图完全相同。
+      (b) gather 在子图外、cos/sin 是子图的【输入边界通配符】：本方案通配符 = (qkv,q_weight,
+          k_weight,cos,sin)。matcher 走到 cos/sin 这两个通配符就停了——把它们【绑定到“图里产出
+          cos/sin 的节点”(即 gather 的输出)】，但【不往上游看 gather 怎么算】。所以 gather(连同
+          cache 索引、.to)是子图【上游】，落在匹配区域【之外】。
+      ⟹ 精确措辞：不是“cos/sin 不在子图中”，而是【cos/sin 是子图输入边界上的通配符，产生它们的
+         gather 在子图外】。只要 gather 产出的 cos/sin 形态对，它写在哪、长什么样都不影响 step1+
+         step3 这张子图的匹配——这正是方案 A “gather 留 op 外、边界卡在已 gather 的 cos/sin 上”。
+
+────────────────────────────────────────────────────────────────────────────
+方案 B：gather 进 op（cache 索引纳入子图）—— 形参【含】cos_sin_cache、positions
+────────────────────────────────────────────────────────────────────────────
+子图【含】cache 索引；不再传已 gather 的 cos/sin，而是把【完整 cos_sin_cache + positions】作为
+形参，把 gather 写进 search_fn(将来在 kernel 内部完成)。注意 self.cos_sin_cache 必须改成形参
+cos_sin_cache(否则被烤成常量、绑不了也传不出，见 (G))：
+    cos = cos_sin_cache[positions, :self.half].to(qkv.dtype)   # ← 去掉 self.，cache/positions 是形参
+    sin = cos_sin_cache[positions, self.half:].to(qkv.dtype)
+
+  (1) search_fn 形参 = 张量通配符(5 个)：(qkv, q_weight, k_weight, cos_sin_cache, positions)
+      def search_fn(self, qkv, q_weight, k_weight, cos_sin_cache, positions):
+          cos = cos_sin_cache[positions, :self.half].to(qkv.dtype)   # gather 纳入子图
+          sin = cos_sin_cache[positions, self.half:].to(qkv.dtype)
+          # 之后同样 view→切 Q/K/V → RMSNorm → RoPE → V 透传 → cat→reshape
+          ...
+      ⟹ 形参【含】cos_sin_cache、positions；【不再含】已 gather 的 cos、sin。
+
+  (2) example_inputs(5 个张量；cos_sin_cache 与 positions 取代了 cos/sin)：
+      qkv           : randn[num_tokens, (Hq+Hk+Hv)*head_dim]
+      q_weight      : randn[head_dim]
+      k_weight      : randn[head_dim]
+      cos_sin_cache : randn[max_position, rotary_dim]                     # 完整表，dtype 同 qkv
+      positions     : randint(0, max_position, [num_tokens], dtype=long)  # ★整数、合法行号
+      ★ 关键差异：positions 必须是【long 整数张量、取值 ∈ [0, max_position)】，不能 randn(否则
+        cache[positions] trace 不出正确 index 算子)；且 make_example_inputs 需额外拿到 max_position、
+        rotary_dim 来造 cache。
+
+  (3) replace_fn 入参(与 search_fn 一致的 5 个通配符)，内部调 op 烤入标量：
+      def replace_fn(self, qkv, q_weight, k_weight, cos_sin_cache, positions):
+          op(qkv, q_weight, k_weight, cos_sin_cache, positions,      # 5 个通配符(含 cache、positions)
+             self.num_heads_q, self.num_heads_k, self.num_heads_v,   # 标量常量
+             self.head_dim, self.eps)
+          return qkv
+      op schema：
+          op(Tensor qkv, Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, Tensor positions,
+             int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps) -> ()
+      ⟹ kernel 内部按 cos_sin_cache + positions[token]*rotary_dim 取行(gather 在 kernel 内)。
+
+────────────────────────────────────────────────────────────────────────────
+对照表
+────────────────────────────────────────────────────────────────────────────
+  项               方案 A(gather 在 op 外)            方案 B(gather 进 op)
+  ---------------  --------------------------------  ------------------------------------------
+  gather 位置       model.forward(子图外)             search_fn / kernel(子图内)
+  search_fn 形参    qkv,q_weight,k_weight,cos,sin     qkv,q_weight,k_weight,cos_sin_cache,positions
+  子图含 index 吗   否(只逐点 + view/slice/cat)        是(含 aten.index 的 gather)
+  example_inputs   cos/sin = randn[num_tokens,half]  cos_sin_cache=randn[max_pos,rotary_dim]
+                                                     positions=randint long[num_tokens]
+  replace_fn 入参   (...,cos,sin)                     (...,cos_sin_cache,positions)
+  op schema 张量    Tensor cos, Tensor sin            Tensor cos_sin_cache, Tensor positions
+  匹配稳定性        高(逐点为主)                       低(gather 受动态形状/降级形态影响)
+  共同(烤死的标量)  num_heads_q/k/v、head_dim、eps、half；replace_fn 形参恒同 search_fn；输出≡qkv
+
+────────────────────────────────────────────────────────────────────────────
+优缺点权衡
+────────────────────────────────────────────────────────────────────────────
+  方案 A(gather 在 op 外)：
+    + 优点：子图匹配【更鲁棒】——pattern 只含逐点(RMSNorm+RoPE 数学)+ view/slice/cat，不含
+            gather，静态/动态形状下降级形态一致，稳定命中(见 一·补 (B)/(D))。
+    - 缺点：gather 单独成一个算子 → 【一次额外 kernel 发射】 + cos/sin 的【HBM 二次搬运】
+            (gather 把 [num_tokens,half] 写回 HBM，融合 kernel 再读回来)。但量小(cos/sin 远
+            小于 qkv)、且 cos/sin 可跨层复用，代价通常可接受。
+
+  方案 B(gather 进 op)：
+    + 优点：把上面那【一次额外 kernel 发射 + HBM 二次搬运】去掉——kernel 直接按 positions 索引
+            cos_sin_cache，省掉中间 [num_tokens,half] 的写回与读回。
+    - 缺点：gather 纳入子图后【匹配脆弱】——aten.index 的降级形态受静态/动态形状、周边规范化/
+            CSE 影响，静态针易与动态草堆失配(见 一·补 (B)/(D))；常需 dynamic=False 兜底，又招致
+            重编译爆炸(见 一·补 (D))。
+
+  ⟹ 权衡：A 用【小而可接受的 HBM/launch 代价】换【匹配鲁棒】；B 用【匹配脆弱 + 编译代价】
+     换【省掉那次 HBM 二次搬运(二阶收益)】。本仓库取 A。若确需 B 的 HBM 收益，更稳的是学 vLLM
+     【直接调用】融合算子而非子图匹配(见 一·补 (D) 的 vLLM 补充)。
+
+────────────────────────────────────────────────────────────────────────────
+附：rotary_dim 等常量随 config 变时，针/草堆为何仍一致(本仓库机制)
+────────────────────────────────────────────────────────────────────────────
+两方案的 search_fn 都把 rotary_dim/Hq/Hk/Hv/head_dim 等【结构常量烤死】进针(草堆同样烤死)。
+那么 config 改了 rotary_dim，针会不会变旧、与新草堆失配？关键在【针和草堆各由谁更新】：
+
+      更新对象        由什么触发
+      --------------  ----------------------------------------------
+      针(needle)      register_replacement，即 install_fusion_pass 的【重跑】
+      草堆(haystack)  torch.compile 的【(重)编译】
+
+  这是【两个独立触发点】——torch.compile 重编译只更新草堆，【不会】回头重 trace 针；让针跟上
+  新 rotary_dim 的，是【再调一次 install_fusion_pass(重 trace)】。
+
+  ▶ 本仓库属于“一致”的情形(runner.run_compiled)：每次都按【当前 config 现造】并把两者放在一起：
+        rp = RMSNormRoPEreplacePass(..., head_dim=self.head_dim, ...)   # rp.rotary_dim=head_dim
+        installer.install_fusion_pass()      # 用【当前 rotary_dim】重新 trace 针
+        compiled = torch.compile(self.model) # 建草堆(model 也用同一 rotary_dim)
+    搜索/替换的 rp 与 model 取自【同一份 config】，且 install 与 compile 同进同出 →
+    针、草堆的 rotary_dim 恒一致 → 匹配。改 config 重跑脚本(新进程)，这套再跑一遍，仍一致。
+
+  ▶ 会失配的情形(本仓库已规避)：install_fusion_pass 只在【进程启动跑一次】，之后单独改
+    rotary_dim、rebuild_model + 再 torch.compile(草堆更新成新值)，却【没再调 install】→ 针仍是
+    旧值 → 针 ≠ 草堆 → 匹配不上。本仓库因 install 在 run_compiled 里、每次与 compile 一起、且 rp
+    现造，天然避开。(同 第七节问题 1.5：针随 register_replacement 更新、草堆随重编译更新。)
+
+  ▶ 另一种思路：把 slice 移出子图，【从根上不烤死 rotary_dim】(换通用性)
+    上面靠“重 install 保持针/草堆 rotary_dim 一致”；也可以干脆【不把 rotary_dim 烤进 pattern】——
+    把 rot = x[..., :rotary_dim] 这个切片(及末尾 cat)留在 forward【子图外】，pattern 只含「单组头
+    的 RoPE 核心」，靠形状推 rotary_dim，于是【一条 pattern 通吃任意 rotary_dim】。
+
+    # forward 里：slice / cat 在子图【外】(都是 view / 物化，见下优缺点)
+    def _qk_norm_rope(self, x, weight, cos, sin):
+        x   = rms_norm_pure(x, weight, self.eps)
+        rot = x[..., :self.rotary_dim]                 # ← slice 留 forward(子图外，view 零搬运)
+        pas = x[..., self.rotary_dim:]
+        rot = rope_core(rot, cos, sin, self.interleave)# ← 仅这一段进 pattern
+        return torch.cat([rot, pas], dim=-1)           # ← cat 留 forward(子图外，物化)
+
+    # search_fn：形参/输出是【已切好的 rot】，不再是整块 qkv；pattern 里没有 :rotary_dim 字面常量
+    def search_fn(self, rot, cos, sin):                # 通配符 = rot, cos, sin
+        return rope_core(rot, cos, sin, self.interleave)
+    # 该 pattern 会在图里【匹配两次】(q 的 rot 一次、k 的 rot 一次) → 两次替换成 op。
+
+    优点：
+      + rotary_dim 不进 pattern(无 :rotary_dim 切片常量)→ 一条 pattern 匹配【任意】rotary_dim，
+        不必为每个值各注册一条、也不依赖“重 install 维持针草堆一致”。更通用。
+    缺点：
+      - slice 本身是 view(零 HBM、不发 kernel)→ 移出【不带来任何加速】(本就免费)。即“更通用、
+        但无性能提升”。
+      - cat 是【物化】(非 view)：全旋转(rotary_dim==head_dim)时 cat 是 no-op、移出免费；但
+        【部分旋转】时移出 → 额外一次 kernel 发射 + cos/sin 之外的【HBM 二次搬运】(rot 写回再读回
+        拼 pas)→ 反而略慢。
+      - 匹配两张子图 → 【两次 op 发射】(q、k 各一)，比“整块 qkv 一次”多一点 launch 开销；q/k/v
+        的最终重组 cat 也落到子图外(再一次物化)。
+      - slice 会把【整 head_dim 的 RMSNorm】与【rot 上的 RoPE】隔开：部分旋转时难再把 RMSNorm+RoPE
+        塞进同一个 post-slice 算子(要么 RMSNorm 留外面、丢了 QK-Norm 融合，要么 slice 仍得进
+        pattern、rotary_dim 又被烤回去)。全旋转时无此问题(根本没有真 slice)。
+    适用：需要【同时支持多种 rotary_dim】且接受上述代价时值得；本仓库 rotary_dim==head_dim(全旋转)，
+      根本没有真切片可移(rot 取全部、cat 是 no-op)，故此思路对本仓库【无收益】，维持现状即可。
+
+★ 方案 B 的匹配为何脆、dynamic 如何影响、gather 降级形态差异(symint/guard)等——见下一节【一·补】。
+  本仓库采用【方案 A】。
+
+────────────────────────────────────────────────────────────────────────────
+对照 vLLM
+────────────────────────────────────────────────────────────────────────────
+
+  ▶ 对照 vLLM：带 gather 的 RoPE【不走子图匹配】，而是手写 kernel【直接调用】(positions +
+     cos_sin_cache 进 kernel、内部 gather)，从而既拿到 gather 进 kernel 的 HBM 收益、又完全
+     绕开“动态形状 + pattern 匹配”这条会逼出“多张静态图”的路径。子图匹配只用在它稳的地方
+     (RMSNorm+quant 等逐点/归约 op 链)。
+
+  ▶ 补充：vLLM 的“子图匹配替换”到底替换的是什么(为何根本不碰 gather)。
+    vLLM 也有 pattern-match 融合 pass(用 torch 的 PatternMatcher)，但它的替换对象是
+    【自定义算子 → 融合自定义算子】，典型如：
+        rms_norm + 量化 op       → fused_rms_norm_quant
+        allreduce + rms_norm     → 融合的通信+归一化算子
+        attention + 量化         → 融合算子
+    被匹配的子图，通配符是【op 之间流动的张量】(上一个 op 的输出 = 下一个 op 的输入)，
+    内部全是【逐点 / 归约 / 量化】这类(B)节里【最稳】的算子，【根本不含 gather/index】。
+    也就是说 vLLM 的分工是：
+        - 带 gather 的 RoPE / attention  → 手写 kernel【直接调用】(gather 在 kernel 内部)；
+        - 逐点 op 链(norm+quant、通信+norm)→ 才用【子图匹配】替换成融合自定义算子。
+    它从不把 gather 放进 pattern，所以它的子图匹配天然避开本节(D)讲的“动态形状让 gather
+    失配”问题——失配风险高的那类算子，vLLM 压根没交给匹配去处理。
+    ⟹ 对本仓库的启示：若坚持用子图匹配上 RoPE，就别把 gather 纳入 pattern(维持方案 A)；
+       若一定要 gather 进 kernel(方案 B 的收益)，更贴近 vLLM 的做法是【直接调用融合算子】，
+       而非 register_replacement 匹配。
+
+================================================================================
+一·补：子图匹配究竟在匹配什么 —— 算子类别、影响因素与 dynamic
+================================================================================
+
+承接上节“匹配的是图、不是源码”，本节细化三件事：
+  (A) 到底比对图的【哪些部分】；
+  (B) 不同【类别的算子】对匹配可靠性的差异；
+  (C) 影响匹配成败的【因素】，重点讲 dynamic。
+这三点直接解释了贯穿全文的那条结论的根因：
+  【方案 A(gather 留在 op 外)稳】，而【方案 B(gather 纳入 pattern)脆】。
+
+--------------------------------------------------------------------------------
+(A) 子图匹配到底比对“图的什么”
+--------------------------------------------------------------------------------
+针(pattern)与草堆(model 图)都是【经 Dynamo trace + AOTAutograd + decomposition 之后
+的 post-grad FX 图】(已降级到 aten/prim 级算子)。matcher 在这两张【已降级图】之间找
+同构子图。它：
+
+  【比对】
+    - 节点的算子类型     aten.mul / aten.rsqrt / aten.index / aten.slice …
+    - 连边拓扑(数据流)   谁的输出喂给谁的输入
+    - 节点上的字面常量   slice 起止下标、reduce/cat 的 dim、dtype、写死的 reshape 尺寸
+  【不比对】
+    - 张量里的运行期数值  positions=[0,1,2] 还是 [0,1,2,3]，图里都是同一个输入节点
+    - batch/token 这类维度大小  基本被符号化、不钉死(见第七节问题 2)
+
+  ⟹ 推论：换数据、换序列长度本身【不会】让匹配失败(值不进结构、size 被符号化)。
+     真正左右匹配的，是【降级后图的结构 + 字面常量】两边是否一致。
+
+  另注：针只在【调用 register_replacement 那一刻】trace 一次、把常量烤死；之后 model
+  反复 torch.compile 重编译只刷新草堆，不会回头重 trace 针(见第七节问题 1.5)。
+
+--------------------------------------------------------------------------------
+(B) 常见算子类别对匹配的影响(可靠性由高到低)
+--------------------------------------------------------------------------------
+  类别              例子                         降级是否确定      匹配可靠性
+  ----------------  ---------------------------  ----------------  --------------------
+  逐点 pointwise    mul/add/sub/neg/rsqrt/pow    高度确定，        ★★★ 最稳
+                    /sigmoid/非no-op的cast       静态==动态        (方案A的rope数学)
+  归约 reduction    mean/sum/var(dim 为常量)     确定(dim 字面量)  ★★★ 稳
+  形状 view-like    view/reshape/permute         结构稳；但写死的  ★★ 看有无写死尺寸
+                    /transpose/expand            尺寸会被钉住
+  基础切片 basic    x[:, :Hq](整数/slice 对象)   结构稳；上下界    ★★ 上下界=字面常量
+                    → aten.slice                 烤成字面常量      不同值=不同子图
+  拼接 cat/stack    cat([a,b], dim=-1)           结构稳(看输入数   ★★ 稳(dim 为常量)
+                                                 + dim)，不挑长度
+  高级索引/聚散     x[idx](idx 是张量)/          降级【对上下文    ☆ 最脆(方案B痛点)
+  gather/scatter    index_select/gather/scatter  敏感】静态≠动态
+  dtype 转换 .to    .to(dtype)                   dtype 相同时是    特殊：两边须一致
+                                                 no-op、不留节点   (见(C)第4点)
+
+  关键对比：
+    - 逐点 / 归约：无论静态动态、无论上下文，几乎必然降级成同一串算子 → 照抄即匹配。
+      这正是【方案 A 的 RMSNorm + RoPE 纯数学(mul/add/rsqrt/mean/cat)】能稳过匹配的原因。
+    - gather(aten.index 等)：降级形态随【静态/动态形状、周边融合/重排】而变 → 即使源码
+      一字不差，针(静态 trace)与草堆(可能动态)的 index 形态也可能对不上 → 失配、回退 eager。
+      这正是【方案 B 把 cos_sin_cache[positions, :half] 纳入 pattern】最容易栽的地方：
+      问题不在“你抄得像不像”，而在“gather 能否被两边以同一形态降级出来”。
+
+--------------------------------------------------------------------------------
+(C) 影响子图匹配的因素总览
+--------------------------------------------------------------------------------
+  1. 算子类别(见 B)：逐点稳、gather 脆。这是最根本的一条。
+  2. 字面常量是否一致：slice 上下界、cat/mean 的 dim、dtype、写死的 view/reshape 尺寸
+     (如 view(8,512) 的 512)必须两边逐字相同。靠“同一组配置同时喂给 model 与 search_fn”
+     来保证(见第十一节)；不同取值 = 不同子图。
+  3. 静态 vs 动态形状(dynamic，见 D)：影响 gather/index 的降级形态；逐点不受影响。
+  4. dtype 与 no-op 的消除：.to(dtype) 在 dtype 已匹配时是 no-op、trace 时不产生 convert
+     节点。只要两边 example/运行期 dtype 一致，两边都【没有】该节点 → 仍同构；若一边有、
+     一边无 → 失配。(本仓库 cos_sin_cache 用 qkv 的 dtype 建，故 .to(qkv.dtype) 是 no-op。)
+  5. 规范化 / DCE / CSE / 融合的上下文：no-op(空 cat、取全切片)可能在匹配前被折叠掉
+     (见第三节)；周边算子的融合/重排也可能改变 gather 等节点的形态。针是【孤立】trace、
+     草堆是【带上下文】降级，二者可能错位。
+  6. 多余节点的位置：夹在 pattern 链路【中间】→ 不同构、失配；只在【上游/下游】→ 不影响
+     (见第三节表)。
+  7. 从 self 读 vs 形参化：从 self 读的张量被烤成常量/捕获张量，只匹配那一个实例且更脆；
+     可变张量须作 search_fn 形参 = 通配符(见第一、四节)。
+  8. 【不影响】匹配的：张量运行期数值、batch/token 维度大小(被符号化)。
+     注意把“维度大小”与“维度数量(秩/ndim)”分清：大小不看、秩要一致、写死的字面尺寸要相等
+     —— 三层区分详见本节 (H)。
+
+--------------------------------------------------------------------------------
+(D) dynamic 的影响(它如何决定 gather 匹不匹配得上)
+--------------------------------------------------------------------------------
+dynamic 是 torch.compile 控制【如何应对输入形状变化】的开关：
+
+  dynamic 取值     行为
+  ---------------  --------------------------------------------------------------
+  False            静态：形状当常量烤进产物；形状一变就【重编译】一份新的(仍静态)
+  True             动态：维度当符号变量(symint)编译；形状变了【复用同一份】，不重编译
+  None(默认)       自动：首次静态；某维第二次出现不同值时，自动把该维【升级为动态】
+                   重编译一次，之后复用动态版
+
+  例(num_tokens 随 ragged 序列变：8 → 10)：
+    False  : 为 8 编一份、为 10 再编一份(两份静态)。
+    True   : 编一份带符号 s0 的图，8/10 共用，不重编译。
+    None   : 先为 8 静态；见到 10 把该维升级 s0 动态、重编译一次；之后复用动态版。
+
+为什么动态形状对【纳入 pattern 的 gather】是坑(机制层面，逐字拆开)：
+
+  ▶ 关键机制：逐点 op【不需要】知道尺寸，gather【需要】。
+    - 逐点算子(mul/add/rsqrt)对每个元素独立运算，【不关心 num_tokens 多大】。所以无论
+      num_tokens 是常量 8 还是符号 s0，节点结构【完全一样】，针与草堆这段恒同构：
+          静态:  %y = aten.mul(%x, %w)
+          动态:  %y = aten.mul(%x, %w)        ← 一模一样，没多出任何节点
+    - gather(cache[positions] → aten.index)要【根据索引张量算输出形状、处理被索引的那一
+      维】，降级时【用得到这一维的大小】：静态下是常量、动态下是符号 → 图里会【额外插入】
+      sym_size、symint 运算、guard(运行期断言)等节点。
+
+  ▶ 针 vs 草堆的形态差异(伪 FX 对照)：
+    针：用 example_inputs(num_tokens=8，具体数)trace → 【静态形态】，干净：
+        %idx = aten.index(%cache, [%positions])      # 一个节点
+        %cos = aten.slice(%idx, dim=1, 0, 32)
+    草堆：若 model 走动态(num_tokens=s0，符号)→ aten.index 周围【多出一圈 symint/guard】：
+        %sz  = aten.sym_size.int(%positions, 0)      # 多出：取符号大小
+        %ge  = %sz >= 0  → runtime_assert / guard     # 多出：约束节点
+        ...  (一串 symint 算 shape 的节点)             # 多出
+        %idx = aten.index(%cache, [%positions])
+        %cos = aten.slice(%idx, dim=1, 0, 32)
+    → aten.index 周围草堆多了节点、连边变了，针里没有 → 这段【不同构】。
+
+  ▶ 连锁后果：
+    - 静态针 ≠ 动态草堆 → matcher 找不到同构子图 → 【不替换】。
+    - “回退”的精确含义：那段子图没被换成你的融合算子，仍以【原来的分步 aten op】
+      (RMSNorm + rope + gather 各自的算子)由 Inductor 照常编译执行——结果【正确】，但
+      【没用上你的 fused kernel】，融合算子白写。(不是退回纯 Python eager，而是“没命中替换”。)
+    - 逐点算子静态/动态降级一致，方案 A 不受影响；gather 受影响——这就是为什么
+      “方案 B 即使逐字照抄 cache[positions, :half] 也不保证匹配”：照抄只保证【源码相同】，
+      但决定匹配的是【降级后的图形态】，而 gather 的图形态受静态/动态左右、逐点的不受。
+
+  对策(二选一)：
+    - 关掉动态：torch.compile(model, dynamic=False)，让针与草堆都走静态、形态对齐 →
+      gather 能稳定匹配。代价：每个不同 num_tokens 各编一份静态图；ragged 推理下
+      num_tokens 高度多变会导致【重编译爆炸】(这正是默认要自动转动态的原因)。
+    - 不把 gather 纳入 pattern：回到方案 A——gather 留在 op 外(model.forward 里)，
+      pattern 只含逐点的 RMSNorm + RoPE 数学，天然静态/动态都稳。本仓库即此选择。
+
+  ▶ dynamic=False 详解：它修好了什么、代价为何是“重编译爆炸”。
+    (1) 机制上做了什么：把每个输入维度都当【具体常量】，不引入符号变量 s0。
+        于是草堆里不再需要为符号服务的那圈节点——上面伪 FX 中 aten.index 周围的
+        sym_size / runtime_assert(guard) / symint 算 shape 全部消除，草堆退化成：
+            %idx = aten.index(%cache, [%positions])
+            %cos = aten.slice(%idx, dim=1, 0, 32)
+        这【正好与针(同样静态 trace)一模一样】→ 同构 → gather 匹配成功。
+        这就是“针与草堆都走静态、形态对齐”的确切含义：两边都不带 symint/guard 那圈，
+        aten.index 的邻域结构便一致了。
+
+    (2) 代价的来源：静态把形状【烤进产物】，并挂 guard(如 num_tokens == 8)。运行时：
+        - 调 compiled(x, positions) 先查 guard；全过 → 复用产物直接跑。
+        - guard 不过(这次 num_tokens=10、产物是为 8 编的)→ 【重新编译】一份 num_tokens=10
+          的静态产物(重 trace + 重跑 Inductor codegen + 重新编译，秒级开销)，挂新 guard。
+        ⟹ 每出现一个【没见过的 num_tokens】，就多编一份静态图。
+
+    (3) 为何 ragged 下会“爆炸”：ragged 的 num_tokens = sum(各序列真实长度)，几乎每个 batch
+        都不同 → 不同 num_tokens 个数近乎无上限：
+        - 重编译次数 ≈ 见过的不同 num_tokens 个数 → 首跑被反复编译开销拖垮；
+        - 撞 cache_size_limit：torch._dynamo.config.cache_size_limit(默认 8)限制“同一 frame
+          能编多少变体”，超过后 Dynamo 报 recompile limit、【放弃编译该 frame、直接跑 eager】
+          → 不但没省，连先前的融合也用不上，彻底回到未优化路径；
+        - 多份静态产物(各自 Triton kernel + guard + 元数据)并存，堆内存/显存。
+
+    (4) 为何默认是“自动转动态”(dynamic=None)：正是为躲开 (3)。首次静态编(快)；第二次见到
+        不同 size 就把该维升级成符号 s0 重编译一次；之后任意 num_tokens 复用同一份动态产物，
+        不再重编译。代价就是动态产物带 symint/guard → 让纳入 pattern 的 gather 失配(本节主题)。
+
+    (5) 若非要 dynamic=False + 方案 B，缓解办法是把 num_tokens【离散成有限档】(vLLM/TRT-LLM
+        的做法)：padding/bucketing 向上补齐到固定几档(128/256/512…)，只编这几份静态图、
+        guard 命中率高、不撞上限，再配 CUDA Graph 按档捕获。代价是回到“有 padding 浪费”
+        (绕回 ragged vs padded 的取舍)。更干净的办法仍是：带 gather 的算子别用匹配、改【直接
+        调用】(gather 在 kernel 内、不进 pattern、不被 dynamic 影响)，见下文 vLLM 补充。
+
+  ⟹ 取舍：num_tokens 取值集合小(定长/少数几档 batch)→ dynamic=False 上方案 B 划算；
+     num_tokens 高度多变(典型 ragged)→ 方案 A + 默认动态更优(避免重编译爆炸)。
+
+
+--------------------------------------------------------------------------------
+(E) dtype 转换(.to)的“no-op 消除”如何影响匹配
+--------------------------------------------------------------------------------
+承接 (C) 第 4 点：.to(dtype) 是【条件性算子】，产不产生节点取决于源/目标 dtype 是否相同。
+
+  ▶ 它在图里到底留不留节点：
+      源 dtype ≠ 目标 dtype  → 真转换(读+cast+写) → 留 prims.convert_element_type 节点
+      源 dtype == 目标 dtype → no-op(直接返回原张量) → 【图里不留任何节点】(像没写过)
+    例(cache 与 qkv 同为 float16)：
+        cos = cos_sin_cache[positions, :half].to(torch.float16)   # 同 dtype → no-op
+      trace 出的图：
+        %idx = aten.index(%cache, [%positions])
+        %cos = aten.slice(%idx, dim=1, 0, 32)          ← 没有 .to / convert 节点
+    例(cache=float32、qkv=float16)：
+        %cos = aten.slice(...)
+        %cos = prims.convert_element_type(%cos, float16)   ← 多出一个 convert 节点
+
+  ▶ 为什么是坑：匹配要求针/草堆对这个 convert 节点【齐有齐无】(否则不同构)。
+    而“有没有”由【各自的 dtype 上下文】分别决定，于是会出现“一边有、一边无”：
+      情况1：草堆 no-op(消失)、针有 convert —— forward 里 cache 与 qkv 同 dtype(.to 消失)，
+             但 make_example_inputs 给 cos_sin_cache 造了【不同】dtype，针的 .to 非 no-op
+             → 针多一个 convert 节点 → 针在草堆里找不到对应结构 → 失配。
+      情况2：反过来(草堆有 convert、针 no-op)，同样失配。
+
+  ▶ 本仓库为何安全：cache 用 qkv 的 dtype 建(build_cos_sin_cache(..., dtype=dtype))，故
+    forward 里 .to(qkv.dtype) 永远 no-op、草堆无 convert；只要 make_example_inputs 给
+    cos_sin_cache 与 qkv 用【同一 dtype】(确实如此)，针也 no-op、同样无 convert → 两边齐无
+    → 同构、安全。
+    (注：本仓库当前是方案 A，.to 在 op 外、根本不进 pattern；(C)4 与本节主要是【方案 B】把
+     gather+.to 纳入 pattern 时的提醒——那时 .to 进了针，example 与运行期 dtype 必须一致。)
+
+  ▶ 提炼成规则：
+    - .to(dtype) 是条件节点：同 dtype → no-op → 消失；异 dtype → 留 convert。
+    - 针/草堆必须对它【齐有齐无】才同构。
+    - 决定有无的是 dtype 上下文 ⟹ example_inputs 的 dtype 必须与【运行期模型 dtype 完全一致】，
+      才能保证 .to 在两边同时 no-op(或同时非 no-op)。这也是全文反复强调“example dtype 要与
+      运行期一致”的原因之一。
+
+--------------------------------------------------------------------------------
+(F) “针孤立 / 草堆带上下文”导致错位的三个具体例子
+--------------------------------------------------------------------------------
+承接 (C) 第 5 点。针(needle)只 trace search_fn 这一小段(无上下文)；草堆(haystack)是同一段
+逻辑嵌在整个 model.forward 图里(有上下文)。规范化 / DCE / CSE 等 pass 多是【上下文敏感】的，
+于是同一段逻辑在两边被改写成【不同形态】而对不上。以下用本仓库 rope 代码举三个真实例子，
+每个都画出针 vs 草堆两张伪 FX 图、指出分叉点。
+
+  ▶ 例 1：DCE / no-op 折叠 —— 全切片 + 空 cat (head_dim==rotary_dim==64)
+    _qk_norm_rope 真实代码：
+        rot = x[..., :64]                 # 取全部 → 恒等
+        pass_through = x[..., 64:]        # 空张量 [.., 0]
+        rot = rope_pure(rot, cos, sin)
+        return torch.cat([rot, pass_through], dim=-1)   # cat([rot, 空]) → rot
+    若 search_fn 写“干净”(直接对整个 x 做 rope，不写 slice/cat)：
+        针(孤立)：
+            %n = rmsnorm(%x, %w)
+            %r = rope(%n, %cos, %sin)                  ← 无 slice / cat
+        草堆(forward 写了 slice/cat)：
+            %n  = rmsnorm(%x, %w)
+            %s1 = slice(%n, dim=-1, 0, 64)             # = 全部(恒等)
+            %s2 = slice(%n, dim=-1, 64, INT_MAX)       # = 空 [.,0]
+            %r  = rope(%s1, %cos, %sin)
+            %c  = cat([%r, %s2], dim=-1)               # = %r
+    分叉点：草堆比针多 %s1 %s2 %c 三个节点。
+        - DCE/规范化把它们折掉(恒等 slice、空 cat 可消)→ 草堆退化成 %n→%r、与针一致 → 匹配。
+        - 某次没折干净 → 草堆多三节点、不同构 → 失配。
+    ⟹ 能否匹配押在“优化器恰好折干净”上。稳妥做法：search_fn 与 forward 都用同一份
+       _qk_norm_rope(都带 slice/cat)，两边形态一致，不赌 DCE。
+
+  ▶ 例 2：规范化(canonicalization) —— div+sqrt vs mul+rsqrt
+    RMSNorm 归一化项的两种等价写法：
+        写法甲(forward)   ： x = x / torch.sqrt(ms + eps)
+        写法乙(search_fn) ： x = x * torch.rsqrt(ms + eps)
+    trace 出的算子不同：
+        针(写法乙)：   %r = rsqrt(%ms_eps);  %y = mul(%x, %r)
+        草堆(写法甲)： %s = sqrt(%ms_eps);   %y = div(%x, %s)
+    分叉点：一边 rsqrt+mul、一边 sqrt+div。
+        - 规范化把 div 改写成 mul+reciprocal、再把 reciprocal+sqrt 合成 rsqrt → 殊途同归 → 匹配。
+        - 没归到同一形态 → sqrt/div ≠ rsqrt/mul → 失配。
+    ⟹ 规范化能抹平“部分”差异、非万能。根治：两边复用同一个 rms_norm_pure，源头同一串算子。
+
+  ▶ 例 3：CSE —— 重复子表达式被合并，出边跨越 pattern 边界
+    rope_pure(neox) 里 cos 用两次：
+        c = torch.cat([cos[:, None, :], cos[:, None, :]], dim=-1)
+    孤立 trace 的两个 unsqueeze 会被 CSE 合并成一个、两条出边喂 cat：
+        CSE 前： %u1=unsqueeze(%cos,1); %u2=unsqueeze(%cos,1); %c=cat([%u1,%u2],-1)
+        CSE 后： %u =unsqueeze(%cos,1);                        %c=cat([%u, %u ],-1)
+    针/草堆各自独立 CSE，多数时候结果一样(对称)、无碍。真正出事是【CSE 跨越 pattern 边界】：
+        设草堆里 pattern 区域【外】也算了同样的 unsqueeze(cos,1)(别的层/分支)，CSE 把
+        “pattern 内的 %u”与“pattern 外那个”合并成同一节点 → 该节点同时被内外消费：
+            %u = unsqueeze(%cos, 1)
+                 ├─→ %c = cat([%u,%u],-1)      (pattern 内)
+                 └─→ %other = ...              (pattern 外也用 %u)   ← 出边越界
+    分叉点：matcher 要求被替换子图“干净一刀切”(内部节点输出只在内部用)；%u 出边越界 →
+        这段不是可整体替换的子图 → 失配/不替换。针孤立 trace 没有“外部那处重复”，不会合并。
+
+  三例共同结构：
+    例     针(孤立)              草堆(带上下文)               分叉根源
+    -----  --------------------  ---------------------------  ----------------------------
+    1 DCE  无 slice/cat          多 slice/slice/cat           no-op 是否被折掉(赌优化器)
+    2 规范 rsqrt+mul             sqrt+div                     是否被归到同一形态
+    3 CSE  两 unsqueeze 各自     与 pattern 外重复式合并越界  上下文带来额外重复式
+
+  贯穿一句话：匹配比的是【降级后的图】，而降级被【上下文】左右(DCE 看周围 no-op、规范化看
+  写法、CSE 看全图重复)；针孤立、草堆带上下文 → 凡形态依赖上下文的节点都可能错位。逐点纯
+  数学因有 register_replacement 的同套规范化兜底、且不依赖上下文，基本不受影响 → 再次落到
+  “逐点稳、gather/边界脆”。
+
+  两条根治原则(本仓库已用)：
+    ① search_fn 与 forward 复用同一份纯函数(rms_norm_pure / rope_pure)，源头保证算子序列一致；
+    ② 拿不准时把 model 真编译、打印 Inductor 图，照真实降级形态调 pattern，不靠猜(见第三节)。
+
+--------------------------------------------------------------------------------
+(G) 从 self 读 vs 形参化：先举例，再谈“张量能否烤成常量、怎么匹配、为何不建议”
+--------------------------------------------------------------------------------
+承接 (C) 第 7 点。一句话先行：search_fn 的【形参】会成为 pattern 里的【通配符(占位符)】，
+能绑定草堆里该位置的【任意】匹配节点；而你在 search_fn 里从 self 读的张量(没走形参)会被
+【烤死】成一个具体常量节点，只认那一个实例。
+
+  ▶ 一、举例：形参=通配符  vs  self 读=烤死的具体张量
+    # ✅ 对：weight 作形参 → 通配符
+    def search_fn(self, x, weight, cos, sin):
+        return rms_norm_pure(x, weight, self.eps)      # weight 是形参
+
+    # ❌ 错：从 self 读 weight → 烤成具体常量
+    def search_fn(self, x, cos, sin):                  # 注意：没有 weight 形参
+        return rms_norm_pure(x, self.weight, self.eps)
+
+    trace 出的 pattern(只看“乘 weight”那步)：
+        ✅ 通配符版：
+            %y = mul(mul(%x, rsqrt(%ms+eps)), %weight)   # %weight 是 placeholder(空位)
+            → 草堆里任意一层的 weight(参数输入节点)都能绑进这个空位；
+              且 matcher 能把绑到的节点【按位置转交】给 replace_fn / 融合算子。
+        ❌ self 读版：
+            %y = mul(mul(%x, rsqrt(%ms+eps)), %const_W)  # %const_W 是“烤死的那一份 Parameter”
+            → 只对应那一个具体常量节点：不泛化、绑不了、也转交不出去。
+
+    再看 cos_sin_cache(方案 B 的真实场景)：
+    # ❌ 错：search_fn 里直接用 self.cos_sin_cache → 整张表被烤死成常量
+    def search_fn(self, qkv, q_weight, k_weight, positions):
+        cos = self.cos_sin_cache[positions, :self.half]      # self.cos_sin_cache 被烤死
+        sin = self.cos_sin_cache[positions, self.half:]
+        ...
+    # ✅ 对：cos_sin_cache 作形参 → 通配符（方案 B 应这么写）
+    def search_fn(self, qkv, q_weight, k_weight, cos_sin_cache, positions):
+        cos = cos_sin_cache[positions, :self.half]           # cos_sin_cache 是形参
+        sin = cos_sin_cache[positions, self.half:]
+        ...
+    trace 出的 pattern(只看“按 positions 取行”那步)：
+        ❌ self 读版：
+            %idx = aten.index(%const_cache, [%positions])    # %const_cache 是烤死的整张表
+            → 只匹配“用了这一份 cache buffer”的图；cache 是 persistent=False 的派生量，
+              换配置/换实例重建后就是【另一个张量】→ 不匹配；且 matcher 无法把这张表
+              当通配符绑定并转交给融合算子(方案 B 想把 cache 传进 kernel 就废了)。
+        ✅ 通配符版：
+            %idx = aten.index(%cos_sin_cache, [%positions])  # %cos_sin_cache 是 placeholder
+            → 草堆里那张表(get_attr/buffer 节点)能绑进空位，并按位置转交给 op 当输入。
+    (注：self.half 是【标量】，无论哪版都烤成切片字面常量，正确；被烤死出问题的是【张量】
+     cos_sin_cache，不是 half。本仓库当前是方案 A，cache 索引在 op 外、cos/sin 已作形参，
+     不涉此坑；此例是方案 B 把 gather 纳入 pattern 时的正确写法对照。)
+
+  ▶ 二、张量在什么情况下“可以”烤成常量，又怎么匹配
+    可行前提(三者同时满足，较苛刻)：
+        a. 该张量【算子根本不需要当输入收】(否则非通配符就传不进 op)；
+        b. 它是【真正固定、处处相同】的常量(如某张写死的系数表)；
+        c. 针与草堆引用的是【实质相同的那一份常量】(同一来源、被同样折叠/引用)。
+    此时它在两边都成为一个 get_attr 常量节点，匹配【不是绑定、而是常量判定】，分三层：
+        ① 节点类型：两边都得是 get_attr / constant(不是 placeholder、不是别的算子)；
+        ② 元信息：shape / dtype / device 一致；
+        ③ “是不是同一个常量”：此步【实现/版本相关】——可能按 identity(同一 storage)、
+           按 value 相等(torch.equal 式)、或被当 Ignored() 只占位；取决于 torch 版本与该常量
+           如何进图(register_buffer / 常量折叠 / lifted constant)。
+    伪 FX 对照：
+        针：    %w  = get_attr[_tensor_constant0];  %y  = mul(%x , %w )
+        草堆：  %w' = get_attr[some_buffer];        %y' = mul(%x', %w')
+    → 仅当 %w 与 %w' 在①②③上都判定为“同一个常量”才匹配；模型那块常量若被重算/折叠成别的
+      节点，就对不上。
+
+  ▶ 三、为什么仍【不建议】把张量烤成常量
+    先把两种情形分清(否则会把“烤错了”和“合法捕获常量”混为一谈)：
+
+    情形①【非对称：其实是“烤错了”】针把张量烤成常量，但草堆里它本就是【参数输入
+      (placeholder)/get_attr】——weight 是 Parameter、cache 是 buffer，编译时都被提升为图输入。
+      → 一边常量、一边输入，种类/角色不符、又非通配符无法泛化绑定 → 对不上(坏处B)；即便对上也
+        不是通配符、无法转交给算子(坏处A)。这是“把本该当输入的张量烤错了”，根本不是 (二) 里那个
+        合法的捕获常量场景。
+      ★ 顺带纠正易误解：这里“对不上”是【结构/角色】问题——张量匹配【从不】逐元素比较数值；
+        “数值相等才匹配”只对【标量】成立(eps 按字面值比、故“不同值=不同子图”)，对张量不成立。
+
+    情形②【对称：(二) 那个“合法”场景】针与草堆【两边都是同一份捕获常量】(算子不碰、处处相同、
+      同一来源)，此时确实【能】匹配。但即便如此，【仍】不建议，原因：
+        1. 判定语义不稳(版本漂移)：能否匹配取决于 (二)③ “是不是同一个常量”那步，它在
+           identity / value 相等 / Ignored() 之间随【torch 版本与常量如何进图】摆动 → 今天匹配、
+           升级后可能失配。
+        2. “同一份常量”极易被打破：常量折叠 / 重编译 / 重建 buffer(persistent=False 的派生量如
+           cos_sin_cache 一旦按超参重算，就是【另一个张量/另一个节点】)，都会让“同一份”不再成立
+           → 失配。
+        3. 不泛化：一条 pattern 绑死【一个】具体常量；多实例 / 换取值就得为每个各注册一条。
+        4. 不可扩展：哪天算子需要用到这张表(需求一变)，立刻退化成情形①的坏处A(非通配符传不出)
+           → 推倒重来。
+        5. 隐式、难调：常量匹配是隐式的(靠元信息/identity)，远不如“显式通配符 + 显式转交”清晰可控。
+
+    ⟹ 结论：凡【算子要用】或【想跨实例泛化】的张量(qkv / weight / cos / sin / cos_sin_cache /
+       positions)，一律作 search_fn 形参 = 通配符(方案 B 把 cache 传进 kernel 也是【形参化】，
+       不是捕获常量)。即使是“算子不碰、处处相同”的固定系数表(情形②)，因上述 1~5 仍不如形参化稳，
+       能形参化就形参化。真正适合烤死的是【标量】(eps/heads/dim/rotary_dim/interleave)——按字面值
+       稳定匹配。
+
+--------------------------------------------------------------------------------
+(H) 形状维度：什么不看、什么看 —— 大小 / 秩(ndim) / 字面尺寸 三层区分
+--------------------------------------------------------------------------------
+承接 (C) 第 8 点。“匹配对形状无关”这句容易被【过度理解】——其实形状要分三层，看不看各不同。
+
+  ▶ 三层一览：
+      看不看  对象                                    结论
+      ------  --------------------------------------  ----------------------------------
+      ❌不看  每一维的【具体大小】(8/16/num_tokens)     符号化、size-agnostic
+      ✅看    【维度数量/秩】(2D vs 3D)，隐式强制       3D 的针匹配不上 2D 的图
+      ✅看    view/reshape 里【写死的字面尺寸】         字面常量、要逐字相等
+
+  ▶ ①“大小不看”：用 [8,8,64] trace 的针，能匹配 [16,8,64]、[N,8,64]……batch/token 那一维的
+     【数值】不钉死(被符号化)。这就是“匹配对 batch/token 形状无关”的本意(第七节问题2)。
+
+  ▶ ②“秩(ndim)要一致”——不是显式断言 ndim，而是经两条途径【隐式】渗进 pattern：
+     (i) dim 参数归一化成【秩相关】的字面常量：
+         mean(-1)/cat(-1)/slice(dim=…) 的负 dim 在降级时常被归一化成非负值，非负值依赖秩——
+             3D 的“最后一维”= dim 2；2D 的“最后一维”= dim 1
+             mean(dim=2) ≠ mean(dim=1) → 不同节点 → 失配。
+         ⟹ 即便源码都写 -1，秩不同 → 归一化出的 dim 不同 → 对不上。
+     (ii) reshape 目标维数 / broadcasting 的 unsqueeze 个数由秩决定(本仓库 rope 现成例子)：
+             qkv.view(num_tokens, H, head_dim)   # 输出【3 维】是结构事实，2D 图根本没这步
+             cos[:, None, :]                     # 为广播到 3D 才有的 unsqueeze，2D 时不同/不存在
+     ⟹ 所以“必须同为 3D(或同为 2D)才匹配”成立；秩是隐式但硬性的一致要求。
+
+  ▶ ③“写死的字面尺寸要相等”：view(8, 512) 里的 512、reshape 写死的某维，是字面常量、要逐字相同
+     (第七节问题2)；它与 ① 的“符号化大小”相反——符号化的不看、写死的看。
+
+  ▶ 一个 view 里三层并存(最易混)：
+        qkv.view(num_tokens, H, head_dim)
+              │            │       └ 若是具体 int → 字面常量(看)
+              │            └ 若是具体 int → 字面常量(看)
+              └ 符号(不看)
+        且“输出是 3 维(秩)”也【看】。三者属不同层面，别混为一谈。
+
+  一句话：matcher 对“几维(秩)”敏感、对“每维多大(符号化大小)”不敏感、对“写死的字面尺寸”要求
+  逐字相等。
+
+小结(本节)：
+  - 匹配比对的是【降级图的结构 + 字面常量】，不比对张量值、对 batch/token size 符号化。
+  - 逐点/归约最稳，gather/scatter 最脆；dtype 的 no-op .to 要两边一致。
+  - 成败因素优先级大致：算子类别 > 字面常量一致性 > 静态/动态(dynamic) > 规范化上下文 >
+    多余节点位置 > self 读 vs 通配符。
+  - dynamic 决定 gather 的降级形态：动态下的 symint/guard 节点让静态针失配；逐点不受影响。
+  - 实务：gather 要么 dynamic=False 走静态匹配(代价是多张静态图)，要么干脆别进 pattern
+    (方案 A)——这正是本仓库选方案 A 的根本理由。
+
+
+================================================================================
+二、search_fn 怎么写：两个反面教材 + 正确姿势
+================================================================================
+
+通用规则见前面【二、通用规则】，张量通配符 vs 烤死常量的机制见【一·补 (G)】。本节用两个
+具体反面教材说明“为什么不能图省事直接搬 model 的方法/forward”，再给正确姿势。
+
+  ▶ 反面教材①：不能直接拿 model._apply_rope 当 search_fn
+    (1) 签名/覆盖不符(最硬)：融合算子要一次吃掉【RMSNorm+RoPE】，需 weight/cos/sin 三个张量；
+        而 _apply_rope(self,x,cos,sin) 只做 RoPE 一半——不含 RMSNorm、不收 weight。search 与
+        replace 要求【输入签名一致】(matcher 把绑定节点按位置传给 replace_fn)，对不上。
+    (2) 链路内有多余算子：_apply_rope 里 rot=x[...,:rotary_dim] / pass_through / 末尾 cat 这些
+        slice/cat 会进图；夹在算子链【中间】会破坏同构(详见第三节“多余节点的位置”)。
+    (3) 闭包 self、不清晰：_apply_rope 是绑定方法，参数表(x,cos,sin)≠算子入参(x,weight,cos,sin)；
+        让待匹配模板依赖一个活模块实例，不如自洽纯函数可控。
+    (4) 强耦合：pattern 直接依赖 model 内部方法 → model 重构可能悄悄破坏匹配。
+
+  ▶ 反面教材②：不能把整个 forward 体当 search_fn(“肯定能匹配”是错的)
+    设 search_fn 直接写成 forward 主体(含 self._rms_norm、cos_sin_cache[positions]、arange…)：
+    (1) 签名崩：这样 search_fn 只剩 (x) 一个输入 → replace_fn 也只能 (x) → 算子要的
+        weight/cos/sin 无处来。
+    (2) self 读的全被烤死：self.weight、self.cos_sin_cache 变成捕获常量、非通配符 → 只匹配那一份
+        实例、绑不了也传不出(机制见 一·补 (G))。
+    (3) 引入更难匹配的节点：arange(依赖动态 num_tokens)、按 positions 的 gather、cos.to(dtype) 都
+        进针 → 节点越多越具体越难匹配(gather 进针的脆弱性见 一·补 (B)/(D)、方案对照见 一·案)。
+    ⟹ 针越小、越只含核心算子、把可变张量暴露成形参(通配符)，越易匹配、越通用。
+
+  ▶ 正确姿势：把核心数学抽成【不依赖 self 的纯函数】，model 与 search 共用(单一真相源、不漂移)
+        def rmsnorm_rope_neox(x, weight, cos, sin, eps):
+            xf = x.float()
+            xn = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype) * weight
+            c2 = torch.cat([cos[:,None,:], cos[:,None,:]], -1)
+            s2 = torch.cat([sin[:,None,:], sin[:,None,:]], -1)
+            return xn * c2 + rotate_half(xn) * s2
+    - model.forward：查好 cos/sin 后调 rmsnorm_rope_neox(x, self.weight, cos, sin, self.eps)
     - search_fn   ：return rmsnorm_rope_neox(x, weight, cos, sin, self.eps)
-      （weight/cos/sin 是形参=通配符；eps 是常量）
-    既单一实现(不漂移)、又满足 pattern 对“纯函数 + (x,weight,cos,sin) 签名”的要求。
+                    (weight/cos/sin 是形参=通配符；eps 是常量)
+    本仓库已落地：model 与 RMSNormRoPEreplacePass.search_fn 共用 util.rms_norm_pure / rope_pure。
 
 
 ================================================================================
-三、“pattern 会匹配不上 _apply_rope 吗” —— 方向与多余算子的位置
+三、多余节点能否匹配 —— 看“多余节点的位置”
 ================================================================================
 
-要点：pattern 不是匹配 _apply_rope 这个【函数】，而是匹配 _apply_rope 生成的【图】。
-问题应改成：“干净的 search_fn 针，能否在 model 跑出来的(含 slice/cat 的)草堆图里找到？”
-
-匹配是“图 vs 图”。草堆比针“多东西”本身不是问题，关键看【多余节点在哪】：
+匹配是“图 vs 图”(见【一】)，草堆比针“多东西”不一定坏，关键看【多余节点在哪】：
 
   多余节点的位置                              结果
   ------------------------------------------  -----------------------------
@@ -93,250 +762,135 @@ register_replacement 的工作流程：
   只是被匹配区域的【下游/上游消费者】(在外面)  不影响，照样匹配并替换
   是 no-op，被规范化 / DCE 提前消掉            匹配前就没了，等价于针
 
-_apply_rope 的 slice/cat：
-  - 开头 rot = x[..., :rotary_dim] 的 slice 若留着，夹在 RMSNorm 与旋转之间(链路内部)
-    → 针里没有它 → 匹配不上。
-  - 结尾 cat([rot, pass_through]) 把结果包一层(下游消费者)，并由 pass_through 再引一条 slice。
+以 _apply_rope 的 slice/cat 为例：
+  - rot = x[..., :rotary_dim] 的 slice 夹在 RMSNorm 与旋转之间(链路内部) → 针里若没有它 → 失配。
+  - 末尾 cat([rot, pass_through]) 把结果包一层(下游消费者)，pass_through 再引一条 slice。
+  为什么实际仍能匹配——靠 rotary_dim==head_dim：此时 pass_through 为空、rot 取全部、cat 是
+  no-op，这些 no-op 多半被 Inductor 规范化/DCE 在匹配前折掉，草堆退化成“纯 RMSNorm+旋转”、与
+  针一致 → 匹配。但这【赌优化器折干净】：若没折掉、针里又没写这些 slice/cat → 失配、不融合
+  (hook 里 count=0，不报错也不替换)。
 
-为什么实际仍能匹配：靠 rotary_dim == head_dim + 规范化
-  - 设 rotary_dim==head_dim：
-      pass_through = x[..., head_dim:] → 空张量；
-      cat([rot, 空]) → 等于 rot，是 no-op；
-      rot = x[..., :head_dim] → 取全部，也是 no-op。
-  - 这些 no-op 很可能在 matcher 跑之前被 Inductor 的规范化 / 死代码消除折叠掉，
-    草堆那段退化成“纯 RMSNorm + 旋转”，与针一致 → 能匹配。
-  - 但这依赖“优化器恰好把 no-op 消干净”。若没消掉、而针里又没写这些 slice/cat → 匹配不上、
-    不融合(hook 里 count=0，不报错也不替换)。
-
-核心难点：针要长得像“实际 lowered 图里那段”，常需把 model 真编译出来、打印 Inductor 图，
-照着图来调 pattern，而不是凭源码猜。register_replacement 有一些规范化能抹平部分差异，但非万能。
+  ★ 更一般地，“针孤立 trace、草堆带上下文”会让规范化/DCE/CSE 的结果错位——三个具体例子(空 cat
+    折叠、div vs rsqrt、CSE 跨边界)见【一·补 (F)】。
+  核心难点：针要长得像【实际 lowered 图里那段】——拿不准就把 model 真编译、打印 Inductor 图照着
+  调 pattern，别凭源码猜。register_replacement 的规范化能抹平【部分】差异，但非万能。
 
 
 ================================================================================
-四、为什么不能把整个 forward 体当 search_fn（“肯定能匹配”是错的）
+四、为什么不能把整个 forward 体当 search_fn（并入第二节反面教材②，此处留作索引）
 ================================================================================
 
-设想把 search_fn 写成 model.forward 的主体：
-    x = self._rms_norm(x)
-    if positions is None:
-        positions = torch.arange(num_tokens, device=x.device)
-    cos = self.cos_sin_cache[positions, :self.half]
-    sin = self.cos_sin_cache[positions, self.half:]
-    x = self._apply_rope(x, cos.to(x.dtype), sin.to(x.dtype))
-    return x
-不仅不“肯定匹配”，反而会坏掉：
-
-(1) 硬约束：search_fn 与 replace_fn 签名必须一致
-    - 算子需要 weight/cos/sin 三个张量输入；matcher 把绑定的节点按位置传给 replace_fn。
-    - 上面这版签名是 search_fn(x)，只有一个输入 → replace_fn 也只能是 (x)，
-      那算子要的 weight/cos/sin 从哪来？对不上。
-
-(2) 从 self 读的东西变成“烤死的常量”，而不是通配符
-    - example_inputs 里给的张量 → pattern 的【占位符(通配符)】，可绑定图里任意匹配节点。
-    - search_fn 里凡是非输入、从 self 读的：
-        x = self._rms_norm(x)                       # 内部用 self.weight / self.eps
-        cos = self.cos_sin_cache[positions, :half]  # self.cos_sin_cache 是具体 buffer
-      会被当成常量/捕获张量【烤进 pattern】 → 只匹配“用了这一份 weight、这一份 cache 的图”，
-      且 matcher 无法把它们当通配符绑定到真实图的 parameter/buffer 节点。通用性、鲁棒性都崩。
-
-(3) 还引入更难匹配的节点
-    - torch.arange(num_tokens)（依赖动态 num_tokens）、按 positions 的 gather 高级索引、
-      cos.to(dtype) 等都会进 pattern。节点越多越具体，越容易匹配不上。
-
-方向再强调：针越小、越只含核心算子、把可变量暴露成输入(通配符)，越容易匹配、越通用。
-把整个 forward(含 buffer 索引、arange、self.weight)塞进针，等于把针做得又大又具体，
-还把该当通配符的 weight/cos/sin 烤成常量 —— 更难匹配，且违反 search/replace 同签名硬约束。
+详见【二、反面教材②】：整个 forward 当 search_fn 会(1)签名崩、(2)self 读的 weight/cache 被烤死、
+(3)引入 arange/gather 等更难匹配的节点。本质：针要小而干净、可变张量作通配符(见 一·补 (G)；
+gather 入针的代价见 一·案 与 一·补 (B)/(D))。
 
 
 ================================================================================
-五、replace_fn / 算子签名里到底该带哪些参数
+五、op / replace_fn 的签名：哪些进 pattern、哪些烤成常量（4 参 ≠ 7 参）
 ================================================================================
 
-关键前提：当前匹配的子图中，cos/sin 已经是“按 position 取好的、每 token 一行”
-([num_tokens, half])，且 search_fn 假设 rotary_dim == head_dim(无 pass_through)。
-这两点决定了哪些东西【不用】进 op 签名。
+本节聚焦一个最易错的点：【replace_fn 的形参】与【它调用的算子 op 的形参】不是一回事。
+(方案 A/B 下完整的 search_fn/example_inputs/replace_fn/op schema 对照见【一·案】，此处不重复。)
 
-特别地，op 签名【不需要 position_ids，也不需要完整的 cos_sin_cache】，因为：
-  - “按 position 查表”这一步(cos_sin_cache[positions, :half] / [positions, half:])
-    已经在 model.forward 里、即【op 外面】做完了；
-  - 传进子图/op 的 cos、sin 是【已经取好的、每 token 一行】的结果([num_tokens, half])，
-    不再是“完整大表 + 位置索引”。
-  - 因此 op 只吃现成的 cos/sin 即可，position_ids 与完整 cache 都无须出现在 op 签名里。
-  - (对照：真实 kernel fused_qk_norm_rope 是把完整 cache + position_ids 一起传进去、
-    在 kernel 内部 gather —— 那是下面“方案 B”，与当前“gather 在 op 外”的方案 A 不同。)
+  ▶ 谁进 pattern、谁烤成常量
+    - 张量(qkv/weight/cos/sin) = pattern 的【通配符】，作 search_fn 形参；
+    - 标量(num_heads_q/k/v、head_dim、eps) = 【常量】，不进 pattern，由 replace_fn 从 self 读出后
+      烤进【算子调用实参】(为何标量烤、张量不烤见 一·补 (G))。
 
-(1) rotary_dim：不用传，且子图已剔除“不旋转的维度”
-    - search_fn 写的是“整段都旋转”(rotary_dim==head_dim)，图里不存在 rot/pass_through/cat，
-      即不存在“不旋转的维度”，已隐含 rotary_dim = head_dim。
-    - rotary_dim 可由张量形状推：rotary_dim = x.shape[-1]，或 = cos.shape[-1]*2。
-    - 反之，若要支持 rotary_dim < head_dim(部分旋转)，必须：
-        a. 在 search_fn 里重新加回 slice + cat(pass_through)(否则匹配不上真实图)；
-        b. 再谈把 rotary_dim 传入(或仍从 cos 形状推)。
+  ▶ ★ 关键区分：replace_fn(4 参) ≠ 它调用的 op(7 参/10 参)
+    - “签名必须一致”只约束 search_fn ↔ replace_fn 互相之间(都是张量通配符那几个，如 (x,weight,
+      cos,sin))——因为 matcher 把绑定到的节点按位置传给 replace_fn。
+    - 但 replace_fn 内部调用的算子可以有【更多形参】(num_heads/head_dim/eps 等常量)，这些不来自
+      pattern，而是 replace_fn 从 self 读出填进去：
+          # replace_fn 仍 4 参(与 search_fn 一致)
+          def replace_fn(self, x, weight, cos, sin):
+              op(x, weight, cos, sin, self.num_heads, self.head_dim, self.eps)  # op 7 参 ≠ 4 参
+      对应 schema：op(Tensor x,Tensor weight,Tensor cos,Tensor sin, int num_heads,int head_dim,
+                     float eps) -> ()
+    - 本仓库已这样实现：replace_fn 是实例方法读 self.*；Installer 的 register_fake 用 *args 吸收
+      这些常量入参。
 
-(2) eps：需要，但它是“标量常量”，不是张量输入/通配符
-    - RMSNorm 要用 eps；在子图里 eps 是字面常量(self.eps)，出现在 rsqrt(ms + eps) 的 add 上。
-    - op schema 应带 eps：
-        run_fused_QKNorm_and_ROPE(Tensor x, Tensor weight, Tensor cos, Tensor sin, float eps) -> Tensor
-    - replace_fn 把 eps 作为【常量】喂给 op。注意：staticmethod 读不到 self.eps，
-      应改成【实例方法 / 闭包】捕获 self.eps，或让其接收 eps 形参。
-    - 一句话：eps 需要，但作为“每个模型固定的标量超参”烤成常量传给 op 即可，不必当通配符。
+  ▶ eps：标量常量，不是通配符
+    出现在 rsqrt(ms+eps) 的 add 上；烤进 op 即可。注意 staticmethod 读不到 self.eps，应用实例方法
+    /闭包，或显式接 eps 形参。
 
-(3) 其它 op 真正需要、但同样是“常量/编译期已知”的东西
-    对照真实 host kernel fused_qk_norm_rope，还需要：num_heads_q/k/v、head_dim、is_neox、
-    position_ids，甚至【分开的 q_weight / k_weight】。在 pattern 里：
-    - num_heads、head_dim、eps：配置常量/可从形状推，作为【常量烤进算子调用实参】。
-      ★ 关键区分：【replace_fn 的参数】不必和【它调用的算子(op)的形参】完全一致。
-        * “签名必须一致”只约束 search_fn ↔ replace_fn 互相之间(都是 (x,weight,cos,sin)，
-          因为这 4 个是 matcher 绑定的张量通配符)；
-        * replace_fn 内部调用的算子可以有【更多形参】(num_heads/head_dim/eps 等常量)，
-          这些不来自 pattern，而是 replace_fn 从 self 读出后填进去的。
-      replace_fn 签名仍是 (x, weight, cos, sin)(与 search_fn 一致)，
-      num_heads/head_dim/eps 从 self 读出后传给算子：
-          op(x, weight, cos, sin, num_heads, head_dim, eps)   # 算子 7 参 ≠ replace_fn 4 参
-      对应算子 schema：
-          <op_name>(Tensor x, Tensor weight, Tensor cos, Tensor sin,
-                    int num_heads, int head_dim, float eps) -> Tensor
-      (本仓库已这样实现：replace_fn 改为实例方法读 self.head_num/head_dim/eps；
-       Installer 的 register_fake 用 *args 吸收这些常量入参。)
-    - is_neox/interleave：【不作算子入参】，而是【在 Runner 里按其值选不同的算子】——
-      neox 与 interleave 各注册一个融合算子(不同 op_name)，Runner 据 self.interleave 传入
-      对应 op_name，replace_fn 再按 op_name 解析出该算子。
-      (这样两种风格的 fake/schema/kernel 各自独立，避免在一个算子里塞运行时分支。)
-    - position_ids + 完整 cache：有个【设计分叉】(见下)。
+  ▶ is_neox / interleave：不作算子入参，而是【按其值选不同算子】
+    neox 与 interleave 各注册一个融合算子(不同 op_name)，Runner 据 self.interleave 传对应 op_name，
+    replace_fn 按 op_name 解析算子。这样两种风格的 fake/schema/kernel 各自独立，避免运行时分支。
 
-(4) 关键分叉：gather(按位置查表)在 op 外还是 op 内
-    - 方案 A：gather 留在 op 外(=当前实现)。
-        cos/sin 是 model.forward 里 cos_sin_cache[positions] 之后的结果([num_tokens, half])，
-        即“查表”发生在 op 之外。
-        → op 不需要 position_ids、不需要完整 cache、也不需要 rotary_dim；只吃已取好的 cos/sin。
-        → op 签名可停在 (x, weight, cos, sin, eps)。pattern 不含 cache 索引/arange，易匹配。
-    - 方案 B：gather 进 op(=真实 kernel fused_qk_norm_rope 的做法)。
-        把完整 cache + position_ids 一起传进去、在 kernel 内部 gather
-        (cos_sin_cache + pos_id*rotary_dim)。
-        → op 签名: (qkv, q_w, k_w, cos_sin_cache, position_ids, eps, is_neox, heads...)。
-        → pattern 必须含 cache[positions] 的 gather + arange，匹配更难。
-
-  方案对比：
-    方案 A: op (x,weight,cos,sin,eps)，cos/sin 已按 token 取好；pattern 不含索引；简单易匹配。
-    方案 B: op (qkv,q_w,k_w,cos_sin_cache,position_ids,...)；pattern 含 gather+arange；难匹配。
-
-结论(本节)：
-  - 列的 (x, weight, cos, sin, eps) 对【方案 A】已足够；rotary_dim 不必要。
-  - 要不要更多参数，取决于打算把多少“位置查表 / 头结构”逻辑塞进融合 op —— 塞得越多，
-    pattern 越难匹配。
+  ▶ position_ids / 完整 cos_sin_cache：方案 A【不需要】
+    “按 position 查表”已在 op 外做完，传进来的 cos/sin 是每 token 一行([num_tokens,half])，op 只吃
+    现成 cos/sin。方案 B 才把 cache+position_ids 进 op(kernel 内部 gather)——详见【一·案】。
+  ▶ rotary_dim：全旋转(本仓库)下不必传，可由 cos.shape[-1]*2 推；部分旋转的取舍见【第六节】。
 
 
 ================================================================================
-六、加不加 rotary_dim：两种方案及取舍（全旋转 vs 部分旋转）
+六、rotary_dim：全旋转 vs 部分旋转（slice 加不加进 pattern）
 ================================================================================
 
-两种方式的本质区别：slice/pass_through/cat 这段处理，放在 op 外面还是包进 op 里。
+注意：本节的“全/部分旋转”是【rotary_dim 维度上的 slice 加不加进 pattern】，与【一·案】里
+“gather 在 op 内外”的方案 A/B 是【两条不同的轴】(详见第十节)，勿混。本质区别：
+rot/pass_through 的 slice + 末尾 cat，放在 op 【外】(全旋转)还是包进 pattern/op 【里】(部分旋转)。
 
-  方案 A（不加 rotary_dim）：
-    - search_fn 不含 rot=x[...,:rotary_dim] / pass_through / 末尾 cat。
-    - 只匹配“整段都旋转”(rotary_dim==head_dim)的图；传进 op 的 x 直接是 rot(全部参与旋转)，
-      op/kernel 不用管 pass_through。
-  方案 B（加 rotary_dim）：
-    - 把 slice + pass_through + cat 写进 search_fn → 这些节点进入待匹配子图 → 匹配后整段被
-      替换成 op → op/kernel 内部实现“只旋转前 rotary_dim 维、其余原样透传”。
+  全旋转(不把 slice 写进 pattern)：
+    - search_fn 不含 rot=x[...,:rotary_dim] / pass_through / cat；只匹配 rotary_dim==head_dim 的图，
+      传进 op 的就是整段、全部参与旋转，kernel 不管 pass_through。rotary_dim 由 cos.shape[-1]*2 推。
+  部分旋转(把 slice 写进 pattern)：
+    - slice+pass_through+cat 进 search_fn → 匹配后整段替换成 op → kernel 内部“前 rotary_dim 旋转、
+      其余透传”。代价是 rotary_dim 被当【字面常量烤进 slice】→ 一条 pattern 绑一个 rotary_dim
+      (机制见第十一节)；要支持多值需注册多条。
 
-关键事实：本仓库 runner.build_model 里 rotary_dim = head_dim（始终全旋转）：
-    QKNorm_ROPE(dim=self.head_dim, rotary_dim=self.head_dim, ...)
-  此时 pass_through 恒为空、rot 取全部、末尾 cat 是 no-op（通常被规范化/DCE 折叠）。
+  对比：
+    维度          全旋转(不写 slice)           部分旋转(写 slice)
+    ----------    ---------------------------  ---------------------------------
+    pattern       小、干净 → 易匹配、鲁棒      多 slice/cat → 大、更具体、更脆
+    通用性        仅 rotary_dim==head_dim      支持 rotary_dim <= head_dim
+    rotary_dim    不传，cos.shape[-1]*2 推     字面常量烤进 pattern，一条绑一值
+    kernel        无需 pass_through 逻辑        需“旋转前段+透传后段”(真实 kernel 本就支持)
 
-对比表：
-  维度              方案 A(不加,全旋转)            方案 B(加 rotary_dim,部分旋转)
-  ----------------  -----------------------------  -----------------------------------
-  pattern 复杂度    小、干净 → 易匹配、鲁棒        多 slice/cat → 大、更具体、更脆
-  通用性            仅 rotary_dim==head_dim        支持 rotary_dim <= head_dim
-  op/kernel         无需 pass_through 逻辑          kernel 要实现“旋转前段 + 透传后段”
-                                                   (真实 fused_qk_norm_rope 本就支持)
-  rotary_dim        不传，可由 cos.shape[-1]*2 推   需作为常量烤进 pattern；一条 pattern 绑一个值
-  匹配风险          低                              slice 下标常量要与真实图精确对上，且依赖规范化
-
-方案 B 的隐藏代价：
-  - slice 把 rotary_dim 当字面常量烤进 pattern → 一条 pattern 只能匹配一个特定 rotary_dim；
-    要支持多种 rotary_dim 需注册多条 pattern。方案 A 用形状推，天然不挑具体数值。
-
+关键事实：本仓库 rotary_dim==head_dim(全旋转)，pass_through 恒空、rot 取全部、cat 是 no-op(通常被
+DCE 折掉，见第三节)。
 建议：
-  - 现在(rotary_dim==head_dim) → 用方案 A。更简单、更鲁棒；pass_through 对你是死代码。
-  - 只有确需部分旋转(rotary_dim < head_dim，如某些 GPT-J / rotary_pct 模型) → 才上方案 B：
-    把 slice/pass_through/cat 加进 search_fn，op schema 带 rotary_dim，kernel 实现
-    “前 rotary_dim 旋转、其余透传”(真实 kernel 的 rotary_lanes 即做此事)。
-
-补充：即使走方案 A，kernel 本身仍可保留 rotary_dim 参数(真实 kernel 就有)。区别只在
-“pattern 要不要表达 slice”—— A 不表达(图里没有)，调用时把 rotary_dim 设成 = head_dim
-(或让 kernel 从 cos 长度推)即可。A 不是“kernel 不支持部分旋转”，而是“这次匹配的图不含
-部分旋转，所以 pattern 不写它”。
+  - 现状(全旋转) → 不写 slice，更简单更鲁棒，pass_through 是死代码。
+  - 确需部分旋转(rotary_dim<head_dim，如 GPT-J / rotary_pct) → 才把 slice/cat 写进 search_fn、
+    op schema 带 rotary_dim、kernel 实现透传(真实 kernel 的 rotary_lanes)。
+  - 另：即便不写进 pattern，kernel 本身仍可保留 rotary_dim 形参——区别只在“pattern 要不要表达
+    slice”，不是“kernel 支不支持部分旋转”。(还有第三种折中：把 slice 移出子图换通用性，见
+    一·案“附”的 ▶ 另一种思路。)
 
 
 ================================================================================
-七、rotary_dim 不同是否=不同子图；子图是否要求形状完全一致
+七、rotary_dim 不同=不同子图；针的生命周期；输出/形状约束
 ================================================================================
 
-【问题 1】rotary_dim 不同 → 不同子图吗？看走哪种方案：
+【问题 1】rotary_dim 不同 → 不同子图吗？
+  写了 slice(部分旋转)：是。slice 上界被当字面常量烤进 pattern(end=64 vs end=48 是不同节点)，
+    matcher 按字面匹配 → 一值一条 pattern(详见第十一节)。
+  没写 slice(全旋转)：pattern 不含该常量，靠形状推，不因 rotary_dim 取值而变。
 
-  方案 B(pattern 含 x[..., :rotary_dim] 切片) → 是，不同值=不同子图：
-    - 切片结束下标 rotary_dim 被当字面整数常量烤进 pattern：
-        rotary_dim=64 → slice(dim=-1, start=0, end=64)
-        rotary_dim=48 → slice(dim=-1, start=0, end=48)
-    - 64/48 是节点上的字面常量参数，matcher 按字面匹配 → rotary_dim=64 的 pattern 匹配不上
-      rotary_dim=48 的图 → 要同时支持多个值，需各注册一条 register_replacement。
-  方案 A(无切片,rotary_dim==head_dim) → 不存在该常量：
-    - pattern 不含 rotary_dim 字面常量，隐含 = head_dim、靠形状推，不因 rotary_dim 取值而变。
+【问题 1.5】“不同值=不同子图” → 真要并存多条 register_replacement 吗？分两种工作流
+  先厘清机制：针只在【调用 register_replacement 那一刻】用 example_inputs 把 search_fn trace 一次、
+  把 rotary_dim 烤死存进 pass；之后 model 怎么 torch.compile 重编译，inductor 只拿【这根旧针】去新
+  图里找，【不回头重 trace 针】。⟹ 让针跟上新 rotary_dim 的是【重调 register_replacement】，
+  不是 model 重编译：草堆随重编译更新、针随 register_replacement 更新。(同 一·案“附”。)
+  (1) 先后跑不同值(改 config→重跑脚本)：【不需要】并存。本仓库每次跑都走 install_fusion_pass →
+      register_replacement，用当前 rotary_dim 重 trace 出新针，model 也用同值 → 自然匹配。任一时刻
+      一根针配一个 model，先后切换即可。
+  (2) 同一进程内【同时】支持多值(如常驻服务多 rotary_dim 共存)：才需为每个值各调一次
+      register_replacement，让多根针并存于同一 pass。
 
-【问题 1.5】“不同值=不同子图”→ 真的要并存多条 register_replacement 吗？分两种工作流：
+【问题 2】子图要求输入/输出形状“完全一样”吗？拆成两层
+  (1) 匹配时要不要和 example_inputs 形状完全一致？——【不要】。匹配按“算子结构+字面常量”，
+      batch/token 维基本符号化，[8,8,64] trace 的针能匹配 [16,8,64]/[N,8,64]。看不看哪些维度
+      (size/秩/写死的字面尺寸)详见【一·补 (H)】。
+  (2) replace 的输出要不要等形等类型？——【要(必须)】。replace 是就地替换，op 输出要能无缝顶替
+      原子图输出(shape/dtype/device 等价)，否则下游形状传播崩。这正是 fake 写成 torch.empty_like(x)
+      的原因(RMSNorm+RoPE 不改形状=x 形状)；输入因共享同一批绑定张量天然一致。若 op 改形状，
+      fake 须按真实逻辑算出正确输出形状。
 
-  先厘清一个关键机制：pattern(针)只在【调用 register_replacement 那一刻】用 example_inputs
-  把 search_fn trace 一次、把 rotary_dim 烤死存进 pass；之后 model 怎么 torch.compile 重编译，
-  inductor 只是拿【这根已烤好的旧针】去新图里找，【不会回头重新 trace search_fn】。
-  ⟹ 让针跟上新 rotary_dim 的，是【重新调用 register_replacement】(重新 trace 出新常量的针)，
-     【不是】model 重编译。草堆随 model 重编译更新；针只随 register_replacement 更新。
-
-  (1) 先后跑不同值(改 config→重跑脚本) → 【不需要】并存多条：
-      本仓库每次运行都会走 installer.install_fusion_pass() → 内部 register_replacement(search_fn,
-      replace_fn, example_inputs)；而 search_fn 里 rot=x[..., :self.rotary_dim] 的 self.rotary_dim
-      来自当前 config。故改 config 的 rotary_dim 后重跑脚本：install_fusion_pass 重跑 → 用新
-      rotary_dim【重新 trace 出新针(end=48)】→ model 也 end=48 → 自然匹配。
-      ★ 生效靠的是“重跑脚本时 register_replacement 也重跑了(重新注册)”，不是“重编译自动更新针”。
-        任一时刻只有一根针、配一个 model，先后切换值即可，无须手动维护多条。
-
-  (2) 同一进程内要【同时】支持多值 → 才【需要】并存多条：
-      若 install_fusion_pass 只在进程启动调用一次、之后想用【同一个已装好的 pass】既匹配 64 又
-      匹配 48 的子图(如一个常驻服务里多种 rotary_dim 共存) → 一根针只认一个值 → 必须为每个值各
-      调一次 register_replacement，让多根针并存于同一 pass。文档下文“需各注册一条”指的就是【这种
-      “同时支持多个值”】的场景。
-  小结：要不要多条，取决于“多个 rotary_dim 是【先后】出现还是【同时】出现”。本仓库是先后(每次
-        重跑 install_fusion_pass 重注册)，故一条即可；常驻进程同时多值才需多条。
-
-【问题 2】子图要求输入/输出形状“完全一样”吗？拆成两个不同的“一样”：
-
-  (1) pattern 匹配时，要不要和 example_inputs 的具体形状完全一致？ —— 不要。
-      - register_replacement 用 example_inputs(具体形状如 [8,8,64]) trace 出 pattern，
-        但匹配按“算子结构 + 节点上的字面常量”进行，维度大小基本保持【符号化】、不被钉死。
-      - 用 [8,8,64] trace 的 pattern，能匹配 [16,8,64]、[N,8,64] 等不同 batch/token 数的图。
-      - 真正约束匹配的是字面常量：slice 下标、cat/mean 的 dim=-1、dtype、显式 view/reshape
-        里写死的尺寸等。
-        * cat([c, c], dim=-1) 是“两个输入喂给 cat”的结构(不是尺寸常量)，不挑具体长度；
-        * x.view(8, 512) 里的 512 是会挑的字面尺寸。
-
-  (2) replace 的输出，要不要和 search 的输出形状/类型一致？ —— 要(必须)。
-      - replace 是就地替换：matcher 把图里那段换成 op，下游节点原样接着用 op 的输出，
-        故 op 产出张量必须能无缝顶替原子图输出 —— shape / dtype / device 等价，否则下游对不上、
-        形状传播会崩。
-      - 这正是 fake 实现写成 torch.empty_like(x) 的原因：声明“输出 == 输入 x 的形状/类型”，
-        与 search_fn 输出(RMSNorm+RoPE 不改形状 = x 形状)一致。
-      - 输入：replace 与 search 共享“同一批被绑定的张量”(按位置传入)，天然一致。
-      - 输出：必须等价(可被下游替用)。若 op 会改形状，fake 须按真实逻辑算出正确输出形状。
-
-小结：
-  - rotary_dim 作为切片常量会让方案 B 的子图随值而异；方案 A 无此常量。
-  - 针只在 register_replacement 时 trace、烤死常量；model 重编译只更新草堆、不重 trace 针。
-    先后跑不同值=每次重跑 install_fusion_pass 重注册(一条即可)；同一进程同时多值才需并存多条。
-  - pattern 匹配对 batch/token 这类维度是【形状无关】的，只钉住“结构 + 字面常量”。
-  - replace 的【输出必须能等形等类型地顶替】search 的输出(fake 用 empty_like(x))。
-  - “结构常量 → 不同值=不同子图”这一结论不止 rotary_dim，对 Hq/Hk/Hv/head_dim/interleave
-    同样成立(合并 qkv 后 search 里有 view/slice 切 Q/K/V)；详见第十一节。
+小结：rotary_dim 作切片常量令“部分旋转”子图随值而异、全旋转无此常量(见第六/十一节)；针随
+register_replacement 更新、草堆随重编译更新；匹配对 batch/token 形状无关、但 replace 输出必须等形
+等类型顶替(fake=empty_like)。
 
 
 ================================================================================
@@ -390,108 +944,74 @@ _apply_rope 的 slice/cat：
 九、总纲（速查）
 ================================================================================
 
-- matcher 匹配“图 vs 图”：search_fn trace 成针，去 model 编译图(草堆)找同构子图替换成 op。
-- search 与 replace【签名必须一致】；可变张量(weight/cos/sin)要作【输入=通配符】，
-  从 self 读的会被烤成常量、只匹配单一实例且更脆。
-- 不能直接用 _apply_rope(缺 RMSNorm/weight、带 slice/cat、闭包 self)；
-  不能用整个 forward(签名只剩 x、把 weight/cache 烤死、引入 arange/gather)。
-- 要复用就把核心数学抽成【不依赖 self 的纯函数(x,weight,cos,sin,eps)】给 model 与 search 共用。
-- eps 需要(标量常量，烤进 replace_fn，别用 staticmethod)；rotary_dim 在“全旋转”下不必要
-  (可由 cos.shape[-1]*2 推)。num_heads/head_dim 同为常量/可推。
-- op 不需要 position_ids、也不需要完整 cos_sin_cache：因为“按 position 查表”
-  (cos_sin_cache[positions]) 已在 model.forward 即【op 外面】做完，传进来的 cos/sin 是
-  已取好的每 token 一行([num_tokens, half])；op 只吃现成 cos/sin(=方案 A)。
-- num_heads/head_dim/eps 作为【常量烤进算子调用实参】：replace_fn 签名仍 (x,weight,cos,sin)，
-  内部 op(x,weight,cos,sin,num_heads,head_dim,eps)；register_fake 用 *args 吸收这些常量。
-- “签名必须一致”只约束 search_fn↔replace_fn(都 4 参=张量通配符)；【replace_fn 的参数不必与它
-  调用的算子形参一致】——算子可多带常量入参(7 参)，由 replace_fn 从 self 填入。
-- is_neox/interleave 不作算子入参，而是【Runner 按其值选不同算子】(neox / interleave 各一个
-  op_name)；replace_fn 据 op_name 解析对应算子。
-- gather 在 op 外(方案 A，签名 (x,weight,cos,sin)+常量 eps/heads，易匹配) vs 进 op(方案 B，含
-  cache+position_ids，难匹配)；本仓库当前是方案 A。
-- 全旋转用方案 A(简单稳)；确需部分旋转(rotary_dim<head_dim)才用方案 B(通用，但 pattern
-  更大更脆、且 rotary_dim 作为切片常量 → 一条 pattern 绑一个值)。
-- 【模型结构】(单一 x ↔ 合并 qkv / 共享 ↔ 分离 q/k 权重 / 全处理 ↔ 仅 QK+V 透传) 与
-  【gather 位置 A/B】是两条【正交轴】，可任意组合：合并 qkv 也能配方案 A(详见第十节)。
-- 切片/形状常量(rotary_dim、Hq/Hk/Hv、head_dim、interleave)在 trace 时烤成字面量 →
-  不同取值=不同子图；把它们“形参化”成普通 int 也一样烤死，不能做张量通配符；要覆盖多组配置
-  只能注册多条 pattern(详见第十一节)。
-- 复用纯函数避免漂移已落地：model 里 rms_norm_pure / rope_pure 同时被 FusedQKVNormRope.forward
-  与 RMSNormRoPEreplacePass.search_fn 调用(单一真相源)。
+前置铺垫(已系统展开，速查时按需跳转)：
+  - 方案 A/B 的 search_fn/example_inputs/replace_fn/op schema 对照、优缺点 → 见【一·案】。
+  - 匹配比对什么、算子类别(逐点稳/gather 脆)、影响因素、dynamic、烤死 vs 通配符、形状三层
+    → 见【一·补 (A)–(H)】。
+
+核心结论：
+- matcher 匹配“图 vs 图”：search_fn trace 成针，去 model 编译图(草堆)找同构子图替换成 op；
+  比的是【降级图结构 + 字面常量】，不比张量数值、对 batch/token size 符号化(详见 一·补 A/H)。
+- 张量(weight/cos/sin/cache)作 search_fn 形参=【通配符】，可绑定并转交给 op；从 self 读的张量被
+  【烤死】(绑不了/传不出/不泛化，详见 一·补 G)。标量(eps/heads/dim)才烤成常量。
+- 反面教材(详见第二节)：不能直接用 _apply_rope(缺 RMSNorm/weight、链路内 slice/cat、闭包 self)；
+  不能用整个 forward(签名只剩 x、self 读被烤死、引入 arange/gather)。正确姿势=抽纯函数两边共用。
+- ★ replace_fn(4 参) ≠ 它调用的 op(7 参/10 参)：签名一致只约束 search_fn↔replace_fn(张量通配符)；
+  op 可多带常量入参(num_heads/head_dim/eps)，由 replace_fn 从 self 填入(详见第五节)。
+- is_neox/interleave 不作算子入参，而是【Runner 按其值选不同 op_name】(详见第五节)。
+- gather 在 op 外(方案 A，易匹配) vs 进 op(方案 B，含 cache+positions，难匹配、需 dynamic=False、
+  且 gather 降级形态受动态形状影响)；本仓库取方案 A(详见 一·案、一·补 D)。
+- rotary_dim：全旋转(本仓库)不把 slice 写进 pattern、靠形状推；部分旋转才写 slice，rotary_dim 被
+  当字面常量烤死、一条 pattern 绑一值(详见第六、十一节)。
+- 针随 register_replacement 更新、草堆随 torch.compile 重编译更新(详见第七节问题 1.5、一·案附)。
+- replace 输出必须等形等类型顶替 search 输出(fake=empty_like，详见第七节问题 2)。
+- 复用纯函数避免漂移已落地：model 与 search_fn 共用 util.rms_norm_pure / rope_pure(单一真相源)。
 
 
 ================================================================================
-十、合并 qkv 模型 + “模型结构”与“gather 位置 A/B”是两条正交轴
+十、模型结构 × gather 位置：两条正交轴（合并 qkv 也能配方案 A）
 ================================================================================
 
-真实 vLLM 的 qkv 是【一整块合并张量】：[num_tokens, (Hq+Hk+Hv)*head_dim]，每 token 内按
-[Q 头… | K 头… | V 头…] 连续；仅 Q、K 头做 QK-Norm+RoPE，V 头【透传】；Q、K 各用一份独立
-的 γ(q_weight / k_weight)。本仓库的 FusedQKVNormRope(model.py) 即此形态的参考实现。
+真实 vLLM 的 qkv 是【一整块合并张量】[num_tokens,(Hq+Hk+Hv)*head_dim]，每 token 内
+[Q…|K…|V…] 连续；仅 Q/K 做 QK-Norm+RoPE、V 透传、Q/K 分离 γ。本仓库 FusedQKVNormRope 即此形态。
 
-(1) 两条【正交】的设计轴（可任意组合，不要混为一谈）
-    轴 1·模型结构：单一 x[num_tokens,num_heads,head_dim] ↔ 合并 qkv；共享 γ ↔ Q/K 分离 γ；
-                  全头处理 ↔ 仅 QK 处理 + V 透传。
-    轴 2·gather 位置(=方案 A/B)：cos/sin 在 op 外已 gather(A) ↔ 完整 cache+position_ids 进
-                  op 内 gather(B)。
-    玩具实现 = (单一 x)×(A)；真实 kernel = (合并 qkv)×(B)。但对角/混搭都成立——
-    【合并 qkv 也可以配方案 A】。
+  ▶ 两条【正交】的设计轴(可任意组合，勿混)：
+    轴 1·模型结构：单一 x ↔ 合并 qkv；共享 γ ↔ Q/K 分离 γ；全头处理 ↔ 仅 QK + V 透传。
+    轴 2·gather 位置(=方案 A/B)：cos/sin 已在 op 外 gather(A) ↔ cache+positions 进 op 内 gather(B)。
+    玩具 = (单一 x)×(A)；真实 kernel = (合并 qkv)×(B)；但混搭都成立——【合并 qkv 也能配方案 A】。
 
-(2) 合并 qkv + 方案 A：op 签名与 pattern 形态
-    op(qkv, q_weight, k_weight, cos, sin, num_heads_q, num_heads_k, num_heads_v, head_dim, eps)
-      其中 cos/sin 已 gather [num_tokens, half]；num_heads_q/k/v、head_dim、eps 是常量。
-    search_fn 子图(与 FusedQKVNormRope.forward 同构)：
-      view→切 Q/K/V → Q/K 各自 RMSNorm(分离权重) → 前 rotary_dim 维 RoPE(其余透传) →
-      V 透传 → cat → reshape。
-    与“单一 x + A”相比，pattern 多了【Q/K/V 的 view+slice、双权重 RMSNorm、V 透传的
-    cat+reshape】——这来自【轴 1(合并 qkv)】；但【仍不含 gather/arange】——因为仍是【轴 2=A】。
-    即：合并 qkv 让 pattern 变大；A/B 只决定要不要再把 cache 索引也塞进 pattern。
+  ▶ 合并 qkv + 方案 A 的 pattern 形态(op 签名/example_inputs 详见【一·案】)：
+    view→切 Q/K/V → Q/K 各自 RMSNorm(分离权重) → 前 rotary_dim 维 RoPE → V 透传 → cat → reshape。
+    比“单一 x + A”多了【Q/K/V view+slice、双权重 RMSNorm、V 透传 cat+reshape】——这来自【轴 1】；
+    但【仍不含 gather/arange】——因为仍是【轴 2=A】。即：合并 qkv 让 pattern 变大；A/B 只决定要不要
+    再把 cache 索引塞进 pattern。
 
-(3) 方案 A 也能复用 stock kernel(无需另写)
-    stock kernel 内部按 cos_sin_cache + position_ids[token]*rotary_dim 取行。方案 A 下把
-    【已 gather 的 cos/sin([num_tokens, rotary_dim])】当 cos_sin_cache 传、position_ids 传
-    arange(num_tokens)，内部 gather 退化为恒等，等价“外面查好、里面直取第 token 行”。
+  ▶ 方案 A 也能复用 stock kernel：把【已 gather 的 cos/sin】当 cos_sin_cache 传、position_ids 传
+    arange(num_tokens)，kernel 内部 gather 退化为恒等(=“外面查好、里面直取第 token 行”)。
 
-(4) 本仓库实现现状
-    - model.py：保留 QKNorm_ROPE(单一 x)；新增 FusedQKVNormRope(合并 qkv，方案 A)；
-      抽出纯函数 rms_norm_pure / rope_pure 供模型与 search 共用。
-    - rmsnorm_rope_replace_pass.py：RMSNormRoPEreplacePass 改为合并 qkv 版
-      (search_fn/replace_fn/make_example_inputs 均按 (qkv,q_weight,k_weight,cos,sin) + 常量)。
-    - runner.py：is_qkv 开关选 QKNorm_ROPE / FusedQKVNormRope；util.make_inputs_qkv 造合并
-      qkv 输入；op_name = ROPE_cuda::fused_qkv_norm_rope_{neox,interleave}。
+  ▶ 本仓库现状：model.py 有 QKNorm_ROPE(单一 x) 与 FusedQKVNormRope(合并 qkv，方案 A)，共用纯函数；
+    rmsnorm_rope_replace_pass.py 按 (qkv,q_weight,k_weight,cos,sin)+常量；runner 据 interleave 选
+    op_name = ROPE_cuda::fused_qkv_norm_rope_{neox,interleave}。
 
 
 ================================================================================
-十一、切片/形状常量为何“不同值=不同子图”；“形参化”不改变这一点
+十一、结构/形状常量“不同值=不同子图”；“形参化”不改变这一点
 ================================================================================
 
-search_fn 里凡是进了 view / slice / reshape 的【整数】(rotary_dim、Hq/Hk/Hv、head_dim)，
-以及切换算子序列的 interleave，都是【结构/形状常量】，在 trace 时被烤成图里的字面量。
+(承接第七节问题 1、一·补 (H)：此处专讲“为何形参化也救不了”。)
+search_fn 里进了 view/slice/reshape 的【整数】(rotary_dim、Hq/Hk/Hv、head_dim)与切换算子序列的
+interleave，都是【结构/形状常量】，trace 时烤成图里的字面量 → 不同值=不同子图(每个值各一条 pattern)。
 
-(1) 以 _qk_norm_rope 里的 rot = x[..., :rotary_dim] 为例
-    trace 时 rotary_dim 是具体 int(如 64) → slice 节点带字面上界 slice(dim=-1,0,64)。
-    - 不同 rotary_dim 值 = 结构不同的 pattern(slice 上界常量不同)；
-    - 之所以能匹配，是因为【同一份 rotary_dim 同时喂给 model 与 search_fn】，两边 slice 常量
-      一致 → 对得上。措辞要准：不是“任意 rotary_dim 都匹配同一条 pattern”，而是“对某个固定
-      rotary_dim，search 与 model 一致才匹配”，每个值是各自独立的一条 pattern。
+  ▶ 关键澄清：把这些常量“作为形参”分两种，结论不同——
+    a. 形参 = 普通 Python int(闭包/默认值/传参后固定)：与从 self 读【完全一样】，trace 时仍是具体
+       int、照样烤成字面常量 → 形参化【不会】让一条 pattern 覆盖多值。
+    b. 形参 = register_replacement 的【张量通配符】：【做不到】——通配符是张量，而 slice 上界/view
+       尺寸必须是 int/SymInt，不能是待绑定张量 → 这些常量注定烤死，无法“匹配任意值”。
 
-(2) 把 rotary_dim“作为形参”——分两种，结论不同
-    a. 形参 = 普通 Python int(闭包捕获 / 默认值 / 传参后固定)：与从 self 读【完全一样】。
-       只要 trace 时是具体 int，照样烤成 slice 字面常量 → 不同值=不同子图。形参化【不会】
-       让一条 pattern 覆盖多个 rotary_dim。
-    b. 形参 = register_replacement 的【张量通配符】(example_inputs 里的输入)：【做不到】。
-       通配符是张量，而 slice 上界必须是 int/SymInt，不能是待绑定的张量 → rotary_dim 注定
-       是常量，无法“匹配任意值”。
-
-(3) 同理适用于 Hq/Hk/Hv、head_dim、interleave
-    - qkv.view(num_tokens, H, head_dim) 的 H、head_dim；
-    - v[:, :Hq] / v[:, Hq:Hq+Hk] 切 Q/K/V 的上下界 Hq/Hk；
-    - interleave 切换 neox / interleave 的算子序列结构。
-    全是 trace 时烤死的字面常量/分支选择。
-
-(4) 实务结论
-    一条注册的 pattern ↔ 一组具体的 (rotary_dim, Hq, Hk, Hv, head_dim, interleave)。
-    要支持多种取值，只能【为每组配置各注册一条 register_replacement】(循环注册多条 pattern)，
-    而非指望一条 pattern 泛化。
-- 匹配对 batch/token 维度【形状无关】(维度符号化)，只钉“结构 + 字面常量(slice 下标/dim/
-  dtype/写死的 reshape 尺寸)”；replace 的【输出必须等形等类型顶替】search 输出
-  (fake = empty_like(x))。
+  ▶ 例(rot = x[..., :rotary_dim])：rotary_dim=64→slice(...,0,64)、48→slice(...,0,48) 是不同节点；
+    能匹配是因为【同一份 rotary_dim 同时喂给 model 与 search_fn】，不是“一条 pattern 通吃任意值”。
+  ▶ 同理 Hq/Hk/Hv、head_dim(view/切 Q/K/V 的尺寸)、interleave(选 neox/interleave 算子序列)。
+  ▶ 实务：一条 pattern ↔ 一组具体 (rotary_dim, Hq, Hk, Hv, head_dim, interleave)；要覆盖多组只能
+    各注册一条 register_replacement，别指望一条泛化。
+  ▶ 对比【形状大小】：batch/token 这类维度【符号化、不挑具体值】(与上面“结构常量挑值”相反；
+    size/秩/字面尺寸三层区分详见 一·补 (H))；replace 输出须等形等类型顶替(fake=empty_like)。

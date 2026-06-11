@@ -1,0 +1,198 @@
+================================================================================
+torch 各类算子是否搬运 HBM —— view(零搬运) vs materialize(读+算+写)
+================================================================================
+
+本文回答“某个 torch 算子会不会把数据从 HBM 读进计算核心、再写回 HBM”，用于判断算子的
+访存成本。承接 search_fn 子图匹配里的讨论：x.view()/x[:, :n] 这类是【零搬运的 view】，而
+cos_sin_cache[positions] 这类高级索引是【要搬运的 gather】。
+
+  目录：
+    一、核心概念：view(改元数据) vs materialize(产生新张量)
+    二、判断原则：输出是否与输入【共享 storage】
+    三、分类表 A：零搬运(view 类，O(1) 改元数据)
+    四、分类表 B：必搬运(materialize 类，读+算+写 HBM)
+    五、分类表 C：条件性(看 contiguous / dtype / 形状)
+    六、关键区分：eager(逐 op 各自 HBM 往返) vs torch.compile(融合后中间量不落 HBM)
+    七、隐藏成本：view 本身零搬运，但非连续 view 可能让【下游】算子触发拷贝
+    八、怎么自己验证(data_ptr / _base / is_contiguous)
+    九、与本项目的关系
+    十、速查小结
+
+
+================================================================================
+一、核心概念：view(改元数据) vs materialize(产生新张量)
+================================================================================
+
+一个张量 = 【一块连续显存(storage) + 一组元数据(shape / stride / offset / dtype)】。算子对
+数据的处理只有两种本质形态：
+
+  - view(视图)：【不动 storage】，只返回一组【新的元数据】指向【同一块显存】。
+      → 无 kernel、无 HBM 读写、O(1)。例：x.transpose(0,1) 只是交换 stride。
+  - materialize(物化)：【分配一块新 storage】，启动 kernel，把输入从 HBM 读进核心、算完再
+      把结果写回 HBM。→ 有真实 HBM 流量。例：x + y、cat、gather。
+
+“会不会搬 HBM” = “这个算子是 view 还是 materialize”。
+
+
+================================================================================
+二、判断原则：输出是否与输入【共享 storage】
+================================================================================
+
+  共享 storage(同一块显存) → view → 零搬运。
+  另开 storage(新显存)     → materialize → 搬运。
+
+经验法则：
+  - 只改“怎么看这块内存”(形状/步长/起点/转置/广播) → 多半是 view。
+  - 要“算出新数值”或“把数据重新摆放到新位置”(逐点运算、归约、按索引收集、拼接、改 dtype)
+    → 必然 materialize。
+
+
+================================================================================
+三、分类表 A：零搬运(view 类，O(1) 改元数据，与输入共享 storage)
+================================================================================
+
+  算子                                   说明
+  -------------------------------------  --------------------------------------------------
+  view / view_as                          改形状(要求 stride 兼容)；不兼容会报错(不会偷偷拷贝)
+  transpose / t / T / swapaxes / mT       交换维度，仅换 stride → 结果【非连续】
+  permute / movedim                       重排维度，仅换 stride → 结果【非连续】
+  squeeze / unsqueeze                     增删长度 1 的维；unsqueeze 即 x[:,None,:] 那种
+  expand / broadcast_to                   广播：stride=0 的“假维”，不复制数据(对比 repeat 会复制)
+  narrow                                  沿某维取连续区间
+  基础切片 x[1:3] / x[:, :n] / x[..., :k]  start/stop/step 为 int 或 slice → view
+  select / x[i](整数索引单个)              取一片(降一维)
+  diagonal / unfold(Tensor.unfold)         按 stride 取对角线/滑窗(view)
+  as_strided                              直接指定 stride/offset(底层 view 原语)
+  chunk / split / tensor_split / unbind    返回的【每一片都是 view】
+  flatten / ravel / reshape               【条件性】：stride 兼容→view；否则→拷贝(见表 C)
+  detach / requires_grad_                  只改 autograd 元数据，不动数据
+  real / imag / view_as_real/complex       复数视图
+
+  ★ 共同点：这些都【不启动计算 kernel、不读写数据】，只生成新元数据。代价 O(1)，与张量大小无关。
+
+
+================================================================================
+四、分类表 B：必搬运(materialize 类，分配新 storage + kernel + HBM 读写)
+================================================================================
+
+  类别            算子                                          访存
+  --------------  --------------------------------------------  --------------------------------
+  逐点 pointwise  add/sub/mul/div/neg/abs/exp/log/sqrt/rsqrt    读全部输入 + 写同形输出
+                  /pow/sigmoid/tanh/relu/gelu/clamp/where/比较
+  归约 reduction  sum/mean/prod/max/min/var/std/norm/argmax     读全部输入 + 写(更小)输出
+                  /logsumexp/softmax/cumsum/cumprod
+  矩阵/卷积       matmul/mm/bmm/addmm/einsum/linear/conv         读输入 + 写输出(计算密集)
+  高级索引/聚散   x[idx_tensor] / x[mask] / gather / index_      读被索引数据 + 写收集结果
+                  select / take / masked_select / scatter(_add) (本文开头那个 cache[positions])
+                  / index_put / index_copy
+  形状重排(物化)  cat/stack/hstack/vstack/repeat/repeat_         读输入 + 写到新布局
+                  interleave/tile/roll/flip
+  排序/统计       sort/topk/argsort/unique/bincount/cummax       读输入 + 写输出
+  拷贝/转换       clone / copy_ / contiguous(非连续时) /          读 + 写(纯搬运，无运算)
+                  to(改 dtype/device 时) / type 转换
+  填充           pad / F.unfold / F.fold                         读 + 写到新布局
+
+  ★ 共同点：输出在【新 storage】，必有 HBM 写；输入需 HBM 读。即便像 clone/contiguous 这种
+    “不算数”的，也是纯搬运(读+写)，仍占 HBM 带宽。
+
+
+================================================================================
+五、分类表 C：条件性(同一算子，有时 view、有时拷贝)
+================================================================================
+
+  算子              view(零搬运)的条件            否则(materialize 拷贝)
+  ----------------  ----------------------------  ------------------------------------------
+  reshape           目标形状与当前 stride 兼容     不兼容(如转置后)→ 等价 contiguous()，【拷贝】
+  flatten / ravel   同 reshape                     同上
+  contiguous()      已经连续 → no-op(返回自身)      非连续 → 重排到连续，【拷贝】
+  to(dtype/device)  目标与当前【完全相同】→ no-op   不同 dtype/device → cast/搬移，【拷贝】
+  expand 后接写操作  expand 本身是 view             被某些“要求连续”的算子消费 → 触发拷贝(见七)
+  x[None]/unsqueeze 永远 view                       —
+  x[bool_mask]      —                              永远 materialize(输出大小运行期才知道)
+
+  ⟹ “.to(dtype) 是否搬运”在子图匹配里尤其重要：同 dtype 时是 no-op、图里不留节点
+     (详见 search_fn_replace_fn_pattern_matching.txt 的 (E) 节)。
+
+
+================================================================================
+六、关键区分：eager vs torch.compile —— “搬不搬”答案不同
+================================================================================
+
+同一串算子，在两种执行模式下的 HBM 行为【不一样】：
+
+  (1) eager(逐 op 执行)：
+      每个 materialize 算子 = 一个【独立 CUDA kernel】 = 各自一次 HBM 读 + 一次 HBM 写。
+      中间结果统统【落 HBM 再读回】。例：y = relu(a + b) 在 eager 下：
+        kernel1: 读 a,b → 写 tmp(=a+b) 到 HBM
+        kernel2: 读 tmp → 写 y(=relu(tmp)) 到 HBM
+      → 中间量 tmp 白白 HBM 往返一次。
+
+  (2) torch.compile / Inductor(融合)：
+      连续的【逐点 + 归约】算子被【融合进一个 kernel】，中间结果留在【寄存器/共享内存】，
+      【不写回 HBM】。view 算子被【折进索引算术】(等于免费)。只有融合组的【输入(读)】和
+      【最终输出(写)】碰 HBM。同例融合后：
+        single kernel: 读 a,b → 片上算 a+b、再 relu → 写 y
+      → tmp 从不落 HBM。这正是“算子融合省带宽”的本质。
+
+  ⟹ 所以判断访存要分清场景：
+     - 表 B 描述的是【单个算子在 eager 下】的访存；
+     - 在融合 kernel 里，逐点链的【中间量】不落 HBM，只有边界张量(输入/输出)落。
+     - 融合【改变不了】的是：gather/matmul 这种本身要大范围搬运/计算的，仍是各自的访存大头；
+       view 在两种模式下都零搬运。
+
+
+================================================================================
+七、隐藏成本：view 零搬运，但“非连续 view”可能让下游算子触发拷贝
+================================================================================
+
+view 本身 O(1)，但 transpose/permute 产出的张量是【非连续(non-contiguous)】的。后续若遇到：
+  - reshape/view 到不兼容形状 → 必须先 contiguous() → 【拷贝】；
+  - 某些要求连续内存的算子(部分 kernel、.view()、一些 cuBLAS 路径) → 内部 contiguous → 【拷贝】。
+所以“transpose 不搬数据”对，但“transpose 之后那步”可能替它把数据搬了。判断访存要看【整条链】，
+不能只看单个 view 算子。
+
+  例：x.transpose(0,1).reshape(-1)   # transpose 是 view(0 搬)，但 reshape 因非连续 → 拷贝(搬)
+
+
+================================================================================
+八、怎么自己验证
+================================================================================
+
+  - 是否 view(共享 storage)：
+        y = x.transpose(0,1)
+        y._base is x            # view 通常有 _base 指向源张量
+        x.untyped_storage().data_ptr() == y.untyped_storage().data_ptr()   # 同一块显存 → True
+  - 是否连续：
+        x.is_contiguous()       # transpose/permute 后多为 False
+  - materialize 算子(add/cat/gather/clone) → data_ptr 不同、_base is None。
+
+  注意：data_ptr 相同只说明“没另开显存”(view)；不同则说明物化了。
+
+
+================================================================================
+九、与本项目的关系
+================================================================================
+
+  - search_fn / 真实 kernel 里的 qkv.view(num_tokens,H,head_dim)、v[:, :Hq] 等切 Q/K/V：
+    都是【view(零搬运)】，只改元数据，不产生 HBM 流量。
+  - cos_sin_cache[positions, :half]：是【gather(高级索引)】→ materialize → 有 HBM 读写。
+    这正是“方案 A(gather 在 op 外)多一次 kernel 发射 + cos/sin 的 HBM 二次搬运”的来源
+    (见 search_fn_replace_fn_pattern_matching.txt 一·案 的优缺点权衡)。
+  - 融合 kernel(QK-Norm+RoPE)：把 RMSNorm、旋转等【逐点链的中间量留在片上】，不落 HBM；
+    只读入 qkv/cos/sin、写出结果。这是融合相对 eager(每步各落 HBM)的带宽收益。
+
+
+================================================================================
+十、速查小结
+================================================================================
+
+  - 零搬运(view，O(1) 改元数据)：view/reshape*/transpose/permute/squeeze/unsqueeze/expand/
+    narrow/基础切片(int|slice)/select/chunk/split/unbind/detach。(*reshape 见条件性)
+  - 必搬运(materialize，新 storage + kernel)：逐点/归约/matmul/conv、高级索引 gather/scatter、
+    cat/stack/repeat、sort/topk/cumsum、clone/contiguous(非连续)/to(改 dtype)。
+  - 条件性：reshape/flatten(stride 兼容→view 否则拷贝)、contiguous()(已连续→no-op)、
+    to(dtype)(同 dtype→no-op)、bool 掩码索引(永远物化)。
+  - eager：每个 materialize 算子各自一次 HBM 读+写(中间量落 HBM)；
+    torch.compile：逐点链融合，中间量留片上不落 HBM，view 折进索引(免费)。
+  - view 零搬运，但非连续 view 可能让下游(reshape/需连续的算子)替它触发拷贝——看整条链。
+  - 一句话：改“怎么看内存”→ view 零搬；算新值/重新摆放/换 dtype/按张量索引 → materialize 搬 HBM。
