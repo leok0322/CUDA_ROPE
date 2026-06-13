@@ -1,0 +1,160 @@
+================================================================================
+如何溯源一个 libtorch 宏：以"找到 C10_UNLIKELY_OR_CONST 那段注释"为例
+================================================================================
+
+目标问题：TORCH_CHECK 展开里用了 C10_UNLIKELY_OR_CONST，它在 nvcc 下被特判去掉——
+          为什么？这个"为什么"写在哪、怎么找到的？
+结论先行：宏的"为什么"通常【不在用它的地方】，而在它被 #define 的那一行【上方的注释】里
+          （作者常附 GitHub issue 号）。顺着"grep 定义 → 读上下文"就能找到。
+
+最终找到的那段注释（torch/headeronly/util/Exception.h，C10_UNLIKELY_OR_CONST 定义正上方）：
+    // On nvcc, C10_UNLIKELY thwarts missing return statement analysis. In cases where the
+    // unlikely expression may be a constant, use this macro to ensure return statement
+    // analysis keeps working (at the cost of not getting the likely/unlikely annotation on nvcc).
+    // https://github.com/pytorch/pytorch/issues/21418
+
+  目录：
+    一、第 0 步：定位 libtorch 头文件目录
+    二、第 1 步：找 TORCH_CHECK 的定义文件与行号
+    三、第 2 步：读 TORCH_CHECK 展开，发现它调用了别的宏
+    四、第 3 步：追 C10_UNLIKELY_OR_CONST 的【定义在哪个文件】
+    五、第 4 步：打印宏定义，看清 #if 分支
+    六、第 5 步：读定义【上方的注释】——答案在这里
+    七、可复用的方法论（追任何陌生宏的"为什么"）
+    八、用到的命令/工具小抄
+
+
+================================================================================
+一、第 0 步：定位 libtorch 头文件目录
+================================================================================
+
+宏不在本项目里，在安装的 torch 包的头文件中。先问出 include 路径：
+
+    # 用命令替换 $(...) 把 python 的输出直接赋给变量 INC（后续 grep 用 "$INC" 少打长路径）
+    INC=$(python -c "import torch,os; print(os.path.join(os.path.dirname(torch.__file__),'include'))")
+    echo "$INC"
+    # → /home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/include
+
+说明：INC 是自起的 shell 变量名；$(...) 是【命令替换】，把括号里命令的标准输出当作字符串赋给
+      INC。之后 "$INC" 取它的值，双引号防路径含空格/通配符出错。后续都在 "$INC" 下搜。
+
+
+================================================================================
+二、第 1 步：找 TORCH_CHECK 的定义文件与行号
+================================================================================
+
+TORCH_CHECK 是 c10 异常设施，标准位置是 c10/util/Exception.h（凭经验直接查它）：
+
+    F=$INC/c10/util/Exception.h
+    grep -n "define TORCH_CHECK\b\|define TORCH_CHECK(" $F
+    # → 552 / 566 / 584 / 593  （四个版本，按 STANDALONE_TORCH_HEADER / STRIP_ERROR_MESSAGES 切换）
+
+要点：grep 用 "define 宏名" 精确找【定义处】，避免混进大量"使用处"。
+
+
+================================================================================
+三、第 2 步：读 TORCH_CHECK 展开，发现它调用了别的宏
+================================================================================
+
+读 Exception.h 的 456–605 行，看到生效版本（普通 torch 扩展走这条）：
+
+    #define TORCH_CHECK(cond, ...)                     \
+      if (C10_UNLIKELY_OR_CONST(!(cond))) {            \
+        ::c10::detail::torchCheckFail(__func__, __FILE__, static_cast<uint32_t>(__LINE__), \
+            TORCH_CHECK_MSG(cond, "", ##__VA_ARGS__)); \
+      }
+
+关键观察：它内部用了【C10_UNLIKELY_OR_CONST】和【TORCH_CHECK_MSG】——这俩又是宏，得继续往下追。
+你要找的"nvcc 为何去掉"的注释，就藏在 C10_UNLIKELY_OR_CONST 的定义旁边。
+
+
+================================================================================
+四、第 3 步：追 C10_UNLIKELY_OR_CONST 的【定义在哪个文件】
+================================================================================
+
+它不在 c10/util/Exception.h（那里只是"用"它），所以全目录搜"定义处"：
+
+    grep -rln "define C10_UNLIKELY_OR_CONST" $INC/
+    # → torch/headeronly/util/Exception.h     ← 定义在这（headeronly 版）
+
+背景：新版 torch 把很多 c10 设施下沉到 torch/headeronly/，c10/util/Exception.h 实际转发/包含它。
+grep 选项：
+    -r 递归   -l 只列文件名（先定位"谁定义了它"）   -n 给行号（加上更直观）
+
+
+================================================================================
+五、第 4 步：打印宏定义，看清 #if 分支
+================================================================================
+
+    G=$INC/torch/headeronly/util/Exception.h
+    grep -n "C10_UNLIKELY_OR_CONST" $G
+    sed -n '/define C10_UNLIKELY_OR_CONST/,/^$/p' $G
+    # 看到：
+    #   #if defined(__CUDACC__)
+    #   #define C10_UNLIKELY_OR_CONST(e) e            // nvcc：原样，不加提示
+    #   #else
+    #   #define C10_UNLIKELY_OR_CONST(e) C10_UNLIKELY(e)
+    #   #endif
+
+顺带把它依赖的 C10_UNLIKELY 也确认了（torch/headeronly/macros/Macros.h）：
+    #define C10_UNLIKELY(expr) (__builtin_expect(static_cast<bool>(expr), 0))   // gcc/clang
+    #define C10_UNLIKELY(expr) (expr)                                           // 其它
+
+到这一步：知道"nvcc 下去掉提示"，但【还不知道为什么】。
+
+
+================================================================================
+六、第 5 步：读定义【上方的注释】——答案在这里
+================================================================================
+
+宏定义在该文件第 25–29 行；解释性注释几乎总是【紧贴定义上方】。于是直接读文件开头：
+
+    # 用编辑器/Read 打开 $G 的前 30 行
+    Read  torch/headeronly/util/Exception.h   offset=1  limit=30
+
+读出第 10–24 行那段注释（即开头引用的那段，含 issue 21418 链接）。
+这就是那段话的来源——PyTorch 作者写在 C10_UNLIKELY_OR_CONST 定义正上方的解释，
+说明 nvcc 下去掉它是为了【不破坏 nvcc 的"缺少 return 语句"分析】（不是常量折叠）。
+
+
+================================================================================
+七、可复用的方法论（追任何陌生宏的"为什么"）
+================================================================================
+
+1. 确定来源库：宏不在项目里 → 在依赖里。找 include 路径
+   （python -c "import X, os; print(...)" 或 find / -name 头文件）。
+2. 定位定义文件：grep -rn "define 宏名" <include 目录>。
+   ★ 区分"使用处"与"定义处"：定义处带 define；-l 只看文件名，先锁定"谁定义了它"。
+3. 读展开：看宏内部还调了哪些宏/函数，【逐层往下追】
+   （TORCH_CHECK → C10_UNLIKELY_OR_CONST → C10_UNLIKELY → __builtin_expect）。
+4. 读定义旁注释：凡"为某编译器/平台特判"（#if defined(__CUDACC__) 之类）的写法，
+   作者几乎都在【定义正上方】写明原因，常附 issue 号 → Read 文件头部那几十行即可。
+5. 交叉验证：注释里的 issue 号可去 GitHub 进一步求证（离线时以头文件注释为准）。
+
+一句话：宏的"为什么"在它被 #define 的那行【上方注释】里；grep 到定义、读上下文即可。
+
+
+================================================================================
+八、用到的命令/工具小抄
+================================================================================
+
+  # 找 torch 头文件根目录，并存进变量 INC（$(...) 命令替换：把输出赋给 INC）
+  INC=$(python -c "import torch,os; print(os.path.join(os.path.dirname(torch.__file__),'include'))")
+  echo "$INC"                              # 确认一下值
+
+  # 找某宏的定义文件（而非使用处）
+  grep -rln "define 宏名" "$INC/"          # -l 只列文件；要行号去掉 l 用 -rn
+
+  # 在某文件里找宏所有出现
+  grep -n "宏名" 文件
+
+  # 打印从"define 宏名"到下一个空行的片段（快速看一个 #if/#define 块）
+  sed -n '/define 宏名/,/^$/p' 文件
+
+  # 读文件头部 N 行（注释常在定义上方）
+  #   编辑器直接看，或 Read 工具 offset=1 limit=30
+
+  涉及文件（本次）：
+    c10/util/Exception.h                     TORCH_CHECK / TORCH_CHECK_MSG / torchCheckFail
+    torch/headeronly/util/Exception.h        C10_UNLIKELY_OR_CONST（+ 那段注释）
+    torch/headeronly/macros/Macros.h         C10_UNLIKELY / C10_LIKELY / __builtin_expect

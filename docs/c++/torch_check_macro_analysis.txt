@@ -1,0 +1,432 @@
+================================================================================
+TORCH_CHECK 宏详解：展开、各部件、以及"为什么用宏而非函数"
+================================================================================
+
+对应本仓库 src/run_kernel.cu 里的前置条件校验：
+    TORCH_CHECK(false, "[fused_QKNorm_and_ROPE] half(=rotary_dim/2=", half,
+                       ") 必须是 BLOCK_SIZE_X(=", BLOCK_SIZE_X, ") 的整数倍");
+头文件来源：libtorch 的 c10/util/Exception.h（及 torch/headeronly/util/Exception.h、
+            torch/headeronly/macros/Macros.h）。
+
+  目录：
+    一、TORCH_CHECK 是什么、作用
+    二、用法与消息拼接（c10::str，不是 printf）
+    三、宏展开（生效版本）与逐块解析
+    四、C10_UNLIKELY_OR_CONST 的展开（含 nvcc 为何去掉的真正原因）
+    五、为什么用【宏】而不是写个函数
+    六、运行期判断；torch.compile 下何时触发
+    七、TORCH_CHECK vs return（静默失败的对比）
+    八、相关宏
+    九、小结
+
+
+================================================================================
+一、TORCH_CHECK 是什么、作用
+================================================================================
+
+TORCH_CHECK(cond, msg...) 是 PyTorch C++/CUDA 算子里做【前置条件校验】的标准宏：
+  - cond 为真 → 什么都不做，继续执行；
+  - cond 为假 → 抛 c10::Error（std::exception 子类），经 Dispatcher 传播，
+    在 Python 侧表现为 RuntimeError，异常消息即你给的 msg（自动带函数/文件/行号）。
+
+定位：面向【用户输入错误】的硬失败。预期外的输入应立即报错并把原因交给调用方，
+      而不是静默返回错误数据。（内部不变量用 TORCH_INTERNAL_ASSERT，见第八节。）
+
+
+================================================================================
+二、用法与消息拼接（c10::str，不是 printf）
+================================================================================
+
+消息是【变参 + operator<< 拼接】，没有 %d/%lld 占位符——直接逗号分隔传变量即可
+（int / Tensor / 字符串都行）：
+
+  // ① 常规：条件为真才放行（推荐，语义直白）
+  TORCH_CHECK(x.dim() == 2,            "expected 2D, got ", x.dim(), "D");
+  TORCH_CHECK(x.is_cuda(),             "x must be a CUDA tensor");
+  TORCH_CHECK(a.size(0) == b.size(0),  "batch mismatch: ", a.size(0), " vs ", b.size(0));
+
+  // ② 恒假：进了某分支就一定报错（本仓库用法，因为外层 if 已判定违例）
+  TORCH_CHECK(false, "unreachable / 这里就是要抛: half=", half);
+
+  ▶ 对比 fprintf（为什么它要 %lld + static_cast，而 TORCH_CHECK 不用）
+    设 int64_t half = rotary_dim / 2; 要把它打进消息：
+
+      // fprintf：靠【格式串 + 占位符】，实参类型【必须与占位符精确匹配】
+      fprintf(stderr, "half=%lld\n", static_cast<long long>(half));
+      //                    ^^^^      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      //                    占位符      必须强转成与 %lld 对应的 long long
+
+      // TORCH_CHECK：靠【c10::str 的 operator<< 拼接】，无占位符，直接传 half
+      TORCH_CHECK(half % BLOCK_SIZE_X == 0, "half=", half);   // 不写 %lld、不强转
+
+    为什么 fprintf 必须 %lld + 强转：
+      - fprintf 是【C 变参函数(...)】，实参只做"默认实参提升"，【不会】自动转成与占位符匹配的类型；
+        是程序员用占位符【声明】"我传的是什么类型"，类型必须对上，否则是未定义行为(并触发 -Wformat)。
+      - int64_t 在多数平台是 long（LP64），而 %lld 对应 long long；二者虽常同为 64 位，但【类型不
+        一致】。为可移植/正确，要么 static_cast<long long> 配 %lld，要么用 <cinttypes> 的 PRId64：
+            fprintf(stderr, "half=%" PRId64 "\n", half);   // 另一种正确写法
+    为什么 TORCH_CHECK 不用：
+      - 它的消息走 c10::str(args...)：变参【模板】，每个实参【保持静态类型】，用 operator<< 输出
+        (类似 std::ostream)。int64_t 由对应的 operator<<(ostream&, long) 正确处理 → 无需占位符、
+        无需强转；类型对错由【编译期重载决议】保证，不会有"占位符与类型不符"的运行期 UB。
+    ⟹ 一句话：fprintf 是"运行期按格式串解释变参"(要你手动对齐类型)；TORCH_CHECK/c10::str 是
+       "编译期按类型选 operator<<"(自动正确)。所以前者要 %lld+强转，后者直接传 half。
+
+
+================================================================================
+三、宏展开（生效版本）与逐块解析
+================================================================================
+
+c10/util/Exception.h 里 TORCH_CHECK 有【4 个版本】，按两个开关切换：
+    STANDALONE_TORCH_HEADER（脱离 libtorch，如 AOTInductor 生成码）→ 抛 std::runtime_error
+    STRIP_ERROR_MESSAGES   （减小二进制体积）→ 丢掉富消息
+普通 torch 扩展（本仓库）走的是【既非 STANDALONE 也非 STRIP】的版本：
+
+  #define TORCH_CHECK(cond, ...)                     \
+    if (C10_UNLIKELY_OR_CONST(!(cond))) {            \
+      ::c10::detail::torchCheckFail(                 \
+          __func__,                                  \
+          __FILE__,                                  \
+          static_cast<uint32_t>(__LINE__),           \
+          TORCH_CHECK_MSG(cond, "", ##__VA_ARGS__)); \
+    }
+
+配套 TORCH_CHECK_MSG：
+  #define TORCH_CHECK_MSG(cond, type, ...)                   \
+    (::c10::detail::torchCheckMsgImpl(                       \
+        "Expected " #cond " to be true, but got false. (…)", \  // ← #cond 见下
+        ##__VA_ARGS__))
+
+把本仓库的调用展开后等价于：
+  if (C10_UNLIKELY_OR_CONST(!(false))) {             // !(false)==true → 进入
+      ::c10::detail::torchCheckFail(
+          __func__,                                   // "fused_QKNorm_and_ROPE_interleave"
+          __FILE__,                                   // ".../src/run_kernel.cu"
+          static_cast<uint32_t>(__LINE__),            // 行号
+          ( ::c10::detail::torchCheckMsgImpl(
+                "Expected false to be true, …",        // 默认串：有用户消息时被忽略
+                "[fused_QKNorm_and_ROPE] half(=rotary_dim/2=", half,
+                ") 必须是 BLOCK_SIZE_X(=", BLOCK_SIZE_X, ") 的整数倍") ));
+  }
+
+逐块解析：
+  (1) if (C10_UNLIKELY_OR_CONST(!(cond)))
+      运行期判断；只有失败才进块。C10_UNLIKELY_OR_CONST 是分支预测/常量提示（见第四节）。
+  (2) TORCH_CHECK_MSG(...) → torchCheckMsgImpl(...) → (视情况) c10::str(args...)
+      用户消息经 ##__VA_ARGS__ 进来（## 在"无可变参数"时吃掉多余逗号）。最终由 torchCheckMsgImpl
+      决定"用什么字符串"，half / BLOCK_SIZE_X 等被直接传入、无需 %lld/强转。
+
+      ▷ torchCheckMsgImpl 是什么：它接收【第一个=默认串，其余=用户消息片段】，靠【三个重载】按
+        "用户给了几个、什么类型的消息"选不同结果（c10/util/Exception.h，简化）：
+            namespace c10::detail {
+              // ② 变参模板：有【多个/带类型】用户参数 → 拼接；注意首参 msg 被【忽略】(/*msg*/)
+              template <typename... Args>
+              auto torchCheckMsgImpl(const char* /*msg*/, const Args&... args) {
+                  return ::c10::str(args...);          // 用 c10::str 拼成 std::string
+              }
+              // ① 没有用户参数 → 返回那条默认串本身
+              inline const char* torchCheckMsgImpl(const char* msg) { return msg; }
+              // ③ 恰好【一个 const char* 用户参数】→ 直接返回它(不拼接、不分配，省开销)
+              inline const char* torchCheckMsgImpl(const char* /*msg*/, const char* args) {
+                  return args;
+              }
+            }
+      ▷ 三种情形对应（重载决议在编译期按实参选）：
+          TORCH_CHECK(cond)                       → 走①：用默认串 "Expected cond to be true…"
+          TORCH_CHECK(cond, "just a message")     → 走③：直接用 "just a message"(单串，零拼接)
+          TORCH_CHECK(cond, "half=", half, " …")  → 走②：c10::str("half=", half, " …") 拼成一串
+
+      ▷ 集中举例（设 int64_t half=16; int n=3; std::string name="x";）——调用 → 命中重载 → 最终消息：
+          TORCH_CHECK(ok)
+            → ①  无用户参数             → 默认串 "Expected ok to be true, …"
+          TORCH_CHECK(ok, "bad input")
+            → ③  恰好 1 个 const char*  → 直接返回 "bad input"（不分配、不拼接，最省）
+          TORCH_CHECK(ok, "half must be even, got ", half)
+            → ②  多个参数               → c10::str(...) = "half must be even, got 16"
+          TORCH_CHECK(ok, n)
+            → ②  1 个【非 const char*】参数(int) → c10::str(n) = "3"（注意：单参但不是字符串 → 仍走②）
+          TORCH_CHECK(ok, name)
+            → ②  1 个 std::string       → c10::str(name) = "x"（std::string 不是 const char*，走②）
+          TORCH_CHECK(ok, "n=", n, " name=", name)
+            → ②  多段混合类型           → c10::str(...) = "n=3 name=x"
+        要点：只有【正好一个 const char* 字面量/指针】才命中省事的③；其余有参数情形(多参、或单个
+        非 const char* 如 int/std::string/Tensor)都走②的 c10::str 拼接；完全不给参数才走①默认串。
+      ▷ 为什么"默认串有用户消息时被忽略"：情形②③ 的首参都写成 /*msg*/(未命名、不用)——所以你
+        一旦给了用户消息，那条 "Expected #cond…" 默认串就被丢弃，只用你的消息。仅情形①(没给消息)
+        才回退到默认串。这正是展开里注释"默认串：有用户消息时被忽略"的由来。
+      ▷ 和 c10::str 的关系：只有情形②(多个/带类型参数)才真正调 c10::str(见第五节(2))去拼接、分配；
+        情形①③ 直接返回现成 const char*，更省。
+  (3) __func__ / __FILE__ / __LINE__
+      编译器内置宏，在【调用点】展开，自动捕获函数名/文件/行号，拼进报错定位。
+  (4) ::c10::detail::torchCheckFail(...)
+      声明于本头文件、标 [[noreturn]]、实现在 libtorch .cpp：抛出 c10::Error（带 func/file/
+      line + 消息）。[[noreturn]] 让编译器知道"过了这行不会返回"——故 TORCH_CHECK 之后的代码
+      被视为"仅 cond 为真才可达"，不会误报未初始化/缺 return。c10::Error → Python RuntimeError。
+
+  (5) ##__VA_ARGS__：可变参数为空时，删掉它前面的逗号（让"不传消息"也能展开）
+      ▷ __VA_ARGS__：变参宏 #define F(fmt, ...) 里的 ... 代表"任意多个参数"，宏体内用
+        __VA_ARGS__ 取它们。
+      ▷ 空参数的麻烦：若写 f(fmt, __VA_ARGS__) 而调用时【一个变参都不传】，__VA_ARGS__ 展开为空，
+        但前面的逗号还在 → f(fmt, ) 尾随逗号 → 语法错误。
+            #define LOG(fmt, ...) printf(fmt, __VA_ARGS__)
+            LOG("hi\n");        // → printf("hi\n", )   ✗ 编译错误
+      ▷ ##__VA_ARGS__ 的特殊规则：在 __VA_ARGS__ 前加 ##，当它【为空】时【连同前面的逗号一起删】；
+        不为空则逗号保留：
+            #define LOG(fmt, ...) printf(fmt, ##__VA_ARGS__)
+            LOG("hi\n");        // → printf("hi\n")     ✓ 逗号被吃掉
+            LOG("x=%d\n", 5);   // → printf("x=%d\n", 5) ✓
+      ▷ 在 TORCH_CHECK_MSG 里的作用（正好接 (2) 的 torchCheckMsgImpl 三重载）：
+            TORCH_CHECK(cond)            → 变参空 → ## 吃掉逗号 → torchCheckMsgImpl("Expected…")
+                                          【只 1 参】→ 命中重载①（用默认串）
+            TORCH_CHECK(cond, "msg")     → torchCheckMsgImpl("Expected…", "msg")     → 重载③
+            TORCH_CHECK(cond, "x=", v)   → torchCheckMsgImpl("Expected…", "x=", v)   → 重载②
+        没有 ## 的话，TORCH_CHECK(cond) 会展开出尾随逗号而编译失败——所以 ## 是"不传消息"这种
+        用法能成立的关键。
+      ▷ 它是扩展，C++20 有标准替代 __VA_OPT__：
+            #define LOG(fmt, ...) printf(fmt __VA_OPT__(,) __VA_ARGS__)  // 仅当有变参才放逗号
+        ##__VA_ARGS__ 是 GCC/Clang/MSVC 广泛支持的扩展；__VA_OPT__ 是 C++20 的可移植标准写法。
+
+  (6) #cond：把宏参数的【源代码文本】变成字符串字面量（# 是预处理"字符串化"运算符）
+      ▷ # 运算符：在宏体内，#参数 把该参数【写下的源码文本】整体变成一个字符串字面量(string
+        literal)，而【不是它的值】；只能作用于【宏参数】。
+            #define STR(x) #x
+            STR(a + b)         // → "a + b"     （是文本，不是 a+b 的计算结果）
+            STR(x > 0)         // → "x > 0"
+        空白会被规范化：参数首尾空白去掉、内部连续空白压成一个空格。
+      ▷ 在 TORCH_CHECK_MSG 里：默认串靠 #cond 嵌入"哪个条件没成立"：
+            #define TORCH_CHECK_MSG(cond, type, ...) \
+              (::c10::detail::torchCheckMsgImpl("Expected " #cond " to be true, …", ##__VA_ARGS__))
+        于是 TORCH_CHECK(x > 0) 的 #cond = "x > 0" → 默认串 = "Expected x > 0 to be true, …"。
+        相邻字符串字面量 "Expected " "x > 0" " to be true…" 在【编译期】自动拼成一个字面量，零运行期成本。
+      ▷ 这正是 TORCH_CHECK【必须是宏】的核心理由之一(见第五节(3))：函数只收到 cond 的【值】
+        (true/false)，拿不到它的源码文本；只有预处理器的 # 能取到 "x > 0" 这串文本。
+      ▷ 常见坑：# 不会先展开宏参数；若要把"宏展开后的结果"字符串化，需套两层(经典 STRINGIZE 技巧)：
+            #define STR(x)  #x
+            #define XSTR(x) STR(x)
+            #define N 64
+            STR(N)    // → "N"    （# 直接对文本 N 字符串化，不展开 N）
+            XSTR(N)   // → "64"   （先经一层把 N 展开成 64，再 #）
+
+
+================================================================================
+四、C10_UNLIKELY_OR_CONST 的展开（含 nvcc 为何去掉的真正原因）
+================================================================================
+
+定义（torch/headeronly/util/Exception.h）：
+  #if defined(__CUDACC__)
+  #define C10_UNLIKELY_OR_CONST(e) e            // nvcc：原样，不加提示
+  #else
+  #define C10_UNLIKELY_OR_CONST(e) C10_UNLIKELY(e)
+  #endif
+
+C10_UNLIKELY（torch/headeronly/macros/Macros.h）：
+  #if defined(__GNUC__)   // gcc / clang
+  #define C10_UNLIKELY(expr) (__builtin_expect(static_cast<bool>(expr), 0))
+  #else
+  #define C10_UNLIKELY(expr) (expr)
+  #endif
+
+于是 C10_UNLIKELY_OR_CONST(!(cond)) 三种展开：
+  - nvcc（.cu，本仓库 run_kernel.cu）        → !(cond)            （无提示）
+  - gcc/clang 编 host（.cpp）                → __builtin_expect(static_cast<bool>(!(cond)), 0)
+  - 其它编译器                                → !(cond)
+
+__builtin_expect(x, 0)：GCC/Clang 内建，返回值仍是 x，但告诉编译器"这个值大概率是 0(false)"，
+  用于【分支布局/预测】——把"成功(不进块)"排成顺序快路径，"失败抛错"挪到冷路径。纯性能提示。
+
+★ nvcc 为何去掉它（真正原因——不是"常量折叠"！）
+  头部注释（pytorch issue 21418）原文：
+    "On nvcc, C10_UNLIKELY thwarts missing return statement analysis. In cases where the
+     unlikely expression may be a constant, use this macro to ensure return statement
+     analysis keeps working (at the cost of not getting the likely/unlikely annotation on nvcc)."
+  用一条因果链说清这段注释：
+    前提：非 void 函数里，常靠"某分支恒真 / 恒抛 / 恒调 [[noreturn]]"来保证"所有路径都已了结"
+          （末尾不可达，故不写多余 return）。编译器前端要据此判定"末尾不可达 → 不报缺 return"。
+    步骤①：要判定上面这点，前端必须【看穿条件是常量】(如 !(false) 恒真)。
+    步骤②：但 nvcc 一旦把这个【可能是常量】的条件包进 __builtin_expect，它的前端就【看不穿】里面
+            的常量、把条件当"运行期不定值"。
+    步骤③：于是 nvcc 误判"该分支可能不走 → 可能落到末尾还没 return" → 【误报 missing return】。
+    结论：所以在 nvcc 上把它退化成 e（不包裹），让前端重新看清常量、返回分析恢复正常。
+    代价：仅"nvcc 下拿不到 likely/unlikely 分支提示"（注释称无性能证据）。
+  名字 _OR_CONST 的含义：表达式【可能是 CONST(常量)】时用这个版本——"可能是常量，那就别在 nvcc
+  上套 __builtin_expect"。
+  ★ 一句话：__builtin_expect 让 nvcc 前端【看不穿常量】→ 返回分析误判 → 误报缺 return；
+    退化去掉它即可。坏的是【前端返回分析】，不是常量折叠、也不是 DCE（见下"注意区分"）。
+
+  注意区分：
+    - g++/clang 能【透明处理】__builtin_expect——既不碍常量折叠、也不碍返回/可达性分析，
+      所以 host 保留它只赚不赔。
+    - 受损的是 nvcc 的【返回语句分析】，这是 nvcc 专有的坑，与"常量折叠优化"是两回事。
+
+
+================================================================================
+五、为什么用【宏】而不是写个函数
+================================================================================
+
+其实 PyTorch 大部分活儿都用函数做了（torchCheckFail / torchCheckMsgImpl / c10::str 都是
+函数）；宏只是薄壳，只干【函数干不了】的事。若写成普通函数：
+
+  void torchCheck(bool cond, const std::string& msg) {
+      if (!cond) throw c10::Error(msg, __FILE__, __LINE__);   // ← 两个致命问题
+  }
+  torchCheck(half % 64 == 0, "half=" + std::to_string(half) + " 必须整除 64");
+
+致命问题，正是非用宏不可的理由：
+
+  (1) 调用点位置捕获：__FILE__ / __LINE__ / __func__
+      函数里的 __FILE__/__LINE__ 是【函数自身所在行】，不是出错的调用点。宏在调用点原地展开，
+      位置才正确。举例对比：
+
+      // —— 写成函数（位置错）——  假设这函数定义在 check.cpp 第 10 行
+      void my_check(bool c, const char* msg) {
+          if (!c) torchCheckFail(__func__, __FILE__, __LINE__, msg);
+          //                     ^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+          //                     "my_check" "check.cpp"  10   ← 永远是【函数自身】这一行！
+      }
+      // user.cpp 第 99 行调用：
+      my_check(x > 0, "x must be > 0");
+      // → 报错位置显示 check.cpp:10（函数定义处），而不是 user.cpp:99（真正出错的调用点）✗
+
+      // —— 写成宏（位置对）——
+      #define MY_CHECK(c, msg) \
+          if (!(c)) torchCheckFail(__func__, __FILE__, __LINE__, msg)
+      // user.cpp 第 99 行调用：
+      MY_CHECK(x > 0, "x must be > 0");
+      // 宏在【调用点】原地展开 → __FILE__=user.cpp、__LINE__=99、__func__=调用者所在函数 ✓
+      // → 报错位置正是 user.cpp:99，定位到真正出错处
+
+      原因：__FILE__/__LINE__/__func__ 在【它们被写下的那一行】求值。写在函数体里 → 永远是函数
+      自身的位置；宏是文本替换、在调用点展开 → 取到调用点的位置。这就是 TORCH_CHECK 的报错能
+      指到"你写 TORCH_CHECK 的那一行"的原因。
+      （C++20 std::source_location 能部分解决这条——用默认实参在调用点捕获位置——但还有 (2)(3)，
+        且要兼容老标准，故仍用宏。）
+
+  (2) 惰性求值：失败时才构造消息（最关键的性能点）
+      C++ 函数调用【先求值所有实参再进函数】，所以上面 "half=" + std::to_string(half)
+      【每次调用都执行】，哪怕 cond 为真（99.999% 的热路径）。宏把消息构造放进 if 内部，
+      cond 为真时 c10::str(...) 根本不执行 → 零开销。函数做不到延迟实参求值。
+
+      ▷ c10::str(...) 是什么：PyTorch 的【变参拼字符串】工具(c10/util/StringUtil.h)。把任意多个、
+        任意可流式输出(operator<<)的实参，依次 << 进一个 ostringstream，返回拼好的 std::string。
+        相当于"用流把它们拼起来"：
+            c10::str("x=", 3, ", y=", 4.5)        // → std::string "x=3, y=4.5"
+            c10::str("half=", half, " 不整除")     // half 是 int64_t，直接传，无需 %lld/强转
+        简化实现(意思如此；真实版对 0 参/单个 const char* 另有快路径)：
+            template <typename... Args>
+            std::string str(const Args&... args) {
+                std::ostringstream ss;
+                (ss << ... << args);   // C++17 折叠表达式：把每个 arg 依次 << 进流
+                return ss.str();       // ← 这里有【堆分配 + 流操作】，是真正的开销
+            }
+      ▷ 它和 TORCH_CHECK 的关系：消息那串走 TORCH_CHECK_MSG → torchCheckMsgImpl(..., args...)
+        → 最终就是 c10::str(args...)。这一步包含 ostringstream 构造、operator<<、堆分配——【不便宜】。
+      ▷ 所以"惰性"的意义：宏把 c10::str(args...) 放在 if (!cond) 块内，cond 为真(热路径)时它
+        【根本不执行】→ 零开销；只有失败(冷路径)才真的拼字符串。
+
+      ▷ 为什么"函数做不到"——对照宏与两种函数写法（核心：C++【进函数前先求值所有实参】）
+        〔宏，现状〕整段消息构造被【贴进 if 块内】，cond 真则整块不展开执行：
+            if (C10_UNLIKELY_OR_CONST(!(x > 0))) {
+                torchCheckFail(__func__, __FILE__, __LINE__,
+                    torchCheckMsgImpl("Expected x > 0 …", "half=", half));  // 仅失败才求值
+            }
+            // x>0 真 → 整块跳过 → "half="、half、c10::str 统统不跑（零开销）
+        〔函数A：传现成串〕消息是【实参】，进函数前就求值 → 每次都跑：
+            void tc(bool c, const std::string& msg) { if (!c) torchCheckFail(..., msg); }
+            tc(x > 0, c10::str("half=", half));
+            //        ^^^^^^^^^^^^^^^^^^^^^^^^ 实参，C++ 在【进 tc 之前】求值 → c10::str 每次都执行 ✗
+        〔函数B：变参模板，体内才拼〕能延迟【字符串构造】，但【实参本身仍每次求值】：
+            template <class... A> void tc(bool c, const A&... args) {
+                if (!c) torchCheckFail(..., torchCheckMsgImpl("…", args...)); // c10::str 在 if 内 ✓
+            }
+            tc(x > 0, "half=", half);   // "half="、half 作实参，进函数前各求值一次（若是 expensive() 就白算）✗
+
+        对照：
+            能力                        宏 TORCH_CHECK   函数A(传现成串)  函数B(变参模板)
+            --------------------------  ---------------  ---------------  ---------------
+            消息字符串构造(c10::str)     仅失败 ✓         每次 ✗           仅失败 ✓
+            消息实参求值(half/表达式)    仅失败 ✓         每次 ✗           每次 ✗
+            调用点 __FILE__/__LINE__     ✓               ✗               ✗
+            #cond 条件文本               ✓               ✗               ✗
+        ⟹ 只有【宏】能把"实参求值 + 字符串构造"整段关进 if(!cond)，cond 真时全不跑；函数最多延迟
+           字符串构造(B)，实参仍先求值，且还丢了 __FILE__/__LINE__ 与 #cond。这就是"惰性"非宏不可。
+
+  (3) #cond 字符串化（TORCH_CHECK_MSG 必须是宏的核心理由）
+      TORCH_CHECK_MSG 里的 #cond 用预处理器把【条件的源代码文本】变成字符串字面量
+      （"half % BLOCK_SIZE_X == 0"），塞进默认消息。函数只收到 cond 的【值】(true/false)，
+      拿不到它的源码文本。相邻字面量 "Expected " #cond " to be true…" 还在编译期拼成一个
+      字面量、零运行期成本。要把"哪个条件没成立"写进报错，非宏不可。
+
+  (4) 编译期开关切换实现
+      __builtin_expect 是编译器内建，要按 __CUDACC__/__GNUC__ 切不同实现（见第四节）——
+      这种"按预处理宏选实现"也只能用宏。
+
+各宏"只因什么而必须是宏"：
+    TORCH_CHECK             ：调用点 __FILE__/__LINE__/__func__ + 失败才构造消息（惰性）
+    TORCH_CHECK_MSG         ：#cond 把条件源码文本字符串化 + 字面量编译期拼接
+    C10_UNLIKELY(_OR_CONST) ：包 __builtin_expect 内建 + 按编译器宏切换
+
+共同规律：凡需要预处理器特有能力（# 字符串化、__FILE__/__LINE__、惰性展开、按编译器宏切换）
+的，才用宏；其余逻辑都落在函数里。这就是 assert / CHECK / TORCH_CHECK 几乎都用宏的根本原因。
+
+
+================================================================================
+六、运行期判断；torch.compile 下何时触发
+================================================================================
+
+TORCH_CHECK 是【运行期】检查：在 host 包装函数里、CPU 上、kernel 启动前求值，每次调用都查。
+本仓库 half = rotary_dim/2，rotary_dim 是运行期传入的 int64_t，其值 C++ 编译期不知道，故
+【只能】运行期查（BLOCK_SIZE_X 是编译期宏常量 64）。对比：static_assert 是编译期、不适用此处。
+
+torch.compile 下，算子有两条路径，TORCH_CHECK 只在真实执行时触发：
+  - 编译/trace 期（FakeTensor）：走 fake 实现（本算子 _fake 返回 None），【不进】真实 CUDA host
+    函数 → TORCH_CHECK 不执行。
+  - 真实执行期：compiled(x, positions) 实际跑到融合算子、用真张量在 CUDA 上执行时 → 进
+    fused_QKNorm_and_ROPE_interleave → TORCH_CHECK 求值。
+
+
+================================================================================
+七、TORCH_CHECK vs return（静默失败的对比）
+================================================================================
+
+本算子是写法③ void in-place（schema -> ()，Tensor(a!) qkv）。若失败时用 return：
+
+  写法            Python 行为                              结果
+  --------------  --------------------------------------  ----------------------------------
+  fprintf+return  静默：不抛异常、不返回 None；kernel 没启   qkv 未改 → 下游拿到错误数据，
+                  动 → qkv 原样返回；只在 stderr 留一行日志   只在后续 allclose 才间接暴露
+  TORCH_CHECK     抛 c10::Error → Python RuntimeError      立即中断，可 try/except RuntimeError
+
+本仓库保留 fprintf（终端 stderr 日志）+ 用 TORCH_CHECK(false, ...) 抛错（取代静默 return）：
+  if (half % BLOCK_SIZE_X != 0) {
+      fprintf(stderr, "... %lld ... %d ...\n", static_cast<long long>(half), BLOCK_SIZE_X);
+      TORCH_CHECK(false, "... half(=", half, ") 必须是 BLOCK_SIZE_X(=", BLOCK_SIZE_X, ") 的整数倍");
+  }
+
+
+================================================================================
+八、相关宏
+================================================================================
+
+  TORCH_CHECK(cond, ...)            面向【用户输入错误】→ 抛 c10::Error → Python RuntimeError
+  TORCH_INTERNAL_ASSERT(cond, ...)  面向【内部不变量/代码 bug，不该发生】，消息措辞不同
+  TORCH_CHECK_EQ/_NE/_LE…(a, b)     比较类简写
+  TORCH_CHECK_NOT_IMPLEMENTED(...)  抛 NotImplementedError
+  TORCH_CHECK_WITH(error_t, ...)    指定异常类型（如 TORCH_CHECK_LINALG / IndexError 变体）
+  C10_THROW_ERROR(Error, msg)       直接抛（TORCH_CHECK 底层用它/torchCheckFail）
+
+经验：用户传错 → TORCH_CHECK；自己代码逻辑保证、违反即 bug → TORCH_INTERNAL_ASSERT。
+
+
+================================================================================
+九、小结
+================================================================================
+
+- TORCH_CHECK(cond, msg…) ≈ if (unlikely(!(cond))) torchCheckFail(__func__,__FILE__,__LINE__,
+  c10::str(msg…));  失败抛 c10::Error → Python RuntimeError；消息用 c10::str 拼接（非 printf）。
+- 必须是宏的三大唯一理由：① 调用点抓 __FILE__/__LINE__/__func__；② 失败才构造消息（惰性，
+  热路径零开销）；③ TORCH_CHECK_MSG 用 #cond 字符串化条件源码文本。重活仍由函数完成。
+- C10_UNLIKELY_OR_CONST：host 下 = __builtin_expect（分支提示）；nvcc 下 = 原样（去掉），
+  因为 __builtin_expect 会破坏 nvcc 的【缺少 return 语句分析】（issue 21418）——不是常量折叠。
+  g++/clang 能透明处理 __builtin_expect，既不碍折叠也不碍返回分析，故 host 保留。
+- 运行期、host 端、kernel 启动前、每次调用都查；torch.compile 下只在真实执行触发，trace 走 fake。
+- 相比静默 return（in-place 算子不改 qkv、错误数据流向下游），TORCH_CHECK 让违例硬失败、可见。

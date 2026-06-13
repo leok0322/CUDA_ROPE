@@ -621,6 +621,276 @@ C/C++ 源文件从代码到可执行文件经过四个阶段：
   这类它独有的活。
 
 
+十二、变参 ... / __VA_ARGS__、字符串化 #、记号粘接 ## / ##__VA_ARGS__（以 TORCH_CHECK 为例）
+================================================================================
+
+  本节讲三个【只活在函数式宏体内】的预处理要素，普通 C++ 代码里没有它们。以 libtorch 的
+  TORCH_CHECK 为综合实例（简化）：
+
+    #define TORCH_CHECK_MSG(cond, type, ...)                       \
+      (::c10::detail::torchCheckMsgImpl(                           \
+          "Expected " #cond " to be true, but got false. (…)",     \   // #cond 字符串化
+          ##__VA_ARGS__))                                              // 空变参时删逗号
+
+    #define TORCH_CHECK(cond, ...)                       \
+      if (C10_UNLIKELY_OR_CONST(!(cond))) {              \
+        ::c10::detail::torchCheckFail(                   \
+            __func__, __FILE__,                          \
+            static_cast<uint32_t>(__LINE__),             \
+            TORCH_CHECK_MSG(cond, "", ##__VA_ARGS__));   \
+      }
+    （每行末尾的 \ 是续行符，把多行接成一条逻辑宏；\ 后不能有任何字符/空格。）
+
+  ── (1) ... 与 __VA_ARGS__：变参宏 ──────────────────────────────────────────
+    形参表里的 ... 表示"任意多个参数（可为 0 个）"；宏体内用 __VA_ARGS__ 取这一坨。
+        #define LOG(fmt, ...) printf(fmt, __VA_ARGS__)
+        LOG("x=%d\n", 5);          // → printf("x=%d\n", 5)
+    空变参的麻烦：若一个都不传，__VA_ARGS__ 为空、但前面逗号还在 → 尾随逗号语法错误：
+        LOG("hi\n");               // → printf("hi\n", )   ✗ 编译错误（解决见 (3)）
+    TORCH_CHECK(cond, ...) 的 ... 收的就是【用户消息片段】（可为 0 个）。
+
+  ── (2) # ：字符串化（#cond）────────────────────────────────────────────────
+    在函数式宏体内，#参数 把该【参数的源码文本】整体变成字符串字面量（不是它的值），
+    只能作用于【宏参数】：
+        #define STR(x) #x
+        STR(a + b)        // → "a + b"   （文本，不是 a+b 的结果）
+    空白会被规范化（首尾去空白、内部连续空白压成一个空格）。
+    ★ 对比：去掉 # 就【不是】字符串化，只是把参数当【代码记号】原样替换（无引号）：
+        #define A(x)  x      A(hello) → hello    （标识符/代码，不是字符串；当变量名用，没这变量就编译错）
+        #define B(x) #x      B(hello) → "hello"  （# 才加引号 + 转义 → 字符串字面量）
+      ⟹ 字符串化靠的是【# 这个运算符】(加引号、把内部的 " \ 转义)，不是"宏替换"本身；没有 # 就只是
+        普通文本替换、结果仍是代码。
+    TORCH_CHECK_MSG 里 "Expected " #cond " to be true…"：当 TORCH_CHECK(x > 0) 时
+    #cond = "x > 0" → 默认串 = "Expected x > 0 to be true…"；相邻字面量在【编译期】拼成一个、
+    零运行期成本。为什么非宏不可：函数只拿到 cond 的【值】(true/false)，拿不到源码文本。
+
+  ── (3) ## ：记号粘接；以及 ##__VA_ARGS__（空变参删逗号）─────────────────────
+    ## 把左右两个记号【粘成一个】：
+        #define CAT(a, b) a##b
+        CAT(foo, bar)     // → foobar
+    ##__VA_ARGS__ 是 ## 的特殊用法——当 __VA_ARGS__【为空】时，【连同它前面的逗号一起删】：
+        #define LOG(fmt, ...) printf(fmt, ##__VA_ARGS__)
+        LOG("hi\n");          // → printf("hi\n")       ✓ 逗号被吃掉
+        LOG("x=%d\n", 5);     // → printf("x=%d\n", 5)  ✓
+    TORCH_CHECK 用它保证"不传消息"也能正确展开（不出尾随逗号）。
+    ★ 注意：##__VA_ARGS__ 传进去的【还是源码记号(代码)】，【不是字符串、不会加引号】——它只在
+      记号层做"删逗号 / 拼接"，变参原样作为代码贴进展开体（上例里的 5、"x=%d\n" 仍是代码 token，
+      不是被字符串化）。只有 (2) 的【#】会把文本变成字符串字面量；## 系列（含 ##__VA_ARGS__）从不
+      加引号、从不字符串化。一句话：# = 文本→字符串；## = 记号→记号（仍是代码）。
+    注：##__VA_ARGS__ 是 GCC/Clang/MSVC 的【扩展】；C++20 有可移植标准替代 __VA_OPT__：
+        #define LOG(fmt, ...) printf(fmt __VA_OPT__(,) __VA_ARGS__)   // 仅有变参时才放逗号
+
+  ── (4) 综合：把 TORCH_CHECK 两种调用展开 ──────────────────────────────────
+    ▷ TORCH_CHECK(x > 0, "x=", x)   （带消息）
+        ... = "x=", x ；#cond = "x > 0" ；##__VA_ARGS__ 非空、逗号保留 →
+        if (C10_UNLIKELY_OR_CONST(!(x > 0))) {
+          torchCheckFail(__func__, __FILE__, static_cast<uint32_t>(__LINE__),
+              torchCheckMsgImpl("Expected x > 0 to be true…", "x=", x));   // 用户消息进来
+        }
+    ▷ TORCH_CHECK(x > 0)            （不带消息）
+        ... 为空 ；##__VA_ARGS__ 把前面的逗号删掉 →
+        if (C10_UNLIKELY_OR_CONST(!(x > 0))) {
+          torchCheckFail(__func__, __FILE__, static_cast<uint32_t>(__LINE__),
+              torchCheckMsgImpl("Expected x > 0 to be true…"));   // 只剩默认串 1 个参数
+        }
+        若没有 ##，这里会展成 torchCheckMsgImpl("…", ) —— 尾随逗号、编译失败。
+    ⟹ 各司其职：...收消息、#cond 把条件文本写进默认串、##__VA_ARGS__ 处理"无消息"、\ 接行。
+
+  ── 补充坑：# / ## 不先展开宏参数 → 需要"双层"（STRINGIZE 技巧）──────────────
+    先记住预处理的【参数展开规则】（这是理解双层的钥匙）：
+      规则A：函数式宏被调用时，它的【实参先被完全宏展开】，再代入宏体。
+      规则B（例外）：若某实参在宏体里【紧挨着 # 或 ##】（作其操作数），则该实参【不展开】，
+            直接用它的【原始记号文本】。
+    # 和 ## 都受【规则B】约束——所以【直接】对它们用，拿到的是"参数的字面文本"，不是展开后的值。
+
+    例：把宏 N 字符串化
+        #define STR(x)  #x
+        #define XSTR(x) STR(x)
+        #define N 64
+
+      ▷ STR(N) 的展开：
+          STR 的体是 #x，x 紧挨 # → 适用【规则B】→ x【不展开】→ 直接对文本 "N" 字符串化
+          结果： "N"      （不是 "64"！）
+
+      ▷ XSTR(N) 的展开（双层，逐步）：
+          第①层 XSTR(N)：体是 STR(x)，这里 x【没有】紧挨 # 或 ## → 适用【规则A】→
+                         实参 N 先被展开成 64 → 这一层变成 STR(64)
+          第②层 STR(64)：现在 x 已经是 64，再由 # 字符串化 → "64"
+          结果： "64"     ✓
+        关键：靠【外层 XSTR】先把 N 展开成 64（因为那一层 x 不挨 #），再交给【内层 STR】去 #。
+
+    ## 同理（也受规则B、不先展开参数）：要拼接"展开后的结果"也得套两层
+        #define CAT(a, b)  a##b
+        #define XCAT(a, b) CAT(a, b)
+        #define PRE my_
+        CAT(PRE, foo)    // → PREfoo    （PRE 紧挨 ## → 不展开，直接拼字面文本 PRE）
+        XCAT(PRE, foo)   // → my_foo    （外层 XCAT 先把 PRE 展开成 my_，再交内层 CAT 拼）
+
+    实战最常踩：字符串化 __LINE__（编译器内置宏，值是当前行号）
+        #define STR(x)  #x
+        #define XSTR(x) STR(x)
+        STR(__LINE__)    // → "__LINE__"   （# 不展开 → 拿到的是宏名本身，【不是】行号！）
+        XSTR(__LINE__)   // → "42"         （外层先把 __LINE__ 展开成行号 42，再 #）
+      ⟹ 凡是想把 __LINE__ / 版本宏等"宏的值"拼进字符串，必须走 XSTR 这种【双层】；直接 # 只会
+        得到宏名文本。这正是很多日志/断言库都要定义一对 STRINGIZE/XSTRINGIZE 宏的原因。
+
+  小结：... /__VA_ARGS__ = 变参；#x = 字符串化(参数文本→字面量)；a##b = 记号粘接；
+        ##__VA_ARGS__ = 空变参删前导逗号(GCC 扩展；C++20 用 __VA_OPT__)；\ = 续行。
+        TORCH_CHECK 更深的 torchCheckMsgImpl 重载选择 / torchCheckFail / [[noreturn]] 语义，
+        见 torch_check_macro_analysis.txt 第三、四、五节。
+
+
+十三、报错定位（__FILE__ / __LINE__ / __func__）为何必须用宏，不能用函数
+================================================================================
+
+  日志/断言库要在报错时打印"哪个文件、哪一行、哪个函数出错"，靠这三样：
+    __FILE__ ：预处理【宏】，展开成"它所在那一行的源文件名"。
+    __LINE__ ：预处理【宏】，展开成"它所在的行号"。
+    __func__ ：C99/C++11 的【预定义标识符】(不是宏)，名字是"它所处的那个函数"。
+  共同点：它们都表示【自己出现在源码哪个位置】——而"位置"是【它们被写下的那一处】。
+
+  ── 关键问题：写进【函数】里，捕获的是【函数自己】的位置 ───────────────────────
+    // 假设这个日志函数定义在 logger.cpp 第 10 行
+    void log_err(const char* msg) {
+        printf("%s:%d (%s): %s\n", __FILE__, __LINE__, __func__, msg);
+        //                          ^^^^^^^^  ^^^^^^^^  ^^^^^^^^
+        //                          logger.cpp  10   "log_err"   ← 永远是【这里】！
+    }
+    // user.cpp 第 99 行调用：
+    log_err("bad input");
+    // 输出： logger.cpp:10 (log_err): bad input
+    //        ✗ 指向日志函数自己，不是【真正出错的调用点 user.cpp:99】
+
+    原因：__FILE__/__LINE__ 由预处理器在【它们被写下的那一行】展开——写在函数体里，那一行
+    就固定是 logger.cpp:10；__func__ 也只认它【词法上所在】的函数(log_err)。函数把这些 token
+    "封"在了自己体内，调用点的位置传不进去。
+
+  ── 宏的解法：在【调用点】原地展开，捕获的就是调用点位置 ─────────────────────
+    #define LOG_ERR(msg) \
+        printf("%s:%d (%s): %s\n", __FILE__, __LINE__, __func__, msg)
+    // user.cpp 第 99 行调用：
+    LOG_ERR("bad input");
+    // 宏是【文本替换】，在调用点原地展开 → __FILE__/__LINE__/__func__ 落在 user.cpp:99 处求值
+    // 输出： user.cpp:99 (caller_func): bad input     ✓ 正确指向出错点
+
+    原因：宏在调用点展开后，那几个 token 就【物理地出现在 user.cpp 第 99 行】，于是
+    __FILE__=user.cpp、__LINE__=99、__func__=调用者所在函数。这正是"宏在调用点展开"独有的能力，
+    函数做不到（函数体里的 token 永远在函数自己那一行）。
+
+  ── 一句话 + 与 TORCH_CHECK 的关系 ───────────────────────────────────────────
+    __FILE__/__LINE__/__func__ 取的是"它们被写下的位置"；要报【调用方】的位置，引用它们的代码
+    必须【文本上就在调用点】——只有宏(在调用点展开)能做到，函数(token 封在体内)做不到。
+    TORCH_CHECK 正是宏，所以报错能精确指到"你写 TORCH_CHECK 的那一行"，而非 libtorch 内部。
+    (它把 __func__/__FILE__/__LINE__ 传给 torchCheckFail，见 torch_check_macro_analysis.txt 第五节(1)。)
+
+  ── 补充：C++20 std::source_location（是【编译期】捕获，不是运行期求值）────────
+    现代 C++ 让【函数】也能拿到调用点位置：用默认实参 std::source_location::current()——它在
+    【调用点】求值并作为默认参数传入：
+        void log_err(const char* msg,
+                     std::source_location loc = std::source_location::current()) {
+            printf("%s:%d (%s): %s\n", loc.file_name(), loc.line(), loc.function_name(), msg);
+        }
+        log_err("bad input");   // loc 捕获到【调用点 user.cpp:99】 ✓
+    所以"调用点定位"这一条，C++20 起函数也能做。
+
+    ★ 它是【编译期】确定位置，不是运行期"查自己在哪"：
+      - current() 在标准里是 consteval（立即函数）：static consteval source_location current();
+        consteval 必须【编译期求值】，所以文件名/行号/函数名都是【编译期常量】（实现上对应
+        __builtin_FILE()/__builtin_LINE() 等编译器内建），和 __FILE__/__LINE__ 烤进去的常量同理。
+      - 为何能拿到【调用点】：默认实参在【调用处、按调用者上下文】求值——所以 current() 在每个
+        调用点各自被编译期解析成"那个调用点的位置"（user.cpp:99），而非 log_err 定义处。
+      - 运行期只有：把这个 source_location 小结构体（几个指针+整数，全是常量）按值传进来；
+        【没有任何运行期的位置查找/计算】。
+    对比宏：__FILE__/__LINE__ 在【预处理期】定，source_location 在【编译期】定——机制不同，但都是
+    "位置烤成常量、零运行期推断"；区别是 source_location 让【函数】也能享受到（宏只能靠在调用点展开）。
+
+    但宏仍有别的【非宏不可】的理由(如 #cond 字符串化、失败才构造消息的惰性求值)，故 TORCH_CHECK
+    这类仍用宏(见 torch_check_macro_analysis.txt 第五节)。
+
+
+十四、宏变参 vs 函数变参：传【源码文本】还是传【求值后的值】
+================================================================================
+
+  "接收任意多个参数"【不是宏独有】——函数也有两条路。它们和宏 __VA_ARGS__ 的本质区别：
+  宏传【实参的源码文本】，函数传【求值后的值】。（完整解析见 docs/c++/function_variadic.txt。）
+
+  ▶ 三者各一句话
+    - 宏变参 __VA_ARGS__       ：预处理层，传实参的【源码文本】，贴进展开体后才在那里编译/求值。
+    - C 风格变参 ...(va_list)   ：运行期按约定从栈取值，【无类型安全】(printf 那套)。
+    - C++ 变参模板 Args...      ：编译期实例化，【有类型、各求值一次】(c10::str 那套)。
+
+  ▶ 对比（精简）
+        维度          宏 __VA_ARGS__       C 变参 ...(va_list)   C++ 变参模板
+        ------------  -------------------  --------------------  --------------------
+        传什么        实参【源码文本】      求值后的值(从栈取)     求值后的值(值/引用)
+        阶段          预处理(编译前)        运行期                编译期实例化
+        类型/安全     无                   无(va_arg 手动指定)    有(类型推导，安全)
+        求值次数      0 次或多次(文本展开)  一次                  一次
+        能接类型名/#/## 能                  不能                  不能(只传值)
+        典型代表      TORCH_CHECK          printf                c10::str
+
+  ▶ "传文本 vs 传值"最直观的后果：多次求值
+        #define TWICE(x) ((x) + (x))
+        TWICE(i++)          // → ((i++) + (i++))   i++ 文本被贴两次 → 自增【两次】！
+        template<class T> T twice(T x){ return x + x; }
+        twice(i++);         // i++ 先求值【一次】得到值，再 x+x —— 只自增一次
+    宏搬运的是"i++"这段【文本】(出现几次算几次)；函数收到的是"i++ 求值后的那个值"(只算一次)。
+
+  ⟹ 选择：要操作文本/类型名 / 字符串化(#) / 拼接(##) / 捕获 __FILE__ → 用【宏】；
+     要类型安全地接任意参数 → 用【C++ 变参模板】；只为对接 C 接口(printf 家族) → 用【C 变参】。
+     va_list 用法、折叠表达式、递归展开等完整内容见 docs/c++/function_variadic.txt。
+
+
+十五、宏与函数：层次正交，互不限制（函数里能有宏，宏里能有函数）
+================================================================================
+
+  宏是【预处理期的文本替换】(编译前)，函数是【编译/运行期的真实代码】——二者不在同一层，
+  所以可自由嵌套，没有禁止关系。
+
+  ▶ 一、函数里可以用宏 ✓
+    函数源码里写宏调用，预处理器先把它展开成代码，再由编译器编译这个函数：
+        void f(int x, int a, int b) {
+            TORCH_CHECK(x > 0, "bad x");   // 宏 → 展开成 if(!(x>0)){ torchCheckFail(...); }
+            int y = MAX(a, b);             // 宏 → ((a)>(b)?(a):(b))
+        }
+    (严格说：宏不"存在于"编译后的函数里——它在预处理阶段就被展开掉了，函数体里留下的是
+     展开后的代码。)
+
+  ▶ 二、宏里可以有函数 ✓
+    宏的替换体可以包含【函数调用】（甚至函数定义）。TORCH_CHECK 自己就是典型——展开体里调了
+    好几个函数：
+        #define TORCH_CHECK(cond, ...) \
+            if (!(cond)) { ::c10::detail::torchCheckFail(            /* ← 调用函数 */ \
+                __func__, __FILE__, __LINE__,                                         \
+                TORCH_CHECK_MSG(cond, "", ##__VA_ARGS__)); }   /* → torchCheckMsgImpl/c10::str 都是函数 */
+    torchCheckFail、torchCheckMsgImpl、c10::str 全是函数，被宏的替换体调用。
+
+  ▶ 三、为什么互不限制：阶段不同
+        源码 ──预处理(展开宏)──► 纯 C++ 文本 ──编译──► 机器码
+               ↑ 宏在这里被展开成文本          ↑ 函数在这里被编译
+    - 宏先于编译展开成文本；这段文本里可以是/可以调用任何合法 C++，当然包括函数。
+    - 函数只是代码；其源码里可以写宏调用，预处理后变成函数体的一部分。
+    - 所以"嵌套"本质是：【展开后的那段文本里有什么】——彼此没有禁止关系。
+
+  ▶ 四、两个要注意的 nuance
+    (1) 在函数体里 #define 一个宏，语法允许，但它【不是函数局部作用域】：
+            void f() {
+                #define TMP 10      // 合法，但 TMP 从这行起对【整个翻译单元】生效，
+                int x = TMP;        // 不是只在 f 内！直到 #undef 或文件末。
+            }
+            void g() { int y = TMP; }   // ← TMP 在这里仍可见！（宏没有 {} 作用域）
+        与普通变量不同——宏无块作用域。"函数里定义宏"虽可行，但易污染，通常不这么干。
+    (2) 宏是纯文本、不懂作用域/类型（卫生问题）：宏体里的名字/参数没有作用域保护，可能与外面
+        标识符撞名（经典如 MAX(i++, j) 的多次求值，见第十一节后果 2/3）。这是"能共存"之外的
+        "用得对不对"问题。
+
+  ⟹ 一句话：宏(预处理/文本) 与 函数(编译/运行) 层次正交、互不限制——函数源码里能用宏(展开成
+     代码)、宏的替换体里能调用甚至定义函数(TORCH_CHECK 就调了 torchCheckFail 等)。只需注意：函数里
+     #define 的宏没有函数作用域(对整个文件生效)，且宏是无作用域文本替换、要防命名/多次求值的坑。
+
+
 相关文件：
     docs/c++/x_macro_scalartype_enum.txt          —— 宏参数接收"类型名"的实例。
     docs/c++/AT_DISPATCH_FLOATING_TYPES_AND2.txt   —— D6 用 the_type 缓存避免 TYPE 多次求值。
+    docs/c++/torch_check_macro_analysis.txt        —— 十二节 TORCH_CHECK 的更深语义(重载/抛错/[[noreturn]])。
+    docs/c++/function_variadic.txt                 —— 十四节"函数变参"详解(C 变参 va_list / C++ 变参模板)。
