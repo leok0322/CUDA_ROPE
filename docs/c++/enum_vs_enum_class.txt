@@ -183,8 +183,85 @@ c10::ScalarType 被定义为  enum class ScalarType : int8_t { ... };
     杜绝把 dtype 当普通整数误用。
 
 
+================================================================================
+十、torch::headeronly::ScalarType 详解
+================================================================================
+
+1) 它是什么、在哪
+--------------------------------------------------------------------------------
+    namespace torch { namespace headeronly {
+        enum class ScalarType : int8_t { Byte, Char, Short, Int, Long, Half,
+            Float, Double, ComplexHalf, ComplexFloat, ComplexDouble, Bool,
+            BFloat16, ... , Float8_e4m3fn, ... , Undefined, NumOptions };
+    }}
+    （定义见 torch/headeronly/core/ScalarType.h；headeronly = 纯头/stable 版本，
+      不依赖会变动的 ATen 内部，故 stable ABI 也能用。c10::ScalarType / at::ScalarType
+      是同一枚举的别名——三个命名空间指向同一个 enum class。）
+
+  · 是【强类型枚举(enum class)】，底层 int8_t（每值仅 1 字节，是“dtype 的小整数标签”）。
+  · 每个枚举子对应 PyTorch 的一种 dtype：Half=float16、BFloat16、Float=float32、
+    Double=float64、Long=int64、Bool…；末尾 NumOptions 是“总数”哨兵（不是真 dtype）。
+
+2) ★最关键：它是“值”，不是“类型”
+--------------------------------------------------------------------------------
+  ScalarType::Half 是【枚举值(编译期常量)】，不是 C++ 类型。别和真正的类型混：
+
+      值(枚举子)                              对应的 C++ 类型
+      --------------------------------------  ----------------------
+      ScalarType::Half   (= at::kHalf)        c10::Half
+      ScalarType::BFloat16 (= at::kBFloat16)  c10::BFloat16
+      ScalarType::Float  (= at::kFloat)       float       (原生)
+      ScalarType::Double (= at::kDouble)      double      (原生)
+      ScalarType::Long   (= at::kLong)        int64_t     (原生)
+
+  · at::kHalf / c10::kHalf 只是 ScalarType::Half 这个【值】的短别名，仍是“值”。
+  · 注意：枚举【值】Float 对应原生【类型】float —— 没有 c10::Float 这种类型，
+    float32/float64/int64 等直接用 C++ 原生类型，故不需要包装类；只有 C++ 没有原生
+    对应的 Half/BFloat16 才有 c10::Half / c10::BFloat16 包装类型。
+
+3) 值 ↔ 类型 的相互映射（两座桥）
+--------------------------------------------------------------------------------
+  · 值 → 类型：torch::headeronly::impl::ScalarTypeToCPPTypeT<ScalarType::Half>  == c10::Half
+               （模板实参必须是【编译期常量】枚举值，运行时值不行——见第 5 点）
+  · 类型 → 值：CppTypeToScalarType<c10::Half>::value                           == ScalarType::Half
+
+4) 怎么拿到一个 ScalarType 值
+--------------------------------------------------------------------------------
+  · 运行时从张量取：qkv.scalar_type()  → 返回 ScalarType 枚举【值】(当前 dtype)。
+  · 直接写常量：ScalarType::Half / at::kHalf（编译期常量）。
+  · 取总数：static_cast<int16_t>(ScalarType::NumOptions)（enum class 不隐式转，须 cast）。
+
+5) 在 dispatch 里的角色：运行时值 → 编译期类型 的桥
+--------------------------------------------------------------------------------
+  qkv.scalar_type() 是【运行时值】，不能直接塞进模板：
+
+      ScalarTypeToCPPTypeT<qkv.scalar_type()>     // ✗ “不是常量表达式”，编不过
+
+  必须先用 switch 把运行时值分发到某个 case，case 标签是【编译期常量】枚举值，
+  再用它实例化模板得到类型 scalar_t：
+
+      switch (qkv.scalar_type()) {                         // 运行时分发(用“值”)
+        case ScalarType::Half: {                           // 标签是编译期常量
+          using scalar_t = ScalarTypeToCPPTypeT<ScalarType::Half>;  // 值→类型(=c10::Half)
+          /* ...用 scalar_t 实例化 kernel... */
+        }
+        case ScalarType::BFloat16: { ... }
+        ...
+      }
+
+  这正是 DISPATCH_*（本仓库 src/run_kernel.cu / dispatch_utils.h）宏自动展开的事：
+  为每个支持的 dtype 各生成一份模板实例，再用 switch 在运行时选一份。
+
+6) 与 ScalarType 同义的三个名字
+--------------------------------------------------------------------------------
+    torch::headeronly::ScalarType  ←─同一 enum class─→  c10::ScalarType / at::ScalarType
+  枚举值同理：torch::headeronly::ScalarType::Half = c10::kHalf = at::kHalf（皆为“值”）。
+
+
 相关文件：
     docs/c++/AT_DISPATCH_FLOATING_TYPES_AND2.txt  —— switch(ScalarType) 分发，
         枚举值（编译期常量）做 case 标签 + 模板实参。
-    （ScalarType 的枚举项由 X-macro AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS
-      批量生成。）
+    docs/c++/x_macro_scalartype_enum.txt          —— ScalarType 枚举项由 X-macro
+        AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS 批量生成的原理。
+    docs/c++/at_tensor_vs_stable_tensor_registration.txt —— at:: 与 torch::stable:: 两套 API。
+    src/run_kernel.cu / src/inference/dispatch_utils.h   —— DISPATCH_* 宏的实现与用法。

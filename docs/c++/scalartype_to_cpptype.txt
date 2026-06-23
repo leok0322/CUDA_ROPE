@@ -1,0 +1,291 @@
+================================================================================
+ScalarTypeToCPPTypeT —— 把 ScalarType 枚举【值】映射成 C++【类型】(dispatch 里的 scalar_t)
+================================================================================
+
+一句话
+--------------------------------------------------------------------------------
+  ScalarTypeToCPPTypeT<ScalarType::Half>  ==  c10::Half
+  它是“枚举值 → 类型”的【编译期映射】，dispatch 宏在 case 里用它把当前 dtype 的枚举值
+  翻成具体 C++ 类型，并起别名 scalar_t，供 kernel 模板实例化使用。
+
+  方向：值(运行时/编译期常量) ──ScalarTypeToCPPTypeT──▶ 类型(编译期)
+  反向：CppTypeToScalarType<c10::Half>::value == ScalarType::Half （类型 → 值）
+
+
+================================================================================
+一、实现（torch/headeronly/core/ScalarType.h）
+================================================================================
+
+    namespace c10::impl {
+
+    // ① 主模板：只声明不定义（白名单：未特化的 N 用了会“不完整类型”报错）
+    template <c10::ScalarType N>
+    struct ScalarTypeToCPPType;
+
+    // ② 用 X-macro 为每种 dtype 批量生成特化；每个特化提供成员类型 `type`
+    #define SPECIALIZE_ScalarTypeToCPPType(cpp_type, scalar_type)   \
+      template <>                                                   \
+      struct ScalarTypeToCPPType<c10::ScalarType::scalar_type> {    \
+        using type = cpp_type;                                      \
+        static type t;   /* 历史遗留访问器，新代码用别名模板即可 */ \
+      };
+
+    AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(SPECIALIZE_ScalarTypeToCPPType)
+    #undef SPECIALIZE_ScalarTypeToCPPType
+
+    // ③ 别名模板：取 ::type，省去每次写 typename ...::type
+    template <c10::ScalarType N>
+    using ScalarTypeToCPPTypeT = typename ScalarTypeToCPPType<N>::type;
+
+    } // namespace c10::impl
+
+  X-macro 展开后等价于一堆这样的特化（节选）：
+
+    template <> struct ScalarTypeToCPPType<ScalarType::Float>    { using type = float;          ... };
+    template <> struct ScalarTypeToCPPType<ScalarType::Double>   { using type = double;         ... };
+    template <> struct ScalarTypeToCPPType<ScalarType::Half>     { using type = c10::Half;      ... };
+    template <> struct ScalarTypeToCPPType<ScalarType::BFloat16> { using type = c10::BFloat16;  ... };
+    template <> struct ScalarTypeToCPPType<ScalarType::Long>     { using type = int64_t;        ... };
+    // ... Byte/Char/Short/Int/Bool/Complex*/Float8_* 等
+
+  （X-macro 批量生成的原理见 docs/c++/x_macro_scalartype_enum.txt。）
+
+
+================================================================================
+二、逐部分解析
+================================================================================
+
+1) 它是【类模板 + 显式特化】，不是函数
+   · 主模板 ScalarTypeToCPPType<N> 的模板参数 N 是【非类型模板参数】，类型为
+     c10::ScalarType（一个枚举值，编译期常量）。
+   · 主模板【只声明不定义】→ 起“白名单”作用：只有被特化过的枚举值（真实 dtype）才有
+     ::type；拿没特化的值（如 ScalarType::Undefined / NumOptions）去用会因“不完整类型”
+     编译报错，把非法 dtype 挡在编译期。
+
+2) 每个特化提供成员类型 `using type = cpp_type;`
+   · 这就是“值→类型”的真正映射表：键是枚举值（模板特化的实参），值是 C++ 类型。
+   · 成员 `static type t;` 是历史遗留访问器（注释说是绕开旧 CUDA 的一个 bug），
+     新代码不要用 decltype(...::t)，直接用别名模板 ScalarTypeToCPPTypeT<N>。
+
+3) 别名模板 ScalarTypeToCPPTypeT<N> = typename ScalarTypeToCPPType<N>::type
+   · 末尾 T = “Type”，是“取出 ::type”的便捷封装。
+   · 为何需要 typename：ScalarTypeToCPPType<N> 依赖模板参数 N，是【依赖类型】，
+     其成员 ::type 默认被编译器当“值”，必须用 typename 显式声明它是“类型”。
+     （依赖名 typename 的规则详见 docs/c++/template_scope_alias_and_deduction.txt。）
+
+4) 与“运行时”的边界
+   · N 必须是【编译期常量】枚举值。可以写 ScalarTypeToCPPTypeT<ScalarType::Half>，
+     但【不能】写 ScalarTypeToCPPTypeT<qkv.scalar_type()>——后者是运行时返回值，
+     不是常量表达式，编译报错。运行时值要先经 switch 落到某个 case（见第三节）。
+
+
+================================================================================
+二·补、SPECIALIZE 宏 与 别名模板 的分工（生产者 vs 消费者）
+================================================================================
+
+常见疑问：特化里并没有出现别名模板 ScalarTypeToCPPTypeT，它们怎么连起来的？
+答：这是【单向】数据流，二者解耦——别名【读】特化，特化不【提】别名，是正常且有意的。
+
+    SPECIALIZE 宏  ──生成──▶  ScalarTypeToCPPType<N> 的一堆特化（“映射表”本体）
+                                          ▲
+                                          │ 读取 ::type
+    别名模板 ScalarTypeToCPPTypeT<N> ──────┘（“读表器”，只读不建）
+                                          ▲
+                                          │ 实例化
+    调用点 ScalarTypeToCPPTypeT<ScalarType::Half>（真正用的人）
+
+A) SPECIALIZE_ScalarTypeToCPPType = 建表（生产者）
+   · 把“一段几乎相同的特化”抽成模板，由 X-macro 对每个 (cpp_type, scalar_type) 各展开
+     一遍，自动生成几十条特化，每条 `using type = cpp_type;` 即表中一行。
+   · 作用：消除几十段重复手写、防漂移——加新 dtype 只在 X-macro 清单加一行即可。
+
+   ── 为什么用 SPECIALIZE_ 宏 + X-macro（而不是手写几十条特化）──────────────
+   两个宏是【两层】配合，各管一件事：
+
+     · SPECIALIZE_ScalarTypeToCPPType(cpp_type, scalar_type)  —— “动作宏”
+       描述“对【一对】(类型, 枚举名) 该生成什么”：即一条特化的模板。
+     · AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(_)        —— “X-macro 清单”
+       是【唯一一份 dtype 名单】，形如 _(uint8_t,Byte) _(int8_t,Char) _(c10::Half,Half)...
+       它接收一个【回调宏 _】，对名单里【每一项】调用一次 _(类型, 枚举名)。
+
+   组合 AT_FORALL_...(SPECIALIZE_ScalarTypeToCPPType) 的展开过程：
+       把回调 _ 替换成 SPECIALIZE_ScalarTypeToCPPType，于是名单里每一项都触发一次该
+       动作宏 → 自动铺开成几十条特化。一行代码 = 整张映射表。
+
+   这么做的好处（即“为什么用宏”）：
+     1. 消除重复：几十个 dtype 的特化长得几乎一样，手写既冗长又易抄错（漏 static type t、
+        类型写错等）；宏只描述“模板长什么样”一次。
+     2. 单一事实源(single source of truth)：dtype 名单只存在 AT_FORALL_... 一处。
+        同一份名单被【多处复用】——定义 ScalarType 枚举本身、本处“值→类型”映射、
+        反向“类型→值”、toString、各种 dispatch 等，都喂同一清单不同的回调宏。
+     3. 防漂移：新增/删除一种 dtype 只改名单一行，所有“消费方”自动同步生成，绝不会出现
+        “加了枚举值却忘了加映射特化”这类不一致。
+     4. 编译期零成本：纯预处理器文本展开，最终就是普通特化，无任何运行时开销。
+
+   一句话：SPECIALIZE_ 定义“每一项生成什么”，X-macro 清单提供“有哪些项并逐项回调”，
+   二者相乘 = 用一份名单自动产出整张表。详见 docs/c++/x_macro_scalartype_enum.txt。
+
+B) ScalarTypeToCPPTypeT = 读表（消费者）
+   · 只做一件事：取出 ScalarTypeToCPPType<N>::type。
+   · 两个便利：(1) 省掉调用方每次写 typename ...::type 的样板；
+     (2) 把 typename 封装在别名定义里一次，调用方写 ScalarTypeToCPPTypeT<N> 即可。
+
+C) 为何特化里看不到别名——它们在【实例化时】才对接，不在定义时互相引用：
+     ScalarTypeToCPPTypeT<ScalarType::Half>
+        │ ① 代入别名定义 N=Half
+        ▼
+     typename ScalarTypeToCPPType<ScalarType::Half>::type
+        │ ② 编译器查找宏生成的那条特化
+        ▼
+     struct ScalarTypeToCPPType<ScalarType::Half> { using type = c10::Half; ... }
+        │ ③ 取 ::type
+        ▼
+     c10::Half
+   类比查字典：宏负责【印刷词条】(建字典)，别名负责【翻字典取释义】(查字典)；
+   印词条时当然不提“查字典函数”，查的时候才用到字典——两者天然分离、调用点汇合。
+
+
+================================================================================
+二·补二、为什么必须用模板特化，而不是 switch-case 写成一个函数
+================================================================================
+
+常见疑问：用一个 switch-case 函数把 dtype 映射出来，不用模板特化，不也行吗？
+答：【不行】。switch 函数做不到本设施的事——根本原因：函数返回“值”，本设施产出“类型”。
+
+A) 根本障碍：函数不能“返回一个类型”
+     ??? f(ScalarType st) {
+       switch (st) {
+         case ScalarType::Half:  return c10::Half;   // ✗ 想“返回类型”，不合法
+         case ScalarType::Float: return float;       // ✗ float 是类型不是值
+       }
+     }
+   · 函数只能 return 值/对象，不能 return 类型；
+   · 最终要的是拿类型实例化 kernel：
+         using scalar_t = ???;                  // using 右边必须是【类型】
+         fused_kernel<scalar_t><<<...>>>(...);  // 模板实参必须是【编译期类型】
+     而 f(st) 是【运行时表达式(值)】，塞不进 using，也塞不进 <...>。
+
+   维度对比：
+       维度        | switch-case 函数 | ScalarTypeToCPPType(模板特化)
+       ------------+------------------+------------------------------
+       何时发生    | 运行时           | 编译期
+       产出什么    | 值/对象          | 类型
+       可喂 using/<>| 否               | 是
+   模板特化是 C++ 里【唯一】能“由编译期常量(枚举值)算出一个类型”的机制；函数+switch 干不了。
+
+B) switch 没被淘汰——它是【另一半】，与特化互补（非替代）
+     switch (qkv.scalar_type()) {            // switch：运行时分发(值)
+       case ScalarType::Half: {              // case 标签是【编译期常量】
+         using scalar_t = ScalarTypeToCPPTypeT<ScalarType::Half>;  // 特化：值→类型
+         fused_kernel<scalar_t><<<...>>>(...);  break;
+       }
+       ...
+     }
+   · switch：把“运行时 dtype 值”枚举成有限个 case → 完成“运行时值 → 编译期常量”。
+   · 特化：在 case 内把“编译期常量枚举值 → 编译期类型”。
+   两者各做一半，合起来才跨越“运行时 dtype → 编译期类型”的鸿沟，缺一不可。
+
+C) “那在每个 case 里直接写死类型，不就不用 trait 了？”
+   · 可以：case ScalarType::Half: { using scalar_t = c10::Half; ... }——但这只是把 trait 的
+     映射【手抄进每个 case】，且 switch 仍离不开“在分支里指明类型”。
+   · 保留 trait 的价值：
+       1. 让 dispatch 宏【泛型化】：宏只拿到 enum_type 记号，类型层面没有 if/switch，只能写
+          `using scalar_t = ScalarTypeToCPPTypeT<enum_type>;` 对所有 dtype 统一生成 case。
+          没有 trait，宏无法泛型地拿到类型。
+       2. 复用 + 单一事实源：“值→类型”映射多处要用，集中在 trait + 一份 X-macro 名单，
+          改一处全同步，避免到处手抄、漂移。
+
+   ── “在每个 case 里写死类型”是什么意思：两版对比 ────────────────────────
+   “写死(hardcode)”= 把该 dtype 对应的 C++ 类型用 using scalar_t = 具体类型; 人手敲进
+   每个 case，而不是靠 trait 去查。
+
+     版本一（用 trait，现状/宏可泛型生成）：每个 case 结构相同，仅尖括号里的枚举值不同
+         case ScalarType::Float:    { using scalar_t = ScalarTypeToCPPTypeT<ScalarType::Float>;    launch<scalar_t>(); break; }
+         case ScalarType::Half:     { using scalar_t = ScalarTypeToCPPTypeT<ScalarType::Half>;     launch<scalar_t>(); break; }
+         case ScalarType::BFloat16: { using scalar_t = ScalarTypeToCPPTypeT<ScalarType::BFloat16>; launch<scalar_t>(); break; }
+
+     版本二（写死类型，不用 trait）：类型名是人手写的字面量，每个 case 各不相同
+         case ScalarType::Float:    { using scalar_t = float;         launch<scalar_t>(); break; }  // 写死 float
+         case ScalarType::Half:     { using scalar_t = c10::Half;     launch<scalar_t>(); break; }  // 写死 c10::Half
+         case ScalarType::BFloat16: { using scalar_t = c10::BFloat16; launch<scalar_t>(); break; }  // 写死 c10::BFloat16
+
+   差别：
+       维度              | 版本一(trait)                  | 版本二(写死)
+       ------------------+--------------------------------+----------------------------
+       类型从哪来        | trait 查表 <枚举>              | 人手写字面量 c10::Half
+       枚举→类型 的对应  | 集中在 trait 一处             | 散落在每个 case
+       能否被宏统一生成  | 能(每个 case 同构)            | 难(类型名各异，要逐个手写)
+       加新 dtype        | 改 X-macro 名单一行           | 每处 switch 都要新增一个 case
+   版本二能编译运行，但每个 case 类型名不同 → 无法被 dispatch 宏统一展开，且映射散落易漂移；
+   这正是要保留 trait 的原因。
+
+   小结：switch(运行时值→编译期常量) + 特化(常量→类型) 互补；trait 让宏能泛型取类型并消重。
+
+
+================================================================================
+三、在 dispatch 里如何变成 scalar_t（本仓库 src/run_kernel.cu）
+================================================================================
+
+  PRIVATE_CASE_TYPE_USING_HINT_TMPL 宏在每个 case 里这样用它（HINT 固定为 scalar_t）：
+
+    case enum_type: {                                  // enum_type 是编译期常量(如 ::Half)
+      using scalar_t [[maybe_unused]] =
+          torch::headeronly::impl::ScalarTypeToCPPTypeT<enum_type>;   // 值 → 类型
+      return (lambda)();                               // lambda 体里按名字用 scalar_t
+    }
+
+  完整链路（“运行时枚举值 → 编译期类型”的桥）：
+
+    qkv.scalar_type()                 运行时枚举【值】(如 ScalarType::Half)
+        │ switch(the_type)            运行时分发
+        ▼
+    case ScalarType::Half:            标签是【编译期常量】枚举值
+        │ ScalarTypeToCPPTypeT<Half>  值 → 类型
+        ▼
+    using scalar_t = c10::Half        得到编译期【类型】别名
+        │
+        ▼
+    (lambda)() 体内：fused_..._kernel<scalar_t><<<...>>>(...)   用 scalar_t 实例化模板
+
+  关键点：模板实例化是编译期的，dtype 是运行时才知道的；ScalarTypeToCPPTypeT 只负责
+  “值→类型”这一步，而“把运行时值变成可做模板实参的编译期常量”靠的是 switch+case。
+  二者合起来才完成 dispatch。本仓库为 Float/Half/BFloat16 各生成一份 case ⇒ 各一份
+  kernel 模板实例，运行时按 qkv 的 dtype 选其一执行。
+
+
+================================================================================
+四、与相关设施的关系
+================================================================================
+
+  ScalarType（枚举值，dtype 标签）            —— docs/c++/enum_vs_enum_class.txt §十
+      │ ScalarTypeToCPPTypeT<值>  值→类型
+      ▼
+  C++ 类型（float / c10::Half / c10::BFloat16 / int64_t ...）
+      │ _typeConvert<类型> 这层 traits 再做  类型 ↔ 计算用的 hip 原生类型/打包类型/转换
+      ▼
+  kernel 计算（half/bf16 转 float 算，见 type_convert.cuh）
+
+  · ScalarTypeToCPPTypeT：把“dtype 枚举值”定到“torch 的 C++ 标量类型”（c10::Half 等）。
+  · _typeConvert<scalar_t>：再把该 C++ 类型映射到 CUDA 原生类型(__half)、打包类型(__half2)
+    与 convert 函数——是另一层 traits（静态多态），见 static_vs_dynamic_polymorphism.txt。
+  两层各司其职：前者“枚举→类型”，后者“类型→设备端转换细节”。
+
+
+================================================================================
+五、易错点速记
+================================================================================
+  · ScalarType::Half 是“值”，c10::Half 是“类型”；ScalarTypeToCPPTypeT 负责前者→后者。
+  · 模板实参须编译期常量：ScalarTypeToCPPTypeT<qkv.scalar_type()> ✗，必须经 switch/case。
+  · 取 ::type 要加 typename（依赖类型成员），别名模板已替你封装好，直接用 ...T<N> 即可。
+  · 主模板不定义 = 白名单：非法 dtype（未特化）在编译期就报错。
+  · 没有 c10::Float —— Float 这个【值】映射到原生【类型】float；只有 C++ 无原生对应的
+    Half/BFloat16 才有 c10::Half/c10::BFloat16 包装类型。
+
+
+相关文件：
+    docs/c++/enum_vs_enum_class.txt              —— §十 ScalarType 枚举类(值 vs 类型)
+    docs/c++/x_macro_scalartype_enum.txt          —— X-macro 批量生成枚举/特化
+    docs/c++/template_scope_alias_and_deduction.txt —— 依赖类型 + typename 规则
+    docs/c++/static_vs_dynamic_polymorphism.txt   —— _typeConvert traits(下一层映射)
+    src/run_kernel.cu                             —— DISPATCH_* 宏：case 里用本设施得到 scalar_t
+    torch/headeronly/core/ScalarType.h            —— ScalarTypeToCPPType(T) 定义处
