@@ -1,0 +1,293 @@
+================================================================================
+两种算子注册方式：at::Tensor（经典 ATen）vs torch::stable::Tensor（stable ABI）
+—— 实现写法 + 对 CMakeLists 的前提要求
+================================================================================
+
+背景
+--------------------------------------------------------------------------------
+把一个 CUDA kernel 暴露给 Python，有两套 C++ API：
+
+  · 经典 ATen      ：#include <torch/extension.h>，张量类型 at::Tensor
+                     （= torch::Tensor，二者是同一类型的别名）。
+  · stable ABI     ：#include <torch/csrc/stable/...>，张量类型 torch::stable::Tensor。
+
+二者底层握的是【同一个张量】(同一 c10::TensorImpl，引用计数)，区别在 ABI 稳定性：
+  · at::Tensor             ：直接暴露 ATen 内部结构 → ABI【不稳定】，绑定具体 libtorch
+                             版本，换版本通常要重编。
+  · torch::stable::Tensor  ：薄包装，经稳定 C 接口(aoti shim)与 PyTorch 通信，不暴露
+                             会变动的内部 → ABI【稳定】，一次编译可跨多版本 PyTorch。
+
+本项目 src/interface.cpp 当前采用【经典 ATen】；src/inference/fused_qknorm_rope_kernel.cu
+则是【stable ABI】的活例证（validation 目标只链一个 torch 即编译/链接通过）。
+
+⚠ 关键澄清：能在语法上改用 stable 并编过 ≠ 真正获得跨版本可移植。后者需对齐官方
+   stable/AOTInductor 的打包理念（针对 headeronly + 稳定 shim 构建，不绑定完整 libtorch
+   内部库），那是另一套构建方式，不只是改 interface.cpp 与 CMake。
+
+
+================================================================================
+一、版本 A：经典 ATen（at::Tensor）—— 当前采用
+================================================================================
+
+实现写法（src/interface.cpp 摘要）
+--------------------------------------------------------------------------------
+    #include <torch/extension.h>          // 完整 libtorch + pybind11
+
+    // CUDA 封装：参数用 at::Tensor（就地改写的张量用引用 at::Tensor&）
+    void run_..._interleave(at::Tensor qkv, at::Tensor q_weight, /* ... */,
+                            int64_t num_heads_q, /* ... */, double eps) {
+        fused_QKNorm_and_ROPE_interleave(qkv, /* ... */);   // 转调真正 kernel
+    }
+
+    // 经典注册：声明 schema + 绑定 CUDA 实现
+    TORCH_LIBRARY(ROPE_cuda, m) {          // 第一参数 = 命名空间
+        m.def("fused_qkv_norm_rope_interleave(Tensor(a!) qkv, Tensor q_weight, ... "
+              "int head_dim, int rotary_dim, float eps) -> ()");
+    }
+    TORCH_LIBRARY_IMPL(ROPE_cuda, CUDA, m) {
+        m.impl("fused_qkv_norm_rope_interleave", &run_..._interleave);
+    }
+
+    // 另可并存 pybind 直 import：
+    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+        m.def("fused_qkv_norm_rope_interleave", &run_..._interleave, "...");
+    }
+
+要点
+--------------------------------------------------------------------------------
+  · C++ 签名里 at::Tensor 与 torch::Tensor 可互换（同一类型别名）。
+  · schema 字符串是 Dispatcher 的 DSL，张量【只能写 Tensor】(写 at::Tensor 解析失败)；
+    整数写 int(=C++ int64_t)、浮点写 float(=C++ double)；就地改写标 (a!)；无返回 -> ()。
+  · Python 调用：torch.ops.ROPE_cuda.fused_qkv_norm_rope_interleave(...)（torch.ops 方式）
+                  或 import ROPE_cuda; ROPE_cuda.fused_...(...)（pybind 方式）。
+
+对 CMakeLists 的前提要求（缺一不可）
+--------------------------------------------------------------------------------
+    find_package(Torch REQUIRED)                       # libtorch 头/库
+    target_include_directories(... ${TORCH_INCLUDE_DIRS})   # torch/extension.h、pybind11
+    target_link_libraries(... ${TORCH_LIBRARIES})      # libtorch/libc10 等
+    # ★以下为 pybind/import 专属：
+    find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib")
+    target_link_libraries(... ${TORCH_PYTHON_LIBRARY}) # ★PYBIND11_MODULE 需 libtorch_python.so
+    target_compile_definitions(... TORCH_EXTENSION_NAME=ROPE_cuda)  # ★pybind 模块名
+    Python3_add_library(ROPE_cuda MODULE WITH_SOABI ...)           # ★import 需精确 .so 文件名
+    # 共需(与 stable 相同)：
+    separate_arguments + add_compile_options(${TORCH_CXX_FLAGS})   # ABI 标志对齐
+    set(CMAKE_CXX_STANDARD 17 或更高)                              # torch 头要求 ≥C++17
+
+
+================================================================================
+二、版本 B：stable ABI（torch::stable::Tensor）
+================================================================================
+
+实现写法（对照 src/inference/fused_qknorm_rope_kernel.cu 的真实用法）
+--------------------------------------------------------------------------------
+    #include <torch/csrc/stable/library.h>   // STABLE_TORCH_LIBRARY / _IMPL
+    #include <torch/csrc/stable/tensor.h>     // torch::stable::Tensor
+    #include <torch/headeronly/...>           // STD_TORCH_CHECK 等
+
+    void run_..._interleave_stable(torch::stable::Tensor qkv, /* ... */,
+                                   int64_t num_heads_q, /* ... */, double eps) {
+        // 用 stable 接口取信息：qkv.get_device_index() / data_ptr() / ...
+        // DeviceGuard 用 torch::stable::accelerator::DeviceGuard
+        // 检查用 STD_TORCH_CHECK(...)（不是 TORCH_CHECK）
+        // ...转调 kernel...
+    }
+
+    // schema 字符串与经典版【完全一致】(仍写 Tensor / Tensor(a!) / float / -> ())
+    STABLE_TORCH_LIBRARY(ROPE_cuda_stable, m) {        // 命名空间须与经典版不同以免重复注册
+        m.def("fused_qkv_norm_rope_interleave(Tensor(a!) qkv, ... float eps) -> ()");
+    }
+    STABLE_TORCH_LIBRARY_IMPL(ROPE_cuda_stable, CUDA, m) {
+        // ⚠ stable 走 boxed 调用约定：部分版本可直接 m.impl("name", &fn)，
+        //   部分版本需 TORCH_BOX(&fn) 或手写 boxed 包装(StableIValue* stack,...)。按版本核对。
+        m.impl("fused_qkv_norm_rope_interleave", &run_..._interleave_stable);
+    }
+    // Python 调用：torch.ops.ROPE_cuda_stable.fused_qkv_norm_rope_interleave(...)
+
+经典 → stable 的对应关系
+--------------------------------------------------------------------------------
+    #include <torch/extension.h>        →  torch/csrc/stable/* + torch/headeronly/*
+    at::Tensor / at::Tensor&            →  torch::stable::Tensor / &
+    TORCH_LIBRARY / _IMPL               →  STABLE_TORCH_LIBRARY / _IMPL
+    TORCH_CHECK                         →  STD_TORCH_CHECK
+    at::cuda::CUDAGuard                 →  torch::stable::accelerator::DeviceGuard
+    x.is_cuda()/x.size()/x.data_ptr()   →  stable 版等价接口(get_device_index 等)
+    schema 字符串                        →  不变(Tensor / Tensor(a!) / int / float / -> ())
+    不需要 PYBIND11_MODULE              →  统一走 torch.ops.load_library 加载
+
+对 CMakeLists 的前提要求
+--------------------------------------------------------------------------------
+    find_package(Torch REQUIRED)                       # 仍需(stable 头就在 torch include 内)
+    target_include_directories(... ${TORCH_INCLUDE_DIRS})   # 已含 torch/csrc/stable、torch/headeronly
+    target_link_libraries(... torch)                   # 链 torch 一个 imported target 即够：
+                                                       #   stable 注册符号 + aoti shim +
+                                                       #   libtorch_cuda 经接口属性传递拉入
+                                                       #   (见 torch_library_linking.txt)
+    # 共需(与经典相同)：
+    separate_arguments + add_compile_options(${TORCH_CXX_FLAGS})   # ABI 标志对齐
+    set(CMAKE_CXX_STANDARD 17 或更高)                              # torch 头要求 ≥C++17
+
+    相对版本 A【可删去】(纯属 pybind/import 专需)：
+      · find_library(TORCH_PYTHON_LIBRARY ...) 与对其链接   —— libtorch_python 仅 pybind 用
+      · TORCH_EXTENSION_NAME 定义
+      · WITH_SOABI 精确命名 —— torch.ops.load_library 接受任意文件名，
+        可退回普通 add_library(ROPE_cuda MODULE ...)；甚至不再需要 Python3 Development
+
+
+================================================================================
+三、两版前提对照表
+================================================================================
+
+    CMake 项                                 | 经典 at::Tensor | stable Tensor
+    -----------------------------------------+-----------------+---------------
+    find_package(Torch)                      |      必须       |     必须
+    ${TORCH_INCLUDE_DIRS} include            |      必须       |     必须
+    链接 torch / ${TORCH_LIBRARIES}          |      必须       | 必须(链 torch 即够)
+    separate_arguments(${TORCH_CXX_FLAGS})   |      必须       |     必须   ← ABI 对齐
+    C++ 标准 ≥ 17                            |      必须       |     必须
+    TORCH_PYTHON_LIBRARY (libtorch_python)   |   必须(pybind)  |   不需要
+    TORCH_EXTENSION_NAME 定义                |   必须(pybind)  |   不需要
+    WITH_SOABI 精确 .so 文件名               |  必须(import)   | 不需要(load_library)
+    Python3 Development 组件                 |  pybind/import 需 | 可不需要
+
+
+================================================================================
+四、共需前提的两点细节（两版都逃不掉）
+================================================================================
+
+1) separate_arguments(TORCH_CXX_FLAGS) —— ABI 标志对齐
+   · TORCH_CXX_FLAGS 由 find_package(Torch) 导出，核心是 -D_GLIBCXX_USE_CXX11_ABI=0/1
+     （GCC 的 C++ 标准库 ABI 开关）。取值不同，std::string/std::list 等的【内存布局】
+     与【符号名 mangling】都不同。libtorch.so 用固定取值预编译；你的 .so 取值不一致 →
+       - 链接期：符号对不上 → undefined reference；
+       - 运行期：同类型两边理解不一致 → 数据错乱。
+   · 必须把 libtorch 自报的标志原样对齐过来。
+   · 为何用 separate_arguments：TORCH_CXX_FLAGS 是含空格的字符串(可能多个标志)，
+     直接 add_compile_options("${...}") 会当成单个带空格参数 → 编译器无法解析；
+     separate_arguments(... NATIVE_COMMAND ...) 按平台命令行规则拆成 list，逐项独立传入。
+
+2) C++ 标准 ≥ C++17
+   · torch 头(经典的 torch/extension.h、stable 的 torch/csrc/stable/*)用了 if constexpr /
+     结构化绑定 / std::optional 等 C++17 特性，旧标准编不过。
+   · 本项目用 C++20(C++17 超集)，并 set(CMAKE_CXX_STANDARD_REQUIRED ON) 防止静默降级。
+
+
+================================================================================
+五、torch.ops.load_library 是怎么“直接 dlopen”并完成算子注册的
+================================================================================
+
+load_library 本身是薄包装，内部用 ctypes.CDLL 调 OS 的 dlopen：
+
+    # torch/_ops.py（简化）
+    def load_library(self, path):
+        path = _utils_internal.resolve_library_path(path)  # 规整成绝对路径
+        with dl_open_guard():        # 临时设 dlopen 标志(RTLD_GLOBAL)，保证符号互相可见
+            ctypes.CDLL(path)        # ★ 这一句就是真正的 dlopen(path)
+        self.loaded_libraries.add(path)
+
+关键时序（注册发生在 dlopen 的“运行静态初始化器”阶段）：
+
+    torch.ops.load_library("xxx.so")
+       └─ ctypes.CDLL("xxx.so")
+            └─ dlopen("xxx.so")
+                 ├─ 映射 .so、解析符号(libtorch 符号 import torch 时已在进程里)
+                 └─ 运行 .init_array → 运行 .so 里的全局/静态对象构造函数
+                      └─ TORCH_LIBRARY / STABLE_TORCH_LIBRARY 展开出的静态注册器构造函数
+                         调用 m.def(...) → 把算子登记进【全局 Dispatcher】
+
+TORCH_LIBRARY(ns, m){...} 大致展开为一个命名空间作用域的【静态对象】，其构造函数在
+dlopen 时自动运行：
+
+    static void init_ns(torch::Library&);                 // 你写的 { m.def(...); }
+    static const torch::detail::TorchLibraryInit          // ★ 静态对象
+        static_init_ns("ns", &init_ns, ...);              //   构造函数→init_ns→m.def 注册
+    void init_ns(torch::Library& m) { m.def("..."); }
+
+为什么不需要 Python 符号：构造函数里调的 m.def/m.impl 是【libtorch 符号】(链 torch 已满足)，
+不碰任何 CPython API；故 .so 不必链 libpython、不必 include Python.h、文件名也随意。
+
+对比 import 方式(pybind)：import 按文件名规则(SOABI 后缀)找 .so，dlopen 后【还要找并调用
+PyInit_<模块名>】(PYBIND11_MODULE 生成的入口)创建 Python 模块——这一步用 CPython API，故需
+Python.h 与精确文件名。torch.ops 路径不找 PyInit_*，只靠静态注册器，所以“更直接”。
+
+
+================================================================================
+六、Python 调用示例（两种方式）
+================================================================================
+
+约定：算子无返回、就地改写 qkv(schema 标 Tensor(a!))，故 Python 侧拿改写后的 qkv 用。
+      cos/sin 已按 position 取好([num_tokens, rotary_dim/2])，dtype 与 qkv 一致(fp16/bf16)。
+
+────────────────────────────────────────────────────────────────────────────
+方式一：torch.ops.load_library（经典 torch.ops / stable 均用此法；文件名随意）
+────────────────────────────────────────────────────────────────────────────
+    import torch
+
+    # ① 必须先 import torch：让 libtorch*/libc10* 进进程，你的 .so dlopen 时符号才解析得了。
+    # ② 路径可绝对/相对；文件名任意(load_library 直接 dlopen，不挑名字)。
+    torch.ops.load_library("/abs/or/rel/path/任意名.so")
+
+    # ③ 准备输入（CUDA、连续、dtype 受 kernel 支持：fp16/bf16）
+    num_tokens, head_dim = 8, 128
+    Hq, Hk, Hv = 4, 2, 2
+    rotary_dim = head_dim                      # 全旋转；部分旋转则 < head_dim
+    dtype, dev = torch.float16, "cuda"
+
+    qkv = torch.randn(num_tokens, (Hq + Hk + Hv) * head_dim, dtype=dtype, device=dev)
+    q_weight = torch.randn(head_dim, dtype=dtype, device=dev)   # Q 的 RMSNorm γ
+    k_weight = torch.randn(head_dim, dtype=dtype, device=dev)   # K 的 RMSNorm γ
+    half = rotary_dim // 2
+    cos = torch.randn(num_tokens, half, dtype=dtype, device=dev)  # 已 gather
+    sin = torch.randn(num_tokens, half, dtype=dtype, device=dev)
+    eps = 1e-6
+
+    # ④ 调用：torch.ops.<命名空间>.<算子名>(...)
+    #    经典版命名空间 ROPE_cuda；stable 参考版命名空间 ROPE_cuda_stable
+    torch.ops.ROPE_cuda.fused_qkv_norm_rope_interleave(
+        qkv, q_weight, k_weight, cos, sin,
+        Hq, Hk, Hv, head_dim, rotary_dim, eps,
+    )
+    # 算子返回 ()(无返回)；结果就地写回 qkv，直接用 qkv 即可
+    print(qkv)        # 已被 QKNorm+RoPE 改写(V 段不变)
+
+    # 注：schema 里 int↔Python int、float↔Python float；就地算子返回 None。
+
+────────────────────────────────────────────────────────────────────────────
+方式二：import 扩展模块（仅经典 + PYBIND11_MODULE；需 .so 文件名=模块名.SOABI.so）
+────────────────────────────────────────────────────────────────────────────
+    import torch                      # 同样必须先 import torch（带出 libtorch 依赖）
+    import ROPE_cuda                  # 需 .so 名为 ROPE_cuda.cpython-3xx-...-linux-gnu.so
+                                      # 且其所在目录在 sys.path 上(本项目 .so 输出到项目根)
+
+    # 输入构造同上 ...
+    ROPE_cuda.fused_qkv_norm_rope_interleave(
+        qkv, q_weight, k_weight, cos, sin,
+        Hq, Hk, Hv, head_dim, rotary_dim, eps,
+    )
+    print(qkv)
+
+    # 想从任意位置 import：设 PYTHONPATH / sys.path.append(...) / 装进 site-packages。
+
+────────────────────────────────────────────────────────────────────────────
+两方式对照
+────────────────────────────────────────────────────────────────────────────
+    项                     | torch.ops.load_library      | import 模块
+    -----------------------+-----------------------------+-------------------------
+    适用注册方式           | TORCH_LIBRARY / STABLE_*    | PYBIND11_MODULE
+    .so 文件名             | 任意                        | 必须 模块名.SOABI.so
+    .so 位置               | 任意路径(直接给)            | 须在 sys.path 上
+    加载入口               | 静态注册器(dlopen 自动跑)   | PyInit_<模块名>(CPython API)
+    依赖 Python.h/libpython| 否                          | 是
+    调用形式               | torch.ops.<ns>.<op>(...)    | <模块>.<func>(...)
+    先 import torch ?      | 必须                        | 必须
+
+
+================================================================================
+七、相关文档
+================================================================================
+  · torch_library_linking.txt        —— 为何只链 torch 即可拉到 stable/cuda 符号
+  · torch_check_macro_analysis.txt    —— TORCH_CHECK / STD_TORCH_CHECK
+  · static_vs_dynamic_polymorphism.txt
+  · src/interface.cpp                 —— 版本 A 实现 + 末尾 #if 0 的版本 B 参考
+  · src/inference/fused_qknorm_rope_kernel.cu —— 版本 B(stable)真实用例

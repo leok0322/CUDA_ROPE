@@ -90,8 +90,11 @@ if(NOT CMAKE_CUDA_COMPILER)
 endif()
 
 # PyTorch 2.x 要求至少 C++17；C++20 作为超集向后兼容
+#   为何 ≥C++17：torch 头(无论 torch/extension.h 还是 stable 的 torch/csrc/stable/...)
+#   用了 if constexpr / 结构化绑定 / std::optional 等 C++17 特性，旧标准编不过。
+#   ★经典(at::Tensor) 与 stable(torch::stable::Tensor) 两版【共需】此前提。
 set(CMAKE_CXX_STANDARD 20)
-# 不支持 C++20 时直接报错，而非静默降级
+# 不支持 C++20 时直接报错，而非静默降级(降级会导致 torch 头编译失败)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── 可配置的 kernel 编译参数 ──────────────────────────────────────────────────
@@ -126,41 +129,110 @@ add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--use_f
 #   影响 occupancy 分析，两种模式均需查看
 add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>")
 
-# 将 TORCH_CXX_FLAGS（如 "-D_GLIBCXX_USE_CXX11_ABI=1"）从字符串拆分为 CMake list
-#   必须拆分：直接传字符串会被当作单个含空格的参数，编译器无法解析
-#   拆分后每项独立传给编译器，ABI 标志与 libtorch.so 保持一致，避免链接时 undefined reference
+# 将 TORCH_CXX_FLAGS（find_package(Torch) 导出，如 "-D_GLIBCXX_USE_CXX11_ABI=1"）
+# 从字符串拆分为 CMake list，再加进编译命令。★经典与 stable 两版【共需】此前提。
+#
+# 这是什么 / 为什么必须做：
+#   · TORCH_CXX_FLAGS 装着“编译你的代码时必须与 libtorch 一致”的标志，核心是
+#     -D_GLIBCXX_USE_CXX11_ABI=0/1 —— GCC 的 C++ 标准库 ABI 开关。
+#   · 该开关取值不同，std::string/std::list 等的【内存布局】与【符号名 mangling】都不同。
+#     libtorch.so 是用某个固定取值预编译的；你的 .so 若用不同取值 →
+#       - 链接期：符号名对不上 → undefined reference；
+#       - 运行期：同一类型两边理解不一致 → 数据错乱。
+#     故必须把 libtorch 自报的标志原样对齐到本项目，保证 ABI 一致。
+#   · 为何用 separate_arguments：TORCH_CXX_FLAGS 是【含空格的字符串】(可能多个标志)，
+#     直接 add_compile_options("${...}") 会当成单个带空格的参数 → 编译器无法解析；
+#     separate_arguments(... NATIVE_COMMAND ...) 按本平台命令行规则拆成 list，每项独立传入。
 separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 add_compile_options(${TORCH_CXX_FLAGS_LIST})
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 【interface.cpp 两种注册版本各自需要的 CMake 前提】
+#
+# 本 .so 的 C++ 侧可走两套注册方式（见 src/interface.cpp）。它们对 CMake 的依赖不同：
+#
+# ── 版本 A：经典 ATen（at::Tensor）── 当前采用 ─────────────────────────────
+#   代码：#include <torch/extension.h>；TORCH_LIBRARY/_IMPL + PYBIND11_MODULE。
+#   CMake 前提（缺一不可）：
+#     · find_package(Torch REQUIRED)              —— libtorch 头/库
+#     · ${TORCH_INCLUDE_DIRS} include             —— torch/extension.h、pybind11
+#     · ${TORCH_LIBRARIES} 链接                    —— libtorch/libc10 等
+#     · find_library(TORCH_PYTHON_LIBRARY ...) 并链接  —— ★PYBIND11_MODULE 专需(libtorch_python.so)
+#     · TORCH_EXTENSION_NAME=ROPE_cuda 定义        —— ★PYBIND11_MODULE 模块名
+#     · Python3 Development + Python3_add_library(... WITH_SOABI)  —— ★import 方式需精确 .so 文件名
+#     · separate_arguments(TORCH_CXX_FLAGS) ABI 标志、C++17+
+#
+# ── 版本 B：stable ABI（torch::stable::Tensor）─────────────────────────────
+#   代码：#include <torch/csrc/stable/...>+<torch/headeronly/...>；
+#         STABLE_TORCH_LIBRARY/_IMPL（不需 pybind）。
+#   CMake 前提：
+#     · find_package(Torch REQUIRED)              —— 仍需（stable 头就在 torch include 内）
+#     · ${TORCH_INCLUDE_DIRS} include             —— 已含 torch/csrc/stable、torch/headeronly
+#     · 链接 torch（一个 imported target 即够）     —— stable 注册符号 + aoti shim + libtorch_cuda 传递
+#     · TORCH_CXX_FLAGS ABI 标志、C++17+           —— 同 A
+#   相对 A【可删去】(纯属版本 A 的 pybind/import 专需)：
+#     · TORCH_PYTHON_LIBRARY 的 find_library 与链接（libtorch_python 仅 pybind 用）
+#     · TORCH_EXTENSION_NAME 定义
+#     · WITH_SOABI 精确命名（torch.ops.load_library 接受任意文件名，可退回普通 add_library(MODULE)）
+#       · 为何可退回：造 .so 是 CMake 通用能力，与 Python 无关；add_library(... MODULE ...)
+#         即产出可 dlopen 的 .so。Python3 Development / Python3_add_library 只为两件【Python 专属】
+#         的事：(a) 提供 Python.h 给 pybind(PYBIND11_MODULE)；(b) WITH_SOABI 生成 import 认得的
+#         精确文件名。stable + torch.ops 路径两件都不发生：不用 pybind(不碰 Python.h)，
+#         且 load_library(路径) 直接 dlopen、文件名随意；算子靠 STABLE_TORCH_LIBRARY 的
+#         【静态注册器】在 dlopen 时自动登记，只需 libtorch 符号，不需 Python 符号。
+#       · 前提：仅当【彻底不再用 pybind/import 模块】时才能去掉 Python3 Development；
+#         只要保留 import ROPE_cuda 用法，(a)(b) 又都需要。
+#       · 详见 docs/c++/at_tensor_vs_stable_tensor_registration.txt（§五 dlopen 机制 / §六 调用示例）。
+#
+# 佐证：下方 validation 目标编译的 fused_qknorm_rope_kernel.cu 已是 stable ABI，
+#       仅链 `torch` 一个目标即跑通（见该目标注释）——证明 B 的头与符号已就绪。
+# ⚠ 注意：CMake 不改即可“语法上改用 stable 并编过”，但这【不等于】获得跨 PyTorch 版本
+#         可移植——后者需对齐官方 stable/AOTInductor 打包方式，是另一套构建理念。
+# ═══════════════════════════════════════════════════════════════════════════
+
 # ── ROPE_cuda 共享库（Python 扩展模块）───────────────────────────────────────
-# 构建为 SHARED 库，Python import 时由解释器 dlopen 加载
+# 构建为 Python 扩展模块（MODULE 类型），Python import 时由解释器 dlopen 加载
 # 编译流程：
 #   g++  src/interface.cpp  → interface.cpp.o   （pybind11 模块定义，纯主机代码）
 #   nvcc src/run_kernel.cu  → run_kernel.cu.o   （RoPE kernel 实现，含 SASS + PTX）
 #   ld -shared → ROPE_cuda.cpython-313-x86_64-linux-gnu.so
-add_library(ROPE_cuda SHARED
+#
+# 使用 FindPython3 提供的 Python3_add_library（而非裸 add_library）：
+#   - MODULE     ：构建为 Python 可加载模块（不参与链接、仅供 dlopen），扩展模块的标准类型
+#   - WITH_SOABI ：自动去掉 "lib" 前缀，并加上当前解释器的 Python 标准扩展后缀（SOABI），
+#                  即 ROPE_cuda.cpython-313-x86_64-linux-gnu.so
+#                  → 故下方"手动查询 EXT_SUFFIX + 手动设置 PREFIX/SUFFIX"的逻辑不再需要
+# 注：本项目用 find_package(Python3 ...)，对应命令名为 Python3_add_library
+#     （python_add_library 这种无 "3" 的形式仅在 find_package(Python) 下才存在）
+Python3_add_library(ROPE_cuda MODULE WITH_SOABI
     src/interface.cpp
     src/run_kernel.cu
 )
 
-# 查询 venv 解释器的 Python C 扩展标准后缀，如 .cpython-313-x86_64-linux-gnu.so
-#   Python import 时按固定规则搜索文件名，不符合规范则报 ModuleNotFoundError
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
-    OUTPUT_VARIABLE _PY_EXT_SUFFIX
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-
-# 设置共享库文件名：去掉 CMake 默认的 "lib" 前缀，并替换后缀为 Python 标准扩展名
-#   默认：libROPE_cuda.so → 修改后：ROPE_cuda.cpython-313-x86_64-linux-gnu.so
-if(_PY_EXT_SUFFIX)
-    set_target_properties(ROPE_cuda PROPERTIES PREFIX "" SUFFIX "${_PY_EXT_SUFFIX}")
-    message(STATUS "Python extension suffix: ${_PY_EXT_SUFFIX}")
-else()
-    set_target_properties(ROPE_cuda PROPERTIES PREFIX "")
-    message(WARNING "无法检测 Python 扩展后缀，生成裸 .so；若需直接 import，请手动重命名")
-endif()
+# ↓↓↓ 以下"手动处理 .so 前缀/后缀"的逻辑已不再需要 ↓↓↓
+#   原因：Python3_add_library(... MODULE WITH_SOABI) 已自动完成
+#         "去掉 lib 前缀 + 追加 SOABI 后缀"，生成文件名即
+#         ROPE_cuda.cpython-313-x86_64-linux-gnu.so，无需再手动查询/设置。
+#
+# # 查询 venv 解释器的 Python C 扩展标准后缀，如 .cpython-313-x86_64-linux-gnu.so
+# #   Python import 时按固定规则搜索文件名，不符合规范则报 ModuleNotFoundError
+# execute_process(
+#     COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+#     OUTPUT_VARIABLE _PY_EXT_SUFFIX
+#     OUTPUT_STRIP_TRAILING_WHITESPACE
+#     ERROR_QUIET
+# )
+#
+# # 设置共享库文件名：去掉 CMake 默认的 "lib" 前缀，并替换后缀为 Python 标准扩展名
+# #   默认：libROPE_cuda.so → 修改后：ROPE_cuda.cpython-313-x86_64-linux-gnu.so
+# if(_PY_EXT_SUFFIX)
+#     set_target_properties(ROPE_cuda PROPERTIES PREFIX "" SUFFIX "${_PY_EXT_SUFFIX}")
+#     message(STATUS "Python extension suffix: ${_PY_EXT_SUFFIX}")
+# else()
+#     set_target_properties(ROPE_cuda PROPERTIES PREFIX "")
+#     message(WARNING "无法检测 Python 扩展后缀，生成裸 .so；若需直接 import，请手动重命名")
+# endif()
+# ↑↑↑ 已由 WITH_SOABI 自动处理，无需手动逻辑 ↑↑↑
 
 # 将 CMake 变量写成编译器 -D 标志，注入为 C 预处理器宏
 #   cmake -DROPE_VARIANT=2 → CMake 变量 "2" 写入 cache

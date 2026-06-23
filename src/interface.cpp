@@ -10,7 +10,7 @@
 //   - 方案 A：cos/sin 已在算子外按 position 取好([num_tokens, rotary_dim/2])，不收 cache/position_ids。
 //   - num_tokens 不作参数：内部由 qkv.size(0) 推得；qkv.size(1) 应 == (Hq+Hk+Hv)*head_dim。
 //
-// 关于 at::Tensor vs torch::Tensor：二者是【同一个类型】——torch 头文件里有 `using at::Tensor;`，
+// 关于 at::Tensor vs torch::Tensor：二者是【同一个类型】——torch 头文件里有 `using at::Tensor;`
 //   故 torch::Tensor 只是 at::Tensor 的别名(static_assert(is_same_v<...>) 成立)，C++ 签名里两者
 //   可互换(本文件用 at:: 风格；换成 torch::Tensor 一字不差也能编译)。
 //   ⚠ 但这只限【C++ 签名】；下方 schema 字符串(m.def)里【只能写 Tensor】，
@@ -132,3 +132,58 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_qkv_norm_rope_interleave", &run_fused_QKNorm_and_ROPE_cuda_interleave,
           "Fused QKV-Norm and RoPE, interleave (CUDA, in-place on qkv)");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 【对照参考：改用 stable ABI(torch::stable::Tensor) 的写法】
+//
+// 为什么用 #if 0 包起来(默认不编译)：
+//   1) 同命名空间不能重复注册同名算子——上方已用 TORCH_LIBRARY(ROPE_cuda,...) 注册了
+//      fused_qkv_norm_rope_interleave，stable 版若同名同命名空间会 duplicate registration
+//      报错。故此处改用【不同命名空间 ROPE_cuda_stable】示意。
+//   2) stable ABI 的接口(boxed 调用约定 / 宏名 / 辅助)随 PyTorch 版本演进，启用前请按
+//      你的版本核对头文件与签名。标 ⚠ 处尤需确认。
+//
+// 经典(上方)  →  stable(下方) 的对应关系：
+//   #include <torch/extension.h>        →  stable/headeronly 头(见下)
+//   at::Tensor& / at::Tensor            →  torch::stable::Tensor& / torch::stable::Tensor
+//   TORCH_LIBRARY / _IMPL               →  STABLE_TORCH_LIBRARY / _IMPL
+//   TORCH_CHECK                         →  STD_TORCH_CHECK
+//   x.is_cuda()/x.size()/x.data_ptr()   →  stable 版的等价接口(见 fused_qk_norm_rope_kernel.cu)
+//   schema 字符串                        →  不变(仍写 Tensor / Tensor(a!) / -> ())
+// ═══════════════════════════════════════════════════════════════════════════
+#if 0
+// ⚠ 头文件按版本核对；典型为：
+#include <torch/csrc/stable/library.h>   // STABLE_TORCH_LIBRARY / _IMPL
+#include <torch/csrc/stable/tensor.h>    // torch::stable::Tensor
+#include <torch/headeronly/macros/Macros.h>  // STD_TORCH_CHECK 等
+
+// CUDA 封装：与经典版逻辑相同，仅把 at::Tensor 换成 torch::stable::Tensor。
+// 真正的 kernel 入口 fused_QKNorm_and_ROPE_interleave 仍是上方那个(收 at::Tensor)；
+// stable 张量需先桥接成 ATen 张量再转调，或另写一个收 stable 张量的 kernel 入口。
+void run_fused_QKNorm_and_ROPE_cuda_interleave_stable(
+    torch::stable::Tensor qkv, torch::stable::Tensor q_weight,
+    torch::stable::Tensor k_weight, torch::stable::Tensor cos,
+    torch::stable::Tensor sin,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
+    int64_t head_dim, int64_t rotary_dim, double eps) {
+    // ⚠ 这里需要把 torch::stable::Tensor 转成 kernel 能用的形式(data_ptr/形状)，
+    //   或经官方桥接转 at::Tensor 后调用 fused_QKNorm_and_ROPE_interleave(...)。
+    //   具体接口随版本不同，参见 src/inference/fused_qknorm_rope_kernel.cu 里
+    //   torch::stable::Tensor 的用法(get_device_index / DeviceGuard / data_ptr 等)。
+}
+
+// schema 字符串与经典版完全一致(Tensor(a!) 标就地改写、float=double、-> () 无返回)。
+STABLE_TORCH_LIBRARY(ROPE_cuda_stable, m) {   // ← 不同命名空间，避免与 ROPE_cuda 冲突
+    m.def("fused_qkv_norm_rope_interleave(Tensor(a!) qkv, Tensor q_weight, Tensor k_weight, "
+          "Tensor cos, Tensor sin, int num_heads_q, int num_heads_k, int num_heads_v, "
+          "int head_dim, int rotary_dim, float eps) -> ()");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(ROPE_cuda_stable, CUDA, m) {
+    // ⚠ stable ABI 走 boxed 调用约定：部分版本可直接 m.impl("name", &fn)，
+    //   部分版本需用 TORCH_BOX(&fn) / 手写 boxed 包装(StableIValue* stack,...)。按版本核对。
+    m.impl("fused_qkv_norm_rope_interleave",
+           &run_fused_QKNorm_and_ROPE_cuda_interleave_stable);
+}
+// Python 侧调用：torch.ops.ROPE_cuda_stable.fused_qkv_norm_rope_interleave(...)
+#endif
