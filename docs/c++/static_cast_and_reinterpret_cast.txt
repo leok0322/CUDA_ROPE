@@ -1,0 +1,192 @@
+================================================================================
+static_cast 与 reinterpret_cast：适用场景、不适用场景与示例
+================================================================================
+
+一句话区分
+--------------------------------------------------------------------------------
+  · static_cast      ：编译期【有意义的、安全的】转换——类型之间存在已知关系
+                       (数值转换、继承上下行、void* ↔ 对象指针、显式调用转换运算符等)。
+                       编译器理解并(必要时)调整值/地址。
+  · reinterpret_cast ：【按位重新解释】——把同一串比特当成另一种类型看，几乎不做
+                       任何检查或调整(指针↔整数、指针↔不相关指针、函数指针↔函数指针)。
+                       威力大、最危险，多数属实现定义/易 UB，应尽量少用。
+
+  本项目典型用例(src/run_kernel.cu / kernels)：
+      auto* qkv = static_cast<float*>(qkv_void);   // void* → float*  ← static_cast 即可
+      vec_T v   = *reinterpret_cast<vec_T const*>(&qkv[off]);  // 按位重解释作向量化读
+
+
+================================================================================
+一、static_cast：适用场景
+================================================================================
+
+  (1) 数值类型之间的转换(含可能的精度损失，但语义明确)
+        int    i = static_cast<int>(3.9);      // 3   (截断)
+        double d = static_cast<double>(5);     // 5.0
+        float  f = static_cast<float>(x);
+        // enum class 取底层整数也用它(不隐式转)：
+        int n = static_cast<int>(ScalarType::Half);
+
+  (2) void* → 对象指针 T*（★最常见，本项目就用它）
+        void*  p = malloc(n);
+        float* f = static_cast<float*>(p);     // ✓ void* → float*
+        MyCls* c = static_cast<MyCls*>(p);     // ✓ 类类型指针也算“对象指针”，static_cast 即可
+        // 反向 T* → void* 也行(且隐式即可)：
+        void*  q = static_cast<void*>(f);
+
+  (3) 继承体系内的指针/引用上下转换
+        Base* b = derivedPtr;                  // 上行：隐式即可
+        Derived* d = static_cast<Derived*>(b); // 下行：static_cast(不查运行时类型，需自己保证对)
+        // 注：需要【运行时检查】的安全下行用 dynamic_cast，而非 static_cast。
+
+  (4) 显式触发用户定义的转换(构造函数 / 转换运算符)
+        std::string s = static_cast<std::string>("abc");
+        float h = static_cast<float>(c10::Half(1.0f));  // 调转换运算符
+
+  (5) 把值“丢弃”成 void（抑制 [[nodiscard]] 等）
+        static_cast<void>(maybe_unused_result());
+
+  (6) 去掉【右值/左值】或加 const 之外的合法转换、显式 std::move 之类(语义清晰的转换)
+
+
+================================================================================
+二、static_cast：不适用场景（编译报错，需换别的 cast 或根本不该做）
+================================================================================
+
+  (1) 去掉 const / volatile —— 用 const_cast
+        const int* cp = ...;
+        int* p = static_cast<int*>(cp);    // ✗ 报错
+        int* p = const_cast<int*>(cp);     // ✓
+
+  (2) 不相关类型的指针互转(无继承关系、无 void* 中介) —— 用 reinterpret_cast
+        float* f = ...;
+        int*   i = static_cast<int*>(f);       // ✗ 报错(float* 与 int* 无关系)
+        int*   i = reinterpret_cast<int*>(f);  // ✓(按位重解释，慎用)
+
+  (3) 指针 ↔ 整数 —— 用 reinterpret_cast
+        void*     p = ...;
+        uintptr_t n = static_cast<uintptr_t>(p);     // ✗ 报错
+        uintptr_t n = reinterpret_cast<uintptr_t>(p);// ✓
+
+  (4) 对象指针 ↔ 函数指针 —— 用 reinterpret_cast(且仅“有条件支持”)
+        void* p = ...;
+        auto  fn = static_cast<void(*)()>(p);            // ✗ 报错
+        auto  fn = reinterpret_cast<void(*)()>(p);       // ✓(conditionally-supported)
+
+  (5) 从 void(类型，无值)转成别的类型 —— 谁都不行
+        int x = static_cast<int>( <void 表达式> );  // ✗ void 没有值，转不出来
+        // 注意：static_cast<void>(expr) 是“转成 void(丢弃)”，那是合法的(见一·5)。
+
+
+================================================================================
+三、reinterpret_cast：适用场景
+================================================================================
+
+  关键词：把【同一块比特】当作另一种类型解释，不改值、不查关系。
+
+  (1) 不相关对象指针之间的重解释（按内存布局复用同一块字节）
+        // 本项目向量化读写(用具体类型；以 bf16、head_dim/32=8 个/线程 为例)：
+        __nv_bfloat16* qkv = /*...显存里的 bf16 数组...*/;
+        int off = /*...本线程负责的起始元素下标...*/;
+
+        // 宽搬运：把从 &qkv[off] 起的 16 字节(= 8 个 bf16) 当作一个 uint4 整体读/写
+        uint4 v = *reinterpret_cast<uint4 const*>(&qkv[off]);   // 一次 16 字节宽读
+        *reinterpret_cast<uint4*>(&qkv[off]) = v;               // 一次 16 字节宽写
+
+        // 把 v(16 字节) 切成 4 个 __nv_bfloat162(各 4 字节 = 2 个 bf16) 逐个转换：
+        for (int i = 0; i < 4; ++i) {     // 16 / sizeof(__nv_bfloat162)=16/4 = 4
+          __nv_bfloat162 pk = *(reinterpret_cast<__nv_bfloat162*>(&v) + i);  // 取第 i 个 2 元素块
+          float2 f = __bfloat1622float2(pk);                                 // 成对转 float2 计算
+          // ... 用 f.x / f.y 做 RMSNorm/RoPE，算完再 __float22bfloat162_rn 写回 ...
+        }
+        // 说明：uint4 只当“16 字节搬运容器”(不参与计算)；__nv_bfloat162 才是“2 元素计算块”。
+        //   换 fp16 时把 __nv_bfloat162→__half2、__bfloat1622float2→__half22float2 即可。
+        //   (源码里用 vec_T / T2_in 别名是为了对 fp16/bf16 泛型化，这里展开成具体类型便于看清。)
+
+  (2) 指针 ↔ 整数(存指针、做对齐运算、句柄等)
+        uintptr_t a = reinterpret_cast<uintptr_t>(ptr);
+        bool aligned16 = (a % 16 == 0);
+        T* back = reinterpret_cast<T*>(a);
+
+  (3) 函数指针 ↔ 函数指针(不同函数签名间，调用前须确保签名真的匹配)
+        using F1 = int(*)(int);
+        using F2 = void(*)();
+        F2 g = reinterpret_cast<F2>(f1);   // 合法，但用错签名调用 = UB
+
+  (4) 对象指针 ↔ 函数指针(如 dlsym 取符号地址)——“有条件支持”
+        auto fn = reinterpret_cast<void(*)()>(dlsym(h, "sym"));
+        // dlsym 原型：void* dlsym(void* handle, const char* name);
+        //   它【返回 void*】——因为是通用 API，查的符号可能是函数也可能是全局变量，
+        //   它不知道类型，只把符号的【裸地址】用最通用的 void* 交出来。
+        //   这里 sym 的地址其实就是函数入口；void* 的 void 表示“指向未知类型”，
+        //   【不是“无返回值”】。须由你按真实签名 reinterpret_cast 成对应函数指针再调用，
+        //   签名写错则调用 = UB。static_cast 在此会编译报错(对象↔函数指针只能 reinterpret)。
+
+
+================================================================================
+四、reinterpret_cast：不适用场景 / 危险点
+================================================================================
+
+  (1) 对象指针 ↔ 成员指针 —— 【做不到】，连 reinterpret_cast 也不行
+        void* p = ...;
+        int C::* m = reinterpret_cast<int C::*>(p);   // ✗ 非法
+        // reinterpret_cast 对成员指针只允许“成员指针↔成员指针(同类)”。
+
+  (2) 从 void(类型) 转成任何类型 —— 不可能(无值)
+        int x = reinterpret_cast<int>( <void 表达式> );   // ✗
+
+  (3) 去 const/volatile —— 不能(那是 const_cast 的活)
+        reinterpret_cast 不能去掉 cv 限定。
+
+  (4) 用它“绕过类型系统”后【按错类型访问】 —— 编译过，运行 UB
+        // 严格别名(strict aliasing)：用不兼容类型的指针读写同一内存，是未定义行为。
+        float f = 1.0f;
+        int i = *reinterpret_cast<int*>(&f);   // 取 bit 表示——技术上违反严格别名(应 memcpy/bit_cast)
+        // 现代写法用 std::bit_cast<int>(f)(C++20)更安全。
+
+  (5) 误以为它会“转换数值” —— 它【不转值】，只换解释
+        float f = 3.0f;
+        int   n = reinterpret_cast<int&>(f);   // n 不是 3，而是 3.0f 的 IEEE754 位模式
+        int   m = static_cast<int>(f);         // 这才是 3（数值转换）
+
+
+================================================================================
+五、四种 C++ cast 的分工(顺带定位 static/reinterpret)
+================================================================================
+
+  | cast            | 干什么                                   | 典型场景                       |
+  |-----------------|------------------------------------------|--------------------------------|
+  | static_cast     | 有意义/安全的编译期转换(值调整、地址调整)| 数值转换、void*↔T*、继承上下行 |
+  | reinterpret_cast| 按位重解释，不查不调                      | 指针↔整数、不相关指针、向量化读写|
+  | const_cast      | 仅增删 const/volatile                    | 去 const 调旧 API              |
+  | dynamic_cast    | 多态类型的【运行时】安全下行(查 RTTI)    | 基类指针安全转派生(失败给 nullptr)|
+
+  选择口诀：
+    · 能用 static_cast 就别用 reinterpret_cast(前者有检查、更安全)。
+    · void* → T*(对象指针，含类指针) 用 static_cast，不需要 reinterpret_cast。
+    · 只有“指针↔整数 / 不相关指针 / 函数指针”这类“纯按位”才上 reinterpret_cast。
+    · 去 const 用 const_cast；多态安全下行用 dynamic_cast。
+
+
+================================================================================
+六、本项目对照
+================================================================================
+
+  · static_cast：把 torch 传来的 void* 缓冲区还原成具体类型指针——
+        auto* qkv = static_cast<float*>(qkv_void);   // void* → float*  ✓ 正确用 static_cast
+    （若误写 reinterpret_cast 虽也能编过，但语义上 static_cast 才是对的、有检查。）
+
+  · reinterpret_cast：向量化访存——把一段元素的字节当作更宽的打包类型一次性读写，
+    再切成 2 元素打包块做转换(见 src/inference/fused_qknorm_rope_kernel.cu 的 Load/Store)：
+        vec_T v   = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);   // 宽读
+        T2_in pk  = *(reinterpret_cast<T2_in*>(&vec) + i);                 // 切块
+        *reinterpret_cast<vec_T*>(&qkv[offsetThread]) = v;                 // 宽写
+    这里是“同一块字节、换类型解释”，属 reinterpret_cast 的正当用法(且布局/对齐已由
+    head_dim%64==0、elemSizeBytes%4==0 等 static_assert 保证)。
+
+
+相关文件：
+    docs/c++/enum_vs_enum_class.txt          —— enum class 取整数要 static_cast
+    docs/c++/scalartype_to_cpptype.txt       —— 值/类型映射(非 cast，编译期 trait)
+    src/run_kernel.cu                        —— static_cast<float*>(void*) 用例
+    src/inference/fused_qknorm_rope_kernel.cu —— reinterpret_cast 向量化读写用例
