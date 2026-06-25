@@ -1,0 +1,379 @@
+================================================================================
+switch/case 全解：break/return 何时需要、穿透(fall-through)、
+                    -Wswitch / -Wswitch-enum / -Wimplicit-fallthrough、
+                    以及治本的 [[noreturn]]
+================================================================================
+
+本项目相关：src/dispatch.h 的 ROPE_DISPATCH_SWITCH_TMPL / ROPE_DISPATCH_HEAD_DIM_TMPL
+            都是 switch 派发，涉及下面全部知识点。
+
+
+================================================================================
+一、switch/case 基本语法与控制流
+================================================================================
+
+    switch (表达式) {            // 表达式须是【整型 / 枚举 / 可转整型】的值（非类型）
+      case 常量1:                // case 标签必须是【编译期整型常量表达式】
+        语句...
+        break;                   // 跳出 switch
+      case 常量2:
+        语句...
+        break;
+      default:                   // 可选；都不匹配时走这里
+        语句...
+    }
+
+  关键点：
+    · switch 的操作数是【值】，不是类型——switch(类型) 非法（类型分支用 if constexpr）。
+    · case 标签是【编译期常量】（整型/枚举值），不能是变量、不能是浮点、不能是类型。
+    · 控制流：匹配到某个 case 后，从该 case 【一直往下执行】，直到遇到 break/return/
+      throw/到达 switch 末尾——这就是“穿透”的来源（见第三节）。
+
+
+================================================================================
+二、什么时候【需要】break/return，什么时候【不需要】
+================================================================================
+
+  规则一句话：一个 case 若【后面还有别的 case/标签】，且你【不想让它继续执行下去】，
+              就必须用 break / return / throw 结束它；否则会穿透进下一个标签。
+
+  ── 需要 break/return 的情形 ──────────────────────────────────────────────
+    (1) 普通的“每个分支各做各的”——每个 case 末尾要 break（或 return）：
+          switch (op) {
+            case ADD: r = a + b; break;     // ✓ 不 break 会掉进 SUB
+            case SUB: r = a - b; break;
+            default:  r = 0;
+          }
+
+    (2) 在函数里直接 return 结果——可用 return 代替 break（顺带退出函数）：
+          int f(int op) {
+            switch (op) {
+              case ADD: return a + b;        // ✓ return 同时结束 case 和函数
+              case SUB: return a - b;
+              default:  return 0;
+            }
+          }
+
+  ── 不需要 break/return 的情形 ────────────────────────────────────────────
+    (3) 【最后一个标签】（通常是 default 放最后）——后面没有 case 可穿透，省略合法：
+          switch (x) {
+            case 1: foo(); break;
+            default: bar();                  // ✓ 最后一个标签，不写 break 也行
+          }                                  //   bar() 后直接退出 switch，无处穿透
+
+    (4) 故意的“多 case 共享同一段代码”——前几个 case 留空，自然穿透到下一个：
+          switch (c) {
+            case 'a':
+            case 'e':
+            case 'i': isVowel = true; break; // a/e/i 共用：a、e 空体穿透到 i
+          }
+          // 空 case 标签连写不算“危险穿透”，编译器不警告。
+
+    (5) case 体本身【必然 return/throw】——不必再 break（break 反而不可达）：
+          switch (x) {
+            case 1: return g();              // ✓ 已 return，break 多余
+            default: throw std::runtime_error("bad");  // ✓ 已 throw
+          }
+
+
+================================================================================
+三、穿透(fall-through)是什么
+================================================================================
+
+  穿透 = 一个【有代码】的 case 结尾没有 break/return/throw，控制流【继续掉进下一个
+         case 的代码】并执行它。常是 bug：
+
+      switch (x) {
+        case 1:
+          foo();        // ← 漏了 break
+        case 2:         // ← x==1 时“穿透”到这里，bar() 也被执行！
+          bar();
+          break;
+      }
+      // x==1：foo() 和 bar() 都跑（多半非本意）
+
+  穿透【只发生在“掉进下一个 case”时】。若某 case 后面【没有 case 了】（最后一个标签），
+  就无处可穿透——执行只是走到 switch 末尾、正常退出，不算穿透。
+
+  ── ★易错点：穿透【不要求】“下一个 case 的值匹配 x” ──────────────────────
+    很多人以为 case 2 被执行是因为“x==2 成立”。错。case 标签只在 switch【入口】用来
+    决定“跳到哪”，一旦跳进某个 case，之后就是【纯顺序执行】，途经的 case 标签被【无视、
+    直接穿过】，其值是否等于 x【无关】。
+
+    把 switch 想成 “goto 标签 + 顺序往下跑”：
+      · 第 1 步（入口跳转，唯一看值的一步）：用 x 匹配某个 case 标签，goto 到那里。
+      · 第 2 步（之后顺序执行）：case 2: / case 3: … 只是被路过的 label，不再判断 x。
+
+    验证：把下一个标签换成 x 永远不等于的值，穿透照样发生——
+        int x = 1;
+        switch (x) {          // x==1 → 跳到 case 1
+          case 1:
+            foo();            // 执行
+          case 999:           // ← x 永远 ≠ 999，但标签被无视，直接穿过
+            bar();            // ✓ 仍然执行！
+            break;
+        }
+        // foo() 与 bar() 都跑 —— 与“下一个 case 的值”无关。
+
+    穿透真正需要满足的【三个条件】（注意没有“下一个 case 值匹配”）：
+      ① 已【进入】前一个 case（入口匹配时才看值，如 x==1 进了 case 1）；
+      ② 该 case 体【没有】break / return / throw 挡住；
+      ③ 后面【还有】代码/标签可流入（最后一个标签之后无可穿透）。
+    bar() 被执行，纯粹是“没 break、执行流自然流下去”，不是“x==2 成立”。
+
+
+================================================================================
+四、三个相关警告：各管什么、何时触发
+================================================================================
+
+  ┌────────────────────────┬──────────────────────────────────┬───────────────┐
+  │ 警告                   │ 何时触发                          │ 是否在 -Wall  │
+  ├────────────────────────┼──────────────────────────────────┼───────────────┤
+  │ -Wswitch               │ switch 枚举【没列全】且【无 default】│ ✅ 在 -Wall   │
+  │ -Wswitch-enum          │ switch 枚举【没列全】(即使有 default)│ ❌ 需显式开   │
+  │ -Wimplicit-fallthrough │ 有代码的 case 穿透进下一个 case    │ ✅ (-Wextra)  │
+  │                        │ 且无 [[fallthrough]]              │               │
+  └────────────────────────┴──────────────────────────────────┴───────────────┘
+
+  (1) -Wswitch —— “枚举没列全 + 没 default”
+        enum class Color { Red, Green, Blue };
+        switch (c) { case Color::Red: ...; }   // ✗ 漏 Green/Blue 且无 default → 警告
+      消除：把所有枚举值都列出来，【或】加 default。加 default 即可满足它。
+
+      ── ★并非“每个 switch 都要 default”：-Wswitch 触发需【三条同时成立】 ──
+        ① 操作数是【枚举类型】；② 枚举值【没列全】；③ 【没有】default。
+        任一不成立就【不报】，也就【不需要】default：
+
+        情形 A：switch 普通整数（非枚举）→ -Wswitch 永不触发，default 可省
+            switch (n) {            // n 是 int —— ① 不成立
+              case 0: ...; break;
+              case 1: ...; break;
+            }                        // ✓ 没 default 也不报（-Wswitch 只管枚举）
+
+        情形 B：枚举但【已列全】→ 不需要 default
+            switch (c) {
+              case Color::Red:   ...; break;
+              case Color::Green: ...; break;
+              case Color::Blue:  ...; break;
+            }                        // ✓ 三个枚举全列 → 无需 default
+
+        情形 C：枚举且【没列全】→ 这才必须 default（或列全）
+            switch (st) {            // ScalarType 约 30 个值，只处理 3 个
+              case ...::Float: ...; break;
+              case ...::Half:  ...; break;
+              default: ...;          // ★必需（列全不现实，用 default 兜）
+            }
+
+      与本项目对应：
+        · switch(TYPE)     —— 操作数是 ScalarType【枚举】、只列 3 个 → 触发 -Wswitch
+                              → default【必需】（为消 -Wswitch）。
+        · switch(HEAD_DIM) —— 操作数是【int】(head_dim) → -Wswitch【不触发】；
+                              那里的 default 是为【运行时健壮性】(非法 head_dim 报错而非
+                              静默 no-op)，属好习惯，不是 -Wswitch 强制的。
+
+      另注：单独的 -Wswitch-default 会对【任何】缺 default 的 switch(含 int)都警告，
+            但它【不在 -Wall/-Wextra】，需显式 -Wswitch-default 才生效，常规构建不开。
+
+  (2) -Wswitch-enum —— “枚举没列全（哪怕有 default 也警告）”
+        switch (c) {
+          case Color::Red: ...; break;
+          default: ...;                        // 有 default，-Wswitch 不警告
+        }                                      // 但 -Wswitch-enum 仍警告漏了 Green/Blue
+      它比 -Wswitch 严，常用于“强制每个枚举值都显式处理”。【不在 -Wall/-Wextra】，
+      只有显式 -Wswitch-enum 才生效。
+
+  (3) -Wimplicit-fallthrough —— “危险穿透”
+        switch (x) {
+          case 1: foo();        // ✗ 穿透进 case 2 且没标注 → 警告
+          case 2: bar(); break;
+        }
+      消除：要么补 break/return；要么【故意穿透】时用 [[fallthrough]] 显式标注：
+          case 1: foo(); [[fallthrough]];      // ✓ 告诉编译器“我是故意的”
+          case 2: bar(); break;
+
+
+================================================================================
+五、“消除警告”的两类手段：治标 vs 治本
+================================================================================
+
+  两类手段的本质区别：
+    · 治标 = 【忽略警告】：只让编译器不打印，【不改变生成的代码 / 运行行为】。用诊断 pragma。
+    · 治本 = 【改变代码 / 让编译器确知控制流】：从根上消除问题，警告自然消失，且行为正确。
+
+  一个判断口诀：
+    · 警告是【过严/误报】（代码本就正确、只是编译器太挑剔）→ 可【治标】忽略。
+    · 警告指向【真实问题或不确定的控制流】→ 必须【治本】，忽略只会把 bug 藏起来。
+
+  下面对三个警告分别给出“治标 / 治本”分析。
+
+  ── (1) -Wswitch（枚举没列全 + 无 default）──────────────────────────────
+    性质：在 -Wall，几乎一定报；且“缺 default”往往意味着对意外值【静默 no-op】(真问题)。
+    · 治标（忽略）：PUSH/POP IGNORED("-Wswitch") —— ✗【不推荐】。压住后，遇到没列到的
+      枚举值会静默什么都不做，是把潜在 bug 藏起来。
+    · 治本（改代码）：✓【推荐】加 default（顺带对非法值抛错），或把枚举列全。
+        switch (st) {
+          case ...::Float: ...; break;
+          case ...::Half:  ...; break;
+          default: throw ...("unsupported dtype");   // ← 治本：补 default + 明确报错
+        }
+    结论：-Wswitch 用【治本】（加 default / 列全）。
+
+  ── (2) -Wswitch-enum（枚举没列全，即使有 default 也报）──────────────────
+    性质：默认不开（需显式 -Wswitch-enum）；常意味着“故意只处理部分枚举、其余靠 default”。
+    · 治标（忽略）：PUSH/POP IGNORED("-Wswitch-enum") —— ✓【常用且合理】。因为“只处理
+      子集 + default 兜底”是【有意为之】，此警告对这种设计属“过严”，忽略它不掩盖任何 bug。
+        C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wswitch-enum")
+        switch (the_type) { case Float:...; case Half:...; default:...; }
+        C10_DIAGNOSTIC_POP()
+    · 治本（改代码）：把所有枚举值都显式列出（若业务确实要求“每个枚举都处理”）。
+        —— 对 ScalarType 约 30 个值不现实，故一般不走治本。
+    结论：-Wswitch-enum 通常用【治标】（忽略），因为“没列全”是有意的、非 bug。
+
+  ── (3) -Wimplicit-fallthrough（危险穿透）──────────────────────────────
+    性质：在 -Wextra；指向【控制流】——要么真穿透(bug)，要么编译器看不出“必然退出”(误报)。
+    · 治标（忽略）：PUSH/POP IGNORED("-Wimplicit-fallthrough") —— ⚠【一般不推荐】。
+      若是真穿透，忽略 = 把 bug 藏起来；即使是误报，忽略也不如让编译器“看懂”更稳。
+    · 治本（改代码 / 标注）：✓【推荐】，分两种意图：
+        a) 不该穿透 → 补 break / return / throw 结束 case：
+              case 1: foo(); break;            // ← 治本
+        b) 故意穿透 → 用 [[fallthrough]] 显式标注“我是故意的”：
+              case 1: foo(); [[fallthrough]];  // ← 治本：声明意图，编译器放行
+              case 2: bar(); break;
+        c) 终止性错误分支看不出“不返回” → 用 [[noreturn]] 让编译器确知（见第六节）：
+              default: rope_dispatch::throw_runtime(...);  // [[noreturn]]，之后不可达
+    结论：-Wimplicit-fallthrough 用【治本】（break/return/[[fallthrough]]/[[noreturn]]）。
+
+  ── 汇总 ──────────────────────────────────────────────────────────────────
+    | 警告                   | 推荐手段 | 做法                                  |
+    |------------------------|----------|---------------------------------------|
+    | -Wswitch               | 治本     | 加 default（报错）/ 列全枚举          |
+    | -Wswitch-enum          | 治标     | PUSH/POP 忽略（“只处理子集”是有意）   |
+    | -Wimplicit-fallthrough | 治本     | break/return / [[fallthrough]] / [[noreturn]] |
+
+    核心原则：警告若指向【真实/不确定的控制流】（-Wswitch 静默 no-op、fallthrough 穿透）→
+    【治本】；警告若只是对【有意设计】过严（-Wswitch-enum 故意不列全）→ 才【治标】忽略。
+    ⚠ 治标只“不打印”，绝不修复真正的 bug——别用忽略去盖控制流问题。
+
+
+================================================================================
+六、[[noreturn]]：治本地消除“穿透/缺 default”顾虑
+================================================================================
+
+  问题场景（本项目 ROPE_DISPATCH_HEAD_DIM_TMPL 的早期形态）：外层 case 包着内层 switch，
+  内层各 case 都 return、default 抛异常，但【外层 case 末尾没有 break】：
+
+      switch (TYPE) {
+        case Float: {
+          switch (HEAD_DIM) { case 32: return f(); ... default: CHECK(...); }
+        }                         // ← 末尾无 break；编译器若不确定内层“必然退出”，
+        case Half: { ... }        //   就担心 Float 穿透进 Half → -Wimplicit-fallthrough
+      }
+
+  根因：CHECK 展开是 `if(!cond) throw;` —— 编译器【不一定能断定】它“必然抛、不返回”，
+        于是认为内层 switch 可能正常结束 → 外层 case 可能穿透。
+
+  [[noreturn]] 解决：把“抛出”做成一个 [[noreturn]] 函数，编译器据此【确知该路径不返回】：
+
+      #include <stdexcept>
+      #include <utility>
+      namespace rope_dispatch {
+      template <typename Msg>
+      [[noreturn]] inline void throw_runtime(Msg&& msg) {     // ★ [[noreturn]]
+        throw std::runtime_error(std::forward<Msg>(msg));
+      }
+      }  // namespace rope_dispatch
+
+      // CHECK 改走它：
+      #define ROPE_ST_TORCH_CHECK(cond, ...)                  \
+        if (C10_UNLIKELY_OR_CONST(!(cond))) {                 \
+          rope_dispatch::throw_runtime(STD_TORCH_CHECK_MSG(   \
+              cond, "", __func__, ", ", __FILE__, ":",        \
+              __LINE__, ", ", ##__VA_ARGS__));                \
+        }
+
+  效果：
+    · 内层 default 走 [[noreturn]] 的 throw_runtime → 编译器知道它不返回；
+    · 内层各 case 都 return → 整个内层 switch【必然 return/throw、绝不正常结束】；
+    · 于是外层 case 末尾【不可达】→ 不可能穿透进下一个外层 case → -Wimplicit-fallthrough
+      不再触发，且【真正】杜绝穿透（不是靠压警告）。
+
+  [[noreturn]] 含义：标注“此函数永不返回到调用者”（必抛异常 / 必 exit / 死循环等）。
+    它帮助编译器做【可达性分析】：调用点之后视为不可达，从而消除虚假的穿透/“缺 return”警告。
+    （另见 docs/c++/noreturn_and_reachability_analysis.txt。）
+
+  ── ★关键对比：抛异常在【最后一个 default】里时，不需要 [[noreturn]] ──────────
+    [[noreturn]] 之所以在 HEAD_DIM 里有用，是因为那个抛异常的 default 在【内层 switch】里，
+    而内层 switch 外面【还有别的 case（Half/BFloat16）】——编译器要确认“内层不会正常结束”
+    才能放心“外层 case 不穿透”。即：throw 后面【还有代码可流入】，才需要 [[noreturn]] 兜。
+
+    反例：若 throw 发生在某 switch 的【最后一个 default】，它后面【没有任何 case/代码】，
+    本就无处穿透 → 即使【不用 [[noreturn]]】也没有 -Wimplicit-fallthrough 顾虑。
+
+      // ROPE_DISPATCH_SWITCH_TMPL：default 是【最外层 switch 的最后一个标签】
+      switch (the_type) {
+        case Float:    ...; return ...();
+        case Half:     ...; return ...();
+        case BFloat16: ...; return ...();
+        default:
+          throw ...("unsupported dtype");   // ← 最后一个标签：后面再无 case
+      }                                       //   即便不写 [[noreturn]]，也无处穿透→无警告
+
+    对比一眼：
+      | throw 所在位置                         | 后面还有 case/代码？ | 需要 [[noreturn]] 吗 |
+      |---------------------------------------|----------------------|------------------|
+      | 最外层 switch 的最后 default(本例)     | 否                   | 不需要（无处穿透）   |
+      | 内层 switch 的 default，外面还有外层 case| 是（外层 Half/BF16） | 需要（让外层不穿透） |
+
+    所以本项目里：
+      · ROPE_DISPATCH_SWITCH_TMPL 的 default 抛异常——它是最后标签，【本不需要】[[noreturn]]。
+      · ROPE_DISPATCH_HEAD_DIM_TMPL 内层 switch 的 default 抛异常——外层还有 case，【需要】
+        [[noreturn]] 让编译器确知内层必退出、外层不穿透。
+      （把抛出统一做成 [[noreturn]] 的 throw_runtime 是“一处定义、两处都受益”：最后 default
+        处它无害，嵌套 default 处它必要。）
+
+    一句话：[[noreturn]] 是为“throw 之后【还有代码可被穿透】”准备的；若 throw 在最后一个
+    default（后面无 case），穿透不可能发生，[[noreturn]] 可有可无。
+
+
+================================================================================
+七、综合对照：某个警告该用什么手段
+================================================================================
+
+  | 现象 / 警告               | 治标（压警告）            | 治本（推荐）                       |
+  |---------------------------|---------------------------|------------------------------------|
+  | -Wswitch（缺 default）    | —                         | 加 default（顺带给非法值报错）     |
+  | -Wswitch-enum（没列全）   | PUSH/POP IGNORED 区       | 列全所有枚举值（若确需全覆盖）     |
+  |                           | （有意只处理子集时用）    | 否则保留 default + 压 -Wswitch-enum|
+  | -Wimplicit-fallthrough    | （一般不该压）            | break/return；故意穿透用[[fallthrough]];|
+  |   （真穿透 / 误报）        |                           | 终止分支用 [[noreturn]]            |
+
+  经验法则：
+    · -Wswitch：永远加 default（既消警告，又对意外值给清晰错误，而非静默 no-op）。
+    · -Wswitch-enum：只处理部分枚举且其余该报错时，是“有意不列全”，用 PUSH/POP 压住即可；
+      若业务要求每个枚举都显式处理，则改成“列全”。
+    · -Wimplicit-fallthrough：能 break/return 就 break/return；终止性错误分支用 [[noreturn]]
+      让编译器确知不返回——这比压警告更稳（压警告会把真 bug 一起藏掉）。
+
+
+================================================================================
+八、本项目落点（src/dispatch.h）
+================================================================================
+
+  ROPE_DISPATCH_SWITCH_TMPL（按 dtype → 类型 scalar_t）：
+    · switch(the_type) 只列 Float/Half/BFloat16 + default；
+    · 每个 case 以 `return __VA_ARGS__();` 结束 → 不穿透；
+    · default 是最后标签 + 抛异常 → 不穿透、不缺 default；
+    · 外包 PUSH/POP IGNORED("-Wswitch-enum") → 压住“没列全枚举”的过严警告。
+
+  ROPE_DISPATCH_HEAD_DIM_TMPL（按 dtype 选合法 head_dim → constexpr headDIM）：
+    · 外层 switch(TYPE) 列 Float/Half/BFloat16 + default（消 -Wswitch）；
+    · 同样外包 PUSH/POP IGNORED("-Wswitch-enum")（自包含，不依赖嵌套环境）；
+    · 内层 switch(HEAD_DIM) 各 case `return`，default 走 [[noreturn]] 的 throw_runtime
+      → 内层必退出 → 外层 case 不穿透（治本，非压警告）。
+
+
+相关文件：
+    docs/c++/noreturn_and_reachability_analysis.txt  —— [[noreturn]] 与可达性分析
+    docs/c++/enum_vs_enum_class.txt                  —— enum/enum class、ScalarType
+    docs/c++/x_macro_scalartype_enum.txt             —— ScalarType 枚举值由 X-macro 生成
+    src/dispatch.h                                   —— 两个 dispatch 宏的实际写法

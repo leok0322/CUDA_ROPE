@@ -1,0 +1,789 @@
+========================================
+链接性（Linkage）详解
+========================================
+
+链接性决定一个名字（变量、函数、类型等）在多个翻译单元（TU）之间是否可见、是否共享同一个实体。
+
+翻译单元（Translation Unit, TU）= 一个 .cpp/.cu 文件 + 它 #include 的所有头文件，
+经预处理后交给编译器处理的完整代码单元。
+
+
+一、外部链接性（External Linkage）
+========================================
+
+定义：该名字在整个程序中唯一，所有 TU 共享同一个实体。
+      链接器负责将各 TU 对该名字的引用解析到同一个地址。
+
+【符合条件的实体】
+- namespace scope 的非 const 变量（无 static 修饰）
+- namespace scope 的函数（无 static 修饰）        ← 函数默认外部链接，const 修饰无影响
+- extern 显式声明的变量
+- inline 函数 / inline constexpr 变量（C++17，ODR-safe external）
+- 类（class/struct）、枚举
+
+【示例】
+
+// foo.h
+extern int counter;          // 声明：告知编译器 counter 存在于某个 TU
+void increment();            // 声明：外部链接
+
+// foo.cpp
+int counter = 0;             // 定义：整个程序唯一
+void increment() { ++counter; }  // 定义：整个程序唯一
+
+// bar.cpp
+#include "foo.h"
+void use() {
+    increment();             // 链接器把这里的 increment 解析到 foo.cpp 的定义
+    counter = 10;            // 同一个 counter
+}
+
+【 ODR（One Definition Rule）】
+外部链接的名字在整个程序中只能有一个定义。
+若在两个 .cpp 中都写 int counter = 0;（无 extern），链接报 "multiple definition"。
+
+
+【 inline 的特殊规则（C++17）】
+inline constexpr int MAX = 100;   // 外部链接，但 ODR-safe
+                                  // 多个 TU 的定义必须完全相同，链接器合并为一个符号
+                                  // 适合在头文件中定义需要跨 TU 共享地址的常量
+
+
+【 extern const 与 inline const 对比】
+
+// === 老方式（C++98）：extern const ===
+//
+// 头文件：只放声明（无初始值），声明不产生定义，多个 TU include 合法
+//   extern const int f;
+//
+// .cpp：唯一定义，必须保留 extern，否则 const 降为内部链接，其他 TU 找不到
+//   extern const int f = 1;   ← 正确：extern 覆盖 const 的降级，保持外部链接
+//   const int f = 1;          ← 错误：内部链接，其他 TU 的 extern const int f; 声明
+//                                      找不到此定义 → 链接报 undefined reference
+
+// === 新方式（C++17）：inline const ===
+//
+// 头文件：定义直接放头文件，ODR-safe，多个 TU include → 多份定义 → 链接器合并为一个符号
+//   inline const int f = 1;
+
+// 对比总结：
+// ┌─────────────────────┬──────────────────────────────┬──────────────────────────────┐
+// │                     │ extern const（C++98）         │ inline const（C++17）        │
+// ├─────────────────────┼──────────────────────────────┼──────────────────────────────┤
+// │ 链接性              │ external                     │ external                     │
+// │ ODR-safe            │ 否（只能有一个定义）          │ 是（链接器合并多份定义）      │
+// │ 头文件放什么         │ 声明：extern const int f;    │ 定义：inline const int f = 1;│
+// │ .cpp 放什么         │ 定义：extern const int f = 1;│ 不需要 .cpp                  │
+// │ 地址唯一            │ 是                           │ 是                           │
+// └─────────────────────┴──────────────────────────────┴──────────────────────────────┘
+// C++17 起优先用 inline constexpr，无需维护声明与定义的分离
+
+
+【 inline constexpr 与 constexpr 的区别 】
+constexpr 已经隐含 const，即内部链接，为什么还需要 inline constexpr？
+
+constexpr int X = 1;         // 内部链接：每个 TU 独立副本，&X 各不相同
+inline constexpr int X = 1;  // 外部链接（ODR-safe）：全程序唯一，&X 相同
+
+inline 把内部链接升级为外部链接（ODR-safe），适用场景：
+
+场景1：需要地址唯一性
+    const int* p1 = &X;  // a.cpp：地址 0x1000
+    const int* p2 = &X;  // b.cpp：地址 0x2000（constexpr，各自独立副本）
+    p1 == p2;            // false
+
+    改用 inline constexpr → p1 == p2 为 true（全程序同一个符号）
+
+场景2：类的 static 成员（C++17）
+    // C++14：头文件声明，必须在 .cpp 补定义，否则取地址时链接报错
+    struct Config { static constexpr int MAX = 100; };
+    // config.cpp: constexpr int Config::MAX;   ← 必须补这一行
+
+    // C++17：加 inline，头文件直接完整定义，无需 .cpp
+    struct Config { static inline constexpr int MAX = 100; };
+
+对于只用值（不取地址）的编译期整数常量，constexpr 和 inline constexpr 行为完全一样，
+加 inline 没有实际意义。只有需要地址唯一或类 static 成员定义时才需要 inline。
+
+【 inline 变量/函数 与 static 变量/函数 对比 】
+
+两者都可以放在头文件中，但链接性和地址行为完全相反：
+
+// header.h
+inline int x = 1;       // external + ODR-safe：全程序唯一符号
+                         // 多个 TU include → 链接器合并为一个实体
+                         // a.cpp 的 &x == b.cpp 的 &x（地址相同）
+
+static int y = 1;       // internal：每个 TU 独立副本
+                         // 多个 TU include → 各自持有独立的 y
+                         // a.cpp 的 &y != b.cpp 的 &y（地址不同）
+
+// header.h
+inline void foo() { }   // external + ODR-safe：全程序唯一函数体
+                         // 链接器合并多份相同定义，函数地址全程序唯一
+
+static void bar() { }   // internal：每个 TU 独立的函数副本
+                         // a.cpp 和 b.cpp 各有自己的 bar，函数地址不同
+
+// ┌──────────────┬──────────────┬────────────────┬────────────────┬──────────────────┐
+// │              │ 链接性        │ 头文件放定义    │ 各 TU 地址      │ 跨 TU 取地址比较 │
+// ├──────────────┼──────────────┼────────────────┼────────────────┼──────────────────┤
+// │ inline 变量  │ external     │ 安全（ODR-safe）│ 全程序相同      │ 合法，== true    │
+// │ static 变量  │ internal     │ 安全（各自副本）│ 各 TU 不同      │ 无意义，== false │
+// │ inline 函数  │ external     │ 安全（ODR-safe）│ 全程序相同      │ 合法，== true    │
+// │ static 函数  │ internal     │ 安全（各自副本）│ 各 TU 不同      │ 无意义，== false │
+// └──────────────┴──────────────┴────────────────┴────────────────┴──────────────────┘
+
+// 选择依据：
+//   需要跨 TU 共享同一实体（地址唯一、全局状态）→ inline
+//   需要 TU 私有（模块内部实现、防止符号冲突）   → static
+
+
+七、类的 static 成员的链接性
+========================================
+
+类内的 static 与 namespace scope 的 static 含义完全不同：
+
+┌──────────────────────────────┬────────────────────────┬──────────────┐
+│ 写法                          │ static 的含义           │ 链接性       │
+├──────────────────────────────┼────────────────────────┼──────────────┤
+│ namespace scope static int x; │ 限制可见范围            │ internal     │
+│ 类内 static int x;            │ 属于类而非实例          │ external     │
+└──────────────────────────────┴────────────────────────┴──────────────┘
+
+类的 static 成员是外部链接，因为它需要全程序所有 TU 共享同一个实体：
+
+// config.h
+struct Config {
+    static int MAX;   // 外部链接：全程序唯一一个 Config::MAX
+};
+
+// config.cpp
+int Config::MAX = 100;   // 唯一定义（必须在某个 .cpp 中提供）
+
+// a.cpp
+Config::MAX = 200;       // 链接器解析到 config.cpp 的那个 MAX
+
+// b.cpp
+int x = Config::MAX;    // 同一个 MAX，值是 200，而非独立副本
+
+若是内部链接，a.cpp 修改的和 b.cpp 读到的就不是同一个，
+违背了 static 成员"全类共享"的语义，因此必须是外部链接。
+
+【constexpr 不改变类 static 成员的链接性】
+
+namespace scope 的 constexpr 会因隐含 const 而降级为内部链接，
+但类内的 constexpr 不遵循这条规则，链接性仍是 external：
+
+constexpr int X = 1;              // namespace scope → internal（const 降级）
+
+struct Config {
+    static constexpr int MAX = 100;  // 类内 → external（constexpr 不降级）
+};
+
+这也是为什么 C++14 需要在 .cpp 补定义：
+外部链接的符号，链接器必须找到唯一的定义，
+类内那行只是带初始值的声明，不算定义。
+
+C++17 加 inline 后，类内那行本身就成为定义（ODR-safe），无需 .cpp：
+struct Config {
+    static inline constexpr int MAX = 100;  // 定义，全程序唯一符号
+};
+
+四、static 在不同位置的含义与链接性对比
+========================================
+
+"static" 在 C++ 中有三种完全不同的含义，取决于出现的位置：
+
+┌──────────────────────────┬──────────────────┬──────────────┬──────────────────────────┐
+│ 写法                      │ static 的含义     │ 链接性       │ 存储期                   │
+├──────────────────────────┼──────────────────┼──────────────┼──────────────────────────┤
+│ static 局部变量           │ 静态存储期        │ 无链接       │ 静态（程序结束才销毁）    │
+│ static 成员变量/函数      │ 属于类而非实例    │ external     │ 静态                     │
+│ static 全局变量/函数      │ 限制可见范围      │ internal     │ 静态                     │
+│ 普通全局变量              │ （无 static）     │ external     │ 静态                     │
+│ 普通全局函数              │ （无 static）     │ external     │ —                        │
+└──────────────────────────┴──────────────────┴──────────────┴──────────────────────────┘
+
+
+【一】static 局部变量：无链接性 + 静态存储期
+
+// a.cpp
+void counter() {
+    static int count = 0;   // 无链接性：count 只在 counter() 内可访问
+                            // 静态存储期：首次调用时初始化，程序结束才销毁
+                            // 跨调用保持值（不像普通局部变量每次重置）
+    ++count;
+}
+
+// b.cpp 无法通过任何名字引用 count，即使在同一个程序中
+// 若 b.cpp 也定义了 static int count = 0; 在某个函数里，是完全独立的两个变量
+
+
+【二】static 成员变量 / 成员函数：外部链接，属于类而非实例
+
+// config.h
+struct Config {
+    static int version;          // 外部链接：全程序唯一，所有实例共享
+    static void reset();         // 外部链接：全程序唯一的函数
+    int value;                   // 非 static：每个实例独立的 value
+};
+
+// config.cpp
+int Config::version = 1;        // 类外唯一定义（必须在某个 .cpp 中）
+void Config::reset() { version = 0; }
+
+// 访问：不需要实例
+Config::version = 2;            // 所有 TU include config.h 后都能访问同一个 version
+Config a, b;
+a.version = 3;                  // 等价于 Config::version = 3，b.version 也变为 3
+
+// 非 static 成员对比：
+a.value = 10;                   // 只改 a 的 value，b.value 不受影响
+
+【static 成员变量的初始化方式演进】
+
+// 以下六种写法，合法性和是否需要类外定义各不相同：
+struct Config {
+    static int a;                        // 合法：纯声明，类外必须提供定义和初始值
+    static int b = 100;                  // 编译错误：非 const/inline 不允许类内初始化
+    static const int c = 100;            // 合法：const 整型允许类内初始化
+                                         //   纯用值时不需要类外定义
+                                         //   odr-use（取地址/绑定引用）时需要类外定义
+    static constexpr int d = 100;        // 合法（C++11）：同上，odr-use 时 C++14 需类外定义
+                                         //   C++17 起隐式 inline，无需类外定义
+    static inline int e = 100;           // 合法（C++17）：类内即定义，无需 .cpp
+    static inline constexpr int f = 100; // 合法（C++17）：最推荐写法
+};
+
+// 各写法对应的类外操作：
+int Config::a = 0;          // a：必须在某个 .cpp 提供定义 + 初始值
+const int Config::c;        // c：odr-use 时补类外定义（无初始值，初始值已在类内）
+constexpr int Config::d;    // d：C++14 odr-use 时需补（C++17 起免）
+                            // e / f：inline，无需任何类外操作
+
+// 两种声明+定义分离写法对比（效果完全相同，仅命名不同）：
+// 写法1：
+struct Config { static int MAX; };
+int Config::MAX = 100;      // 类外定义时赋初始值
+
+// 写法2：
+struct Config { static int version; };
+int Config::version = 1;    // 类外定义时赋初始值，与写法1无本质区别
+
+
+【三】static 全局变量 / 函数：内部链接，TU 内私有
+
+// utils.cpp
+static int cache = 0;           // 内部链接：只有 utils.cpp 能访问 cache
+static void flush() { cache = 0; }  // 内部链接：只有 utils.cpp 能调用 flush
+
+// main.cpp
+// extern int cache;            // 链接报错：找不到外部符号 cache
+// flush();                     // 链接报错：找不到外部符号 flush
+
+// 用途：模块内部实现细节，防止与其他 TU 的同名符号冲突
+// C++ 推荐用匿名命名空间代替：
+namespace {
+    int cache = 0;
+    void flush() { cache = 0; }
+}
+
+
+【四】普通全局变量 / 函数：外部链接
+
+// math.h
+extern int global_seed;         // 声明：告知编译器 global_seed 定义在某个 TU
+int add(int a, int b);          // 声明：函数默认外部链接
+
+// math.cpp
+int global_seed = 42;           // 定义：整个程序唯一
+int add(int a, int b) { return a + b; }  // 定义
+
+// main.cpp
+#include "math.h"
+global_seed = 100;              // 链接器解析到 math.cpp 的 global_seed，同一个变量
+add(1, 2);                      // 链接器解析到 math.cpp 的 add
+
+
+【五】同名符号在不同位置的独立性
+
+static int x = 1;              // ← a.cpp 的 x，internal，与 b.cpp 完全无关
+
+// b.cpp
+static int x = 2;              // ← b.cpp 的 x，internal，两个 x 互不干扰
+
+// 对比：普通全局变量同名 → 链接报 multiple definition
+int y = 1;                     // a.cpp
+int y = 2;                     // b.cpp → 链接错误
+
+
+六、函数与变量的默认链接性差异
+========================================
+
+函数和变量在 namespace scope 的默认链接性不同：
+
+┌──────────────────────────┬──────────────────┬──────────────────────────────────┐
+│                          │ 默认链接性        │ const/constexpr 修饰后            │
+├──────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ namespace scope 变量      │ external         │ → internal（const 降级）          │
+│ namespace scope 函数      │ external         │ 无影响，仍是 external             │
+└──────────────────────────┴──────────────────┴──────────────────────────────────┘
+
+变量有 const → internal 的特殊规则，是因为 const 变量常放头文件，
+若保持 external 就会产生多个定义，违反 ODR。
+函数通常只在头文件中放声明（无函数体），声明不产生定义，不违反 ODR，无需降级。
+
+【头文件中函数定义的正确写法】
+
+// utils.h
+void helper() { }          // 危险：外部链接 + 有定义，多个 TU include → multiple definition
+
+inline void helper() { }   // 正确：外部链接 + ODR-safe，链接器合并为一个符号
+static void helper() { }   // 也合法：内部链接，每个 TU 独立副本（地址不同）
+
+// 推荐做法：函数定义放 .cpp，头文件只放声明
+// utils.h  → void helper();        （声明，无函数体，外部链接，不违反 ODR）
+// utils.cpp → void helper() { }    （定义，整个程序唯一）
+
+
+
+
+
+二、内部链接性（Internal Linkage）
+========================================
+
+定义：该名字只在当前 TU 内可见。
+      其他 TU 无法通过该名字引用此实体；
+      若多个 TU 都定义了同名的内部链接实体，它们是完全独立的不同实体。
+
+【符合条件的实体】
+- static 修饰的 namespace scope 变量或函数        ← 显式声明内部链接
+- namespace scope 的 const / constexpr 变量（C++98 起，无 extern 修饰）← 唯一内置降级规则
+- 匿名命名空间（anonymous namespace）内的所有名字  ← C++ 推荐替代 static 的写法
+
+【链接性降级规则总结】
+namespace scope 变量中，只有 const/constexpr 有内置降级（→ internal）；
+其余变量默认 external，要变成 internal 必须显式加 static 或放入匿名命名空间：
+
+int a = 1;              // external（默认）
+const int b = 1;        // internal（const 内置降级，C++98 起）
+constexpr int c = 1;    // internal（constexpr 隐含 const）
+
+static int d = 1;       // internal（显式）
+static const int e = 1; // internal（显式，与裸 const 效果相同）
+
+
+namespace {
+    int g = 1;          // internal（匿名命名空间，即使是非 const 变量）
+}
+
+为什么只有 const 有内置降级？
+  const 变量是头文件定义常量的惯用写法；若保持 external，多 TU include 同一头文件
+  就会 ODR 冲突。标准从 C++98 起给 const 内置了 internal，使这种写法合法。
+  普通变量不放在头文件中定义，不需要此规则，保持 external 默认。
+
+【示例 1：static 函数】
+
+// helper.h
+static int add(int a, int b) { return a + b; }
+// 每个 include 此头文件的 TU 都有自己独立的 add 函数副本
+// 不同 TU 的 add 地址不同，互不干扰
+
+// a.cpp → 有自己的 add
+// b.cpp → 有自己的 add（与 a.cpp 的是不同函数）
+
+【示例 2：const 变量（最常见）】
+
+// config.h
+const int BUFFER_SIZE = 4096;        // 内部链接（C++98 起）
+constexpr int MAX_THREADS = 1024;    // 内部链接（constexpr 隐含 const）
+
+// a.cpp 和 b.cpp 都 #include "config.h"
+// 各自持有独立的 BUFFER_SIZE 和 MAX_THREADS 副本
+// 值相同，但地址不同（编译器通常直接内联值，不分配地址）
+
+【示例 3：匿名命名空间】
+
+// utils.cpp
+namespace {
+    int secret = 42;              // 内部链接，其他 TU 无法访问
+    void helper() { /* ... */ }   // 内部链接
+}
+
+// 等价于 C 风格的 static int secret = 42;
+// 匿名命名空间是 C++ 推荐的替代 static 的写法
+
+【为什么头文件中的 const 用内部链接？】
+
+若 const 变量是外部链接，多个 TU include 同一头文件就会产生多个定义，违反 ODR。
+内部链接让每个 TU 独立持有副本，合法。
+对于编译期常量，编译器直接用值替换，副本不占运行时内存。
+
+
+三、无链接性（No Linkage）
+========================================
+
+定义：该名字完全局限于其声明的作用域，不参与任何跨作用域的链接。
+      无法从外部以任何方式引用（包括同一 TU 内的其他作用域）。
+
+【符合条件的实体】
+- 局部变量（函数内的变量，无 static 修饰）
+- 局部类型（函数内定义的 class/struct/enum）
+- 函数参数
+
+【示例】
+
+void foo() {
+    int x = 10;              // 无链接性：只在 foo 的这次调用栈帧中存在
+    struct Point { int x, y; };  // 无链接性：Point 类型只在 foo 内可见
+}
+
+void bar() {
+    // x 和 Point 在这里完全不可见
+}
+
+【static 局部变量是例外】
+
+void counter() {
+    static int count = 0;    // 无链接性（其他 TU 无法引用 count）
+    ++count;                 // 但有静态存储期：跨调用保持值，程序结束才销毁
+}
+// 注意：static 局部变量是"无链接性 + 静态存储期"的组合
+//       不要与 namespace scope 的 static（内部链接）混淆
+
+
+
+
+五、三种链接性对比
+========================================
+
+┌──────────────────┬──────────────────┬──────────────────┬──────────────────┐
+│                  │  外部链接         │  内部链接         │  无链接          │
+├──────────────────┼──────────────────┼──────────────────┼──────────────────┤
+│ 可见范围          │ 整个程序所有 TU   │ 当前 TU 内        │ 当前作用域内      │
+│ 跨 TU 共享       │ 是（同一实体）    │ 否（各自独立）    │ 否               │
+│ ODR 约束         │ 是               │ 否（副本独立）    │ 否               │
+│ 链接器处理        │ 是               │ 否               │ 否               │
+├──────────────────┼──────────────────┼──────────────────┼──────────────────┤
+│ 典型例子          │ 普通全局变量/函数 │ const/static 全局 │ 局部变量/参数    │
+│                  │ extern 变量      │ 匿名命名空间      │ 局部类型         │
+│                  │ inline 函数      │ static 函数      │ static 局部变量  │
+└──────────────────┴──────────────────┴──────────────────┴──────────────────┘
+
+
+五、CUDA 中的链接性
+========================================
+
+【__global__ kernel 的链接性】
+
+__global__ 函数（kernel）是外部链接（external linkage），链接器可以看到它，
+但实际上不能跨翻译单元通过 <<<>>> 语法调用：
+- <<<>>> 启动代码由编译器在编译期生成，要求 kernel 定义和调用处在同一 TU
+- 链接器不理解 <<<>>> 语法，无法在链接阶段补全跨 TU 的 kernel 调用
+
+// a.cu
+__global__ void my_kernel() { }      // 外部链接，符号对链接器可见
+
+// b.cu
+extern __global__ void my_kernel();  // 声明合法
+my_kernel<<<1,1>>>();                 // 编译/链接报错：启动代码无法跨 TU 生成
+
+工程上的标准做法：把 kernel 定义写在头文件（.cuh）中，由调用方 .cu include，
+使 kernel 定义与启动代码处于同一翻译单元：
+
+// kernels.cuh
+__global__ void my_kernel() { }      // 定义放头文件
+
+// runner.cu
+#include "kernels.cuh"
+my_kernel<<<1,1>>>();                 // 合法：同一 TU 内
+
+这也是本项目的结构——kernel 定义放在 .cuh 中，由 runner.cu include 后在同一 TU 内使用。
+
+【为什么 .cuh 中直接定义 kernel 不会重复定义】
+
+__global__ 是外部链接，按 C++ ODR 规则本应因多份定义而报错，
+但 nvcc 自动将 host 侧生成的 kernel 启动桩函数（launch stub）标记为 weak symbol，
+链接器遇到多个同名 weak symbol 时自动合并，不报 "multiple definition" 错误。
+这是 nvcc 的内置行为，不需要开发者额外标注。
+
+对比 C++ host 函数（外部链接）必须靠 inline 才能放头文件：
+
+┌───────────────────┬─────────────────────┬────────────────────────────┐
+│     函数类型      │    定义在头文件     │       防重复定义方式       │
+├───────────────────┼─────────────────────┼────────────────────────────┤
+│ __global__        │ 可以                │ nvcc 自动生成 weak symbol  │
+├───────────────────┼─────────────────────┼────────────────────────────┤
+│ __device__        │ 可以                │ 内部链接，各 TU 独立副本   │
+├───────────────────┼─────────────────────┼────────────────────────────┤
+│ C++ host 函数     │ 需要加 inline       │ inline 提供 ODR 豁免       │
+└───────────────────┴─────────────────────┴────────────────────────────┘
+
+各函数限定符的链接性对比：
+
+┌──────────────────────┬────────────────────────────────┬──────────────────────┐
+│       函数类型       │           链接属性             │       支持内联       │
+├──────────────────────┼────────────────────────────────┼──────────────────────┤
+│ __global__（kernel） │ 外部链接，但不可跨 TU 用<<<>>> │ 不支持（CUDA 禁止）  │
+├──────────────────────┼────────────────────────────────┼──────────────────────┤
+│ __device__           │ 内部链接（默认）               │ 支持 __forceinline__ │
+├──────────────────────┼────────────────────────────────┼──────────────────────┤
+│ __host__（普通函数） │ 外部链接                       │ 支持 inline          │
+└──────────────────────┴────────────────────────────────┴──────────────────────┘
+
+注意：__forceinline__ / __inline__ 只影响内联策略，不改变链接属性：
+- __forceinline__ __device__ float f() { }   // 合法：强制内联
+- __forceinline__ __global__ void k() { }    // 非法：CUDA 禁止 kernel 内联
+__global__ 是 host→device 调用的边界，编译器必须为其生成完整的启动框架，
+物理上无法被内联到调用者中。
+
+【inline 的 ODR 豁免与 weak symbol 的关系】
+
+C++ inline 的 ODR 豁免在底层也是通过 weak symbol（或 COMDAT）实现的：
+
+  C++ inline 函数：你写 inline → 编译器生成 weak symbol → 链接器合并多份定义
+  nvcc __global__：你什么都不写 → nvcc 自动生成 weak symbol → 链接器合并多份定义
+
+底层机制完全相同，区别只是前者由程序员显式声明，后者由 nvcc 自动完成。
+
+因此不允许对 __global__ 加 inline 的原因有两点：
+1. weak symbol 功能 nvcc 已自动处理，inline 的 ODR 豁免是多余的
+2. inline 还携带"内联展开"语义（把函数体插入调用处），而 kernel 调用跨越
+   CPU/GPU 硬件边界，GPU 代码无法内联进 CPU 指令流，语义上根本不成立
+
+
+CUDA 自己的 __forceinline__ / __inline__ 同样不能用于 __global__，原因相同：
+这两个关键字在 CUDA 里只有"内联展开"这一个含义，没有 C++ inline 的 ODR 豁免：
+
+┌────────────────────────┬──────────────┬──────────────┐
+│        关键字          │  ODR 豁免    │ 内联展开提示 │
+├────────────────────────┼──────────────┼──────────────┤
+│ C++ inline             │ 有           │ 有           │
+├────────────────────────┼──────────────┼──────────────┤
+│ CUDA __forceinline__   │ 无           │ 有           │
+├────────────────────────┼──────────────┼──────────────┤
+│ CUDA __inline__        │ 无           │ 有           │
+└────────────────────────┴──────────────┴──────────────┘
+
+它们禁止用于 __global__ 的理由与 C++ inline 完全相同——都卡在"内联展开"上：
+把 GPU kernel 函数体插入 CPU 调用处，跨硬件边界，根本做不到。
+它们也没有额外的 ODR 豁免能力可以绕开这个限制。
+
+CUDA 默认编译模式（无 -rdc=true）：
+- 每个 .cu 文件独立编译成 fat binary（PTX + SASS），不做跨 TU device 链接
+- __device__ / __global__ 函数定义在 .cuh 中 → 每个 TU 独立编译，不会 ODR 冲突
+- Host 侧（__global__ 的启动 stub）由 nvcc 标记为 weak symbol，链接器自动合并
+
+开启 -rdc=true（Relocatable Device Code）：
+- nvlink 执行跨 TU device 链接，ODR 规则对 device 代码生效
+- __device__ 函数若在头文件中定义且被多个 TU include，需加 static 或 inline
+
+【extern __shared__ 的本质】
+
+extern __shared__ T smem[];   // CUDA 专有语法，不参与 C++ 链接性体系
+                               // 这里的 extern 不是 C++ 外部链接，而是 CUDA 的专有标记，
+                               // 含义是：数组大小在编译期未知，由 runtime 在 kernel 启动时分配
+                               // （<<<grid, block, dynSmem>>> 第三个参数指定字节数）
+
+extern __shared__ 不能用 C++ 的内部/外部/无链接来描述：
+- 不做跨 TU 符号解析（不是 C++ 外部链接）
+- 不能从其他 TU 访问（也不符合"外部链接"的可见性语义）
+- 同一 TU 内同名声明要求类型一致（行为又不同于真正的无链接局部变量）
+结论：它是 CUDA 专有构造，强行套用 C++ 链接性分类是类比错误。
+
+若要类比，行为最接近内部链接：
+- 不能被其他 TU 访问，无跨 TU 符号解析
+- 每个 block 持有独立的内存（类似内部链接各 TU 持有独立副本）
+但这只是行为上的近似，机制完全不同：内部链接由链接器实现，
+extern __shared__ 的内存由 CUDA runtime 在 kernel 启动时从 SM 硬件分配。
+
+【模板实例化导致 extern __shared__ 类型冲突的根本原因】
+
+CUDA 编译器在同一 TU 内用符号名标识共享内存布局，要求同名声明类型唯一。
+当 AT_DISPATCH_FLOATING_TYPES 同时实例化 float 和 double 版本时：
+
+  实例1：extern __shared__ float  smem[];   // scalar_t=float
+  实例2：extern __shared__ double smem[];   // scalar_t=double
+
+  // error: declaration is incompatible with previous "smem"
+  // warning: a host variable("smem") redeclared with __shared__
+
+同一符号名 smem 在同一 TU 内被声明为两种不同类型 → 编译器报冲突。
+这是 CUDA 编译器的实现行为，不是 C++ 链接性规则导致的。
+
+标准解法：始终声明为 char[]（类型唯一，不随模板变化），再 reinterpret_cast：
+
+  extern __shared__ char smem_raw[];               // 类型固定，无冲突
+  scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);  // 按需转型
+
+
+CUDA 常量（__constant__）：
+__constant__ float coeff[4];   // 外部链接（device 侧），可从其他 TU 用 extern __constant__ 引用
+
+namespace scope constexpr 在 CUDA device 代码中：
+constexpr int N = 1024;        // host 侧：内部链接，正常
+                               // device 侧：某些 CUDA 版本处理方式不同，
+                               //            可能无法正确识别初始值 → 报 "must be initialized"
+static constexpr int N = 1024; // 显式声明为内部链接，CUDA device 编译器能正确处理
+#define N 1024                 // 预处理器替换，最兼容，无链接性问题
+
+
+
+
+
+
+
+
+
+八、常见误区
+========================================
+
+误区1：头文件中的函数定义需要 inline 来避免多定义
+    正确：inline 在 C++ 中提供 ODR 豁免（允许多个相同定义），而非强制内联
+          函数定义放头文件 → 加 inline；普通函数定义放 .cpp，头文件只放声明
+
+误区2：static 全局变量和 static 局部变量的 static 含义相同
+    正确：
+      static 全局变量 → 内部链接（限制可见范围）
+      static 局部变量 → 静态存储期（延长生命周期，跨调用保持值），链接性为无链接
+
+误区3：constexpr 变量是外部链接，头文件中定义会 ODR 冲突
+    正确：constexpr 隐含 const，const 在 namespace scope 是内部链接（C++98 起）
+          多个 TU include 同一头文件中的 constexpr 变量是合法的，各 TU 独立持有副本
+
+误区4：inline constexpr 和 constexpr 只有"是否内联"的区别
+    正确：inline 作用于变量时不是内联提示，而是改变链接性（internal → external ODR-safe）
+          对纯编译期常量（只用值不取地址）两者行为相同；只有涉及地址时才有差异
+
+
+九、宏（#define）：根本不在链接性 / ODR 体系内
+========================================
+
+宏不是变量/函数/类型那样的“实体”，而是【预处理器的纯文本替换】。它在【编译之前】
+就被展开消失，从不产生任何链接符号。所以“外部/内部/无链接”这套分类【对宏不适用】，
+也不存在 ODR（单一定义规则）意义上的“跨 TU 重复定义”问题。
+
+  源码 + 宏  ──预处理(展开宏)──▶  纯 C++（宏已消失）──编译──▶ .o ──链接──▶ 可执行
+                                   ↑ 链接器永远看不到“宏”这个东西
+
+【一】为什么宏没有“跨 TU 重复定义”问题
+
+  · ODR / “multiple definition” 是【链接器】层面的事，只管会变成符号的实体
+    （函数、变量）。宏展开后不留任何符号 → 链接器无从看见、无从判定重复。
+  · 每个 TU【各自独立预处理】：TU-A 和 TU-B 都 #define ROPE_DISPATCH_CASE_TMPL，
+    互不影响（不像外部链接符号那样需要全程序唯一）。
+
+  ⚠ 措辞精确化：宏躲过“重复定义”，【不是因为“只在 TU 内可见”】（那是表现），
+    而是因为【宏根本不是 ODR 约束的实体】——它在预处理阶段就没了，压根进不了链接。
+
+【二】宏真正可能的“重复定义”：同一个 TU 内、预处理层面
+
+  这是【单 TU 内】的事，与链接/ODR 无关：
+
+    #define X 1
+    #define X 2      // ✗ 警告/错误："macro redefinition"（同名、不同体）
+    #define X 1      // ✓ 同名且【定义相同】→ 允许，不报
+
+  · 防“同一 TU 把同一个头展开两次” → 用 #pragma once / include guard（见 macro 文档）。
+  · 防“与别的头同名宏撞车（不同体）” → 宏无视命名空间，是全 TU 文本替换，风险最高；
+    正解是【加项目前缀】（如 ROPE_*）或用完 #undef，不是 #ifndef。
+
+【三】对照：同一头文件里“宏 vs 真实体”的待遇
+
+  以 src/dispatch.h 为例（宏 + 一个 inline 函数模板并存）：
+
+  ┌─────────────────────────────────┬──────────────┬──────────────────┬────────────────────┐
+  │ 东西                            │ 是 ODR 实体? │ 多 TU 包含会冲突? │ 靠什么避免         │
+  ├─────────────────────────────────┼──────────────┼──────────────────┼────────────────────┤
+  │ ROPE_DISPATCH_CASE_TMPL（宏）   │ 否(预处理文本)│ 不会(不产生符号)  │ 天然无需；         │
+  │                                 │              │                  │ #pragma once 防同TU重复展开 │
+  │ rope_dispatch::throw_runtime    │ 是(函数模板) │ 会(若无豁免)      │ inline + 模板自带  │
+  │（inline 函数模板）              │              │                  │ ODR 豁免           │
+  └─────────────────────────────────┴──────────────┴──────────────────┴────────────────────┘
+
+  即：同一个头里，【宏不需要操心 ODR】（它不是符号），但【函数】要放头文件就必须靠
+  inline（及模板规则）拿 ODR 豁免——正反衬出“宏没有 ODR 问题”是因为它【根本不是实体】。
+
+【四】小结
+
+  · 宏 = 预处理文本替换，编译前消失，不产生符号 → 不在链接性/ODR 体系内。
+  · 没有“跨 TU 重复定义”：各 TU 独立预处理，宏不进链接。
+  · 唯一的“重复定义”是【同一 TU 内同名不同体】的宏重定义（#pragma once + 加前缀规避）。
+  · 真正的风险是【同一 TU 内跨头文件同名冲突】——加项目前缀解决，与链接无关。
+  （详见 docs/c++/macro.txt。）
+
+
+十、namespace 放头文件：本身不会“重复定义”，但管不了里面的东西
+========================================
+
+核心：namespace 这个【块】本身无 ODR 问题——命名空间是【开放(open)、可反复重新打开】的，
+放头文件、在每个 TU 出现、被合并，都【不算重复定义】。但“会不会重复定义”取决于
+namespace【内部放了什么】，其链接性/ODR 规则与放在全局作用域时【完全一样】。
+
+【一】namespace 本身可反复打开，不冲突
+
+    // a.cpp
+    namespace foo { void p(); }     // ✓ 打开 foo
+    // b.cpp
+    namespace foo { void q(); }     // ✓ 再次打开 foo（编译器合并，不冲突）
+
+  所以头文件里 namespace foo { ... } 被 N 个 TU include，【namespace 这层】绝不报
+  multiple definition。
+
+【二】真正的问题在 namespace【里面】放了什么（与“在不在 namespace”无关）
+
+    namespace foo {
+      void bar();                  // ① 声明           → ✓ 头文件安全
+      void baz() { ... }           // ② 函数【定义】(external) → ✗ 多 TU → multiple definition
+      inline void qux() { ... }    // ③ inline 定义     → ✓ ODR 豁免，安全
+      int g = 1;                   // ④ 变量【定义】(external) → ✗ 多 TU 冲突
+      inline int h = 1;            // ⑤ inline 变量(C++17)     → ✓ 安全
+      const int k = 1;             // ⑥ const(内部链接降级)    → ✓ 各 TU 独立副本，安全
+      struct S { int x; };         // ⑦ 类型定义        → ✓ 各 TU 相同定义即可(类型 ODR 允许)
+      template <class T> void t(T){} // ⑧ 模板          → ✓ 模板自带 ODR 豁免
+    }
+
+  结论：把 namespace 放头文件没问题，但里面若有【非 inline 的函数/变量定义】(②④)，
+  照样 multiple definition——这跟有没有 namespace【毫无关系】，是内部实体的链接性决定的。
+  namespace 只负责“名字归属 / 防撞名”，【不负责】“防 ODR 重复定义”。
+
+【三】对应本项目：rope_dispatch::throw_runtime（src/dispatch.h）
+
+    namespace rope_dispatch {
+    template <typename Msg>
+    [[noreturn]] inline void throw_runtime(Msg&& msg) {   // ★ inline + 模板
+      throw std::runtime_error(std::forward<Msg>(msg));
+    }
+    }
+
+  · namespace rope_dispatch 这层：多个 .cu 反复打开、无冲突；
+  · throw_runtime 头文件安全，靠的是【inline +（它是）模板】拿 ODR 豁免，
+    【不是因为它在 namespace 里】。把它移到全局、只要仍是 inline 模板，照样安全；
+    反之去掉 inline（且非模板），即便包在 namespace 里也会 multiple definition。
+
+【四】反模式：头文件里的【匿名】namespace
+
+    namespace { int x = 1; }   // 匿名命名空间 → 内部链接
+
+  匿名命名空间里的东西是【内部链接】，放头文件会让【每个包含它的 TU 各持一份独立副本】
+  （地址不同、二进制膨胀、易出隐蔽 bug）。所以【头文件通常不该用匿名 namespace】——
+  那不是“重复定义”，而是“每个 TU 一份，多半非本意”。具名 namespace 才适合放头文件。
+
+【五】对照表
+
+  ┌────────────────────────────────────┬──────────────────┬──────────────────────────────┐
+  │ 头文件里的写法                      │ 多 TU 包含        │ 原因                         │
+  ├────────────────────────────────────┼──────────────────┼──────────────────────────────┤
+  │ namespace foo {}（空/只声明）       │ ✅ 安全           │ namespace 可重开；声明不产定义│
+  │ namespace 内 非 inline 函数/变量定义│ ❌ multiple def.  │ 外部链接实体，与 namespace 无关│
+  │ namespace 内 inline 函数/变量       │ ✅ 安全           │ inline 的 ODR 豁免           │
+  │ namespace 内 模板                   │ ✅ 安全           │ 模板自带 ODR 豁免            │
+  │ namespace 内 类型/const/constexpr   │ ✅ 安全           │ 类型 ODR 允许；const 内部链接 │
+  │ 匿名 namespace 放头文件             │ ⚠ 各 TU 独立副本  │ 内部链接，通常非本意         │
+  └────────────────────────────────────┴──────────────────┴──────────────────────────────┘
+
+  一句话：namespace 本身可反复打开、放头文件不冲突；是否“重复定义”由其【内部实体】的
+  链接性决定（非 inline 函数/变量定义照样冲突），与“在不在 namespace”无关。
+  项目里 rope_dispatch::throw_runtime 安全靠的是 inline + 模板，不是 namespace；
+  且【匿名 namespace 不要放头文件】。

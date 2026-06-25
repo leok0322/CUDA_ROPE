@@ -1,0 +1,137 @@
+================================================================================
+编译器警告选项(GCC / Clang)：-Wall / -Wextra / -Werror / 单项 -W<name> 全解
+================================================================================
+
+一句话
+--------------------------------------------------------------------------------
+  · -W<name>     ：打开/关闭【某一个】具体警告（-Wxxx 开，-Wno-xxx 关）。
+  · -Wall        ：打开【一批常用警告】（名为 all，实则【并非全部】）。
+  · -Wextra      ：在 -Wall 之上【再加一批】（旧名 -W）。
+  · -Werror      ：把【被触发的警告】统统【升级为编译错误】（编译直接失败）。
+  · 还有许多警告【两档都不开】，必须单独 -W<name> 显式打开。
+
+  层级（由少到多）：
+     默认(无 -W)  ⊂  -Wall  ⊂  -Wall -Wextra  ⊂  -Wall -Wextra -W<额外项>...
+
+  文档表格里“是否在 -Wall”这列 = 该警告会不会被 -Wall【自动打开】（→ 平时会不会真冒出来）。
+
+
+================================================================================
+一、-Wall：打开“一批常用警告”，不是“全部”
+================================================================================
+
+    g++ -Wall main.cpp        # 打开一组高信噪比的常用警告
+
+  · 名字是 “Warnings, all”，但【不等于所有警告】——只是绝大多数项目都该开的一批。
+  · 典型包含（节选）：
+        -Wswitch              枚举 switch 没列全且无 default
+        -Wreturn-type         非 void 函数缺 return
+        -Wunused-variable     定义了没用的变量
+        -Wuninitialized       可能用到未初始化的值
+        -Wsign-compare        有/无符号混比
+        -Wformat              printf 格式串与参数不匹配
+        ...（几十项）
+  · 实务：几乎所有项目都加 -Wall，所以“在 -Wall 的警告”基本【一定会触发】，必须处理。
+
+
+================================================================================
+二、-Wextra：在 -Wall 之上再加一批（旧名 -W）
+================================================================================
+
+    g++ -Wall -Wextra main.cpp
+
+  · 比 -Wall 更严，追加一些“偶有误报、但常有价值”的警告，例如：
+        -Wimplicit-fallthrough   case 穿透进下一个 case 且无 [[fallthrough]]
+        -Wunused-parameter       函数形参没用到
+        -Wtype-limits            比较恒真/恒假（如 unsigned >= 0）
+        -Wempty-body             if/for/while 体为空
+        ...
+  · 注意：-Wimplicit-fallthrough 在 -Wextra 这档（不同编译器/版本略有出入）。
+
+
+================================================================================
+三、单项 -W<name>：很多警告默认两档都不开
+================================================================================
+
+  大量细分警告【-Wall 和 -Wextra 都不打开】，必须显式 -W<name>：
+        -Wswitch-enum         枚举 switch 没列全（即使有 default 也报）
+        -Wswitch-default      任何 switch 缺 default 都报（含 int switch）
+        -Wshadow              内层变量遮蔽外层同名变量
+        -Wconversion          隐式数值转换可能丢精度
+        -Wold-style-cast      C 风格强制转换（建议用 C++ cast）
+        -Wpadded              结构体有填充字节
+        ...
+  · 关某个警告：-Wno-<name>（如 -Wno-unused-parameter）。
+  · 顺序生效：后面的覆盖前面的，例如 `-Wall -Wno-unused-variable` = 开 -Wall 但单独关掉
+    unused-variable。
+
+
+================================================================================
+四、-Werror：把警告升级为错误
+================================================================================
+
+    g++ -Wall -Werror main.cpp        # 任一被触发的警告 → 直接编译失败
+
+  · -Werror 让【已触发】的警告变成 error，强制“零警告”才能编过（CI 常用）。
+  · 可只对某项生效：-Werror=<name>（如 -Werror=return-type 只把它当错误）；
+    反向豁免：-Wno-error=<name>。
+  · 影响：开了 -Werror，则“在 -Wall 的警告”必须【全部清干净】，否则编不过——这就是为什么
+    “是否在 -Wall”很关键。
+
+
+================================================================================
+五、“是否在 -Wall” 决定你要不要为它花功夫
+================================================================================
+
+  | 该列取值     | 含义                       | 实际后果                              |
+  |--------------|----------------------------|---------------------------------------|
+  | ✅ 在 -Wall  | 加 -Wall 就自动报          | 几乎总会触发 → 必须处理（配 -Werror 会编译失败）|
+  | (-Wextra)    | 加 -Wextra 才报            | 取决于项目是否开 -Wextra              |
+  | ❌ 需显式开  | -Wall/-Wextra 都不报       | 默认不触发 → 处理它属“防御性/可选”    |
+
+  应用到 switch（详见 switch_case_fallthrough_and_warnings.txt）：
+    · -Wswitch（✅ -Wall）：基本一定报 → 枚举没列全时【必须】加 default 或列全。
+    · -Wswitch-enum（❌ 需显式开）：默认不报 → 用 PUSH/POP IGNORED 抑制是【防御性】，
+      防“万一上游/某构建开了它”。
+    · -Wimplicit-fallthrough（-Wextra）：开 -Wextra 才报 → 用 break/return/[[noreturn]]
+      或 [[fallthrough]] 处理。
+
+
+================================================================================
+六、相关 pragma：局部开关某警告（不改全局编译选项）
+================================================================================
+
+  想只对【一小段代码】关掉某警告，用诊断 pragma（push 保存状态、ignored 关、pop 还原）：
+
+      // 通用 GCC/Clang 写法：
+      #pragma GCC diagnostic push
+      #pragma GCC diagnostic ignored "-Wswitch-enum"
+      switch (x) { ... }
+      #pragma GCC diagnostic pop
+
+      // 本项目用的封装宏（torch/c10 提供，跨编译器）：
+      C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wswitch-enum")
+      switch (x) { ... }
+      C10_DIAGNOSTIC_POP()
+
+  · 只“不打印”指定警告，【不改变生成的代码/运行行为】——是“治标”（见 fallthrough 文档第 5 节）。
+  · 优点：作用域局部，不污染整个文件/工程的警告策略。
+
+
+================================================================================
+七、常见命令行组合
+================================================================================
+
+    -Wall                         # 基础，几乎必加
+    -Wall -Wextra                 # 更严，推荐
+    -Wall -Wextra -Werror         # 零警告才能编过（CI/严格项目）
+    -Wall -Wno-unused-parameter   # 开 -Wall 但单独关掉某项
+    -Wall -Werror=return-type     # 只把“缺 return”当错误，其余仍是警告
+    -Wall -Wextra -Wshadow -Wconversion   # 再额外开几个默认不开的
+
+
+相关文件：
+    docs/c++/switch_case_fallthrough_and_warnings.txt  —— switch 三个警告与处理手段
+    docs/c++/noreturn_and_reachability_analysis.txt    —— [[noreturn]] 治本消穿透
+    src/dispatch.h                                     —— C10_DIAGNOSTIC_PUSH/POP 实际用例
+    CMakeLists.txt                                     —— 本项目用 add_compile_options 设警告/标志

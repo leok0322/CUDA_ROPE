@@ -4,20 +4,16 @@
 #include <torch/extension.h>
 #include "dispatch.h"
 
-void fused_QKNorm_and_ROPE_interleave(
-    at::Tensor& qkv,                  // [num_tokens, (Hq+Hk+Hv)*head_dim]  ★就地改写
-    const at::Tensor& q_weight,       // [head_dim]  Q 的 RMSNorm γ
-    const at::Tensor& k_weight,       // [head_dim]  K 的 RMSNorm γ
-    const at::Tensor& cos,            // [num_tokens, rotary_dim/2]  已 gather
-    const at::Tensor& sin,            // [num_tokens, rotary_dim/2]
+
+template<typename qkv_scalar_t,typename cache_scalar_t, uint head_dim>
+void launch_fused_QKNorm_and_ROPE_kernel(
+    void* qkv_ptr,             // [num_tokens, (Hq+Hk+Hv)*head_dim]  ★就地改写
+    const void* q_weight_ptr,       // [head_dim]  Q 的 RMSNorm γ
+    const void* k_weight_ptr,       // [head_dim]  K 的 RMSNorm γ
+    const void* cos_ptr,            // [num_tokens, rotary_dim/2]  已 gather
+    const void* sin_ptr,            // [num_tokens, rotary_dim/2]
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
-    int64_t head_dim, int64_t rotary_dim, double eps) {
-  int64_t num_tokens { qkv.size(0) };
-  auto qkv_ptr { qkv.data_ptr() };
-  auto q_weight_ptr { q_weight.data_ptr() };
-  auto k_weight_ptr { k_weight.data_ptr() };
-  auto cos_ptr { cos.data_ptr() };
-  auto sin_ptr { sin.data_ptr() };
+    int64_t num_tokens, int64_t rotary_dim, double eps) {
 
   int64_t half { rotary_dim / 2};
   // half(=rotary_dim/2)须为 BLOCK_SIZE_X 的整数倍：每个 head 的 half 维按 BLOCK_SIZE_X 分块，
@@ -33,9 +29,32 @@ void fused_QKNorm_and_ROPE_interleave(
                 ") 必须是 BLOCK_SIZE_X(=", BLOCK_SIZE_X, ") 的整数倍");
   }
 
-  // dim3 gridSize {1,cuda::ceil_div(static_cast<uint>(num_tokens),BLOCK_SIZE_Y),1};
-  dim3 gridSize {1,static_cast<uint>(num_tokens),1};
+  static_assert(BLOCK_SIZE_X % 32 == 0, "BLOCK_SIZE_X需要是32的倍数，因为一个warp负责一行");
+  uint totalQKHeads {static_cast<uint>(num_tokens * (num_heads_q + num_heads_k))};
+  uint warpsPerBlock {BLOCK_SIZE_X / 32};
+  dim3 gridSize {1,cuda::ceil_div(totalQKHeads,warpsPerBlock),1};
   dim3 blockSize {BLOCK_SIZE_X,1,1};
+
+
+  fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,head_dim><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
+       num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
+}
+
+void fused_QKNorm_and_ROPE_interleave(
+    at::Tensor& qkv,                  // [num_tokens, (Hq+Hk+Hv)*head_dim]  ★就地改写
+    const at::Tensor& q_weight,       // [head_dim]  Q 的 RMSNorm γ
+    const at::Tensor& k_weight,       // [head_dim]  K 的 RMSNorm γ
+    const at::Tensor& cos,            // [num_tokens, rotary_dim/2]  已 gather
+    const at::Tensor& sin,            // [num_tokens, rotary_dim/2]
+    int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
+    int64_t head_dim, int64_t rotary_dim, double eps) {
+
+  int64_t num_tokens { qkv.size(0) };
+  auto qkv_ptr { qkv.data_ptr() };
+  auto q_weight_ptr { q_weight.data_ptr() };
+  auto k_weight_ptr { k_weight.data_ptr() };
+  auto cos_ptr { cos.data_ptr() };
+  auto sin_ptr { sin.data_ptr() };
 
   // qkv.scalar_type() 返回的是【枚举类 torch::headeronly::ScalarType 的一个枚举值】
   //   (如 ScalarType::Half / ::BFloat16 / ::Float)——是“值”，不是类型，等价于 at::kHalf 等。
@@ -43,13 +62,21 @@ void fused_QKNorm_and_ROPE_interleave(
   // 这个【运行时枚举值】交给 DISPATCH_FLOATING_TYPES：内部 switch 据它落到某个 case，
   //   再把该 case 的【编译期常量】枚举值经 ScalarTypeToCPPTypeT 映射成类型 scalar_t，
   //   最后调用第三参的 lambda 体(此处为空)。即“运行时 dtype → 编译期类型”的桥。
-  DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_QKNorm_and_ROPE", [&] () -> void {
+
+  //at::Tensor::scalar_type() 和 torch::stable::Tensor::scalar_type() 返回值的类型确实都是 torch::headeronly::ScalarType 枚举(c10::ScalarType / at::ScalarType / torch::headeronly::ScalarType 是同一枚举的别名)
+  ROPE_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_QKNorm_and_ROPE", [&] () -> void {
     using qkv_scalar_t = scalar_t;
-    DISPATCH_FLOATING_TYPES(cos.scalar_type(), "fused_QKNorm_and_ROPE", [&] () -> void {
+    ROPE_DISPATCH_FLOATING_TYPES(cos.scalar_type(), "fused_QKNorm_and_ROPE", [&] () -> void {
       using cache_scalar_t = scalar_t;
-      fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
-        num_heads_q,num_heads_k,num_heads_v,head_dim,rotary_dim,num_tokens,eps);
+      ROPE_DISPATCH_HEAD_DIM(qkv.scalar_type(),head_dim, "fused_QKNorm_and_ROPE",[&] () -> void {
+        launch_fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,headDIM>(qkv_ptr,q_weight_ptr,k_weight_ptr,cos_ptr,sin_ptr,num_heads_q,num_heads_k,num_heads_v,num_tokens,rotary_dim,eps);
+        //return;
+      });
+      //return;   // 不需要：lambda 是 ()->void，走到 } 自动返回 void。这里的 return 只是
+                  // “从本 lambda 返回”，与宏内部的 `return __VA_ARGS__();`(从 IIFE 返回、跳出 switch)
+                  // 不是一回事——后者才必需，且已由 DISPATCH_FLOATING_TYPES 宏自身提供。
     });
+    //return;     // 同上：外层 lambda 末尾也无需 return；整条 dispatch 全程 void，加不加行为一致。
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -97,11 +124,10 @@ void fused_QKNorm_and_ROPE_interleave(
   // 注：DISPATCH_FLOATING_TYPES 宏体当前有个 `...,` 笔误(dispatch.h)，需去掉才能真正编过。
   // ───────────────────────────────────────────────────────────────────────────
 
-    // AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16,  qkv.scalar_type(),"fused_QKNorm_and_ROPE",([&] () -> void {
-    //     fused_QKNorm_and_ROPE_kernel<scalar_t><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,num_heads_q,num_heads_k,num_heads_v,head_dim,rotary_dim,num_tokens,eps);
-    //     cudaCheck(cudaGetLastError());
-    // }));
-
+  // AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16,  qkv.scalar_type(),"fused_QKNorm_and_ROPE",([&] () -> void {
+  //     fused_QKNorm_and_ROPE_kernel<scalar_t><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,num_heads_q,num_heads_k,num_heads_v,head_dim,rotary_dim,num_tokens,eps);
+  //     cudaCheck(cudaGetLastError());
+  // }));
 }
 
 
