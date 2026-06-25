@@ -67,7 +67,7 @@ except ImportError:
 class Runner:
     """封装 FusedQKVNormRope 的 eager 运行与 torch.compile 融合替换全流程。"""
 
-    def __init__(self, token_size=(4, 4), head_dim=128,
+    def __init__(self, token_size=(4, 4), head_dim=128, rotary_dim=None,
                  eps=1e-6, base=10000.0, max_token_size=4096, device=None, dtype=torch.float32,
                  seed=0, interleave=False,
                  num_heads_q=8, num_heads_k=8, num_heads_v=8):
@@ -76,6 +76,11 @@ class Runner:
         #   序列条数 = len(token_size)，每条长度可不同；num_tokens 由各条真实长度求和而来(无 padding)。
         self.token_size = list(token_size)
         self.head_dim = head_dim          # = 最后一维（RMSNorm/RoPE 作用维），须为偶数
+        # rotary_dim：每头参与 RoPE 旋转的维度数(<=head_dim)；None→默认全旋转=head_dim。
+        #   传给 FusedQKVNormRope 与 RMSNormRoPEreplacePass，二者须一致(否则子图对不上)。
+        self.rotary_dim = rotary_dim if rotary_dim is not None else head_dim
+        assert self.rotary_dim % 2 == 0 and self.rotary_dim <= head_dim, \
+            f"rotary_dim={self.rotary_dim} 需为偶数且 <= head_dim={head_dim}"
         self.eps = eps
         self.base = base
         self.dtype = dtype
@@ -97,7 +102,7 @@ class Runner:
         # num_tokens = 各序列真实长度之和(ragged 拍平成一个 token 维，无 padding) → 与 CUDA
         # kernel 的 [num_tokens, num_heads, head_dim] 对齐。等长是这里的特例，不再写死乘法。
         self.num_tokens = sum(self.token_size)
-        self.half = head_dim // 2
+        self.half = self.rotary_dim // 2   # cos/sin 的列宽 = rotary_dim/2(非 head_dim/2)
         # 模型的上下文最大token
         self.max_position = max_token_size
         # 边界校验：任一序列长度都不得超过 cos/sin cache 的行数上限(max_position)，
@@ -116,7 +121,7 @@ class Runner:
         self.model = FusedQKVNormRope(
             num_heads_q=self.num_heads_q, num_heads_k=self.num_heads_k,
             num_heads_v=self.num_heads_v, head_dim=self.head_dim,
-            rotary_dim=self.head_dim, max_position=self.max_position,
+            rotary_dim=self.rotary_dim, max_position=self.max_position,
             eps=self.eps, base=self.base, interleave=self.interleave,
             dtype=self.dtype, device=self.device,
         ).to(self.device)
@@ -160,6 +165,7 @@ class Runner:
         rp = RMSNormRoPEreplacePass(
             eps=self.eps, num_heads_q=self.num_heads_q, num_heads_k=self.num_heads_k,
             num_heads_v=self.num_heads_v, head_dim=self.head_dim,
+            rotary_dim=self.rotary_dim,            # 与 build_model 的 FusedQKVNormRope 一致(子图才对得上)
             op_name=op_name,                       # 据 interleave 选定的算子
             interleave=self.interleave,            # 与 build_model 的 RoPE 风格保持一致
         )

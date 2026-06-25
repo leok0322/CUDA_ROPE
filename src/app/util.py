@@ -103,6 +103,60 @@ def make_inputs_qkv(seed, num_heads_q, num_heads_k, num_heads_v, head_dim,
     return qkv, positions
 
 
+def make_inputs_qkv_padded(seed, num_heads_q, num_heads_k, num_heads_v, head_dim,
+                           device, dtype, real_lens, max_len=None):
+    """【对照实现】定长 + padding 版本，对应旧的 batch*token_size 排布。
+
+    与 make_inputs_qkv（变长无 padding、扁平 [num_tokens,...]）相对：padding 版的本质
+    是【规整定长】，故这里直接用三维 [batch, max_len, ...]，把 batch 维显式保留，
+    短序列尾部用 0 填充（padding）。三维形状也与 positions/mask 的 [batch, max_len] 对齐。
+
+    real_lens: 每条序列的【真实 token 数】列表(变长)。
+    max_len:   统一对齐到的长度；缺省取 max(real_lens)。
+
+    返回:
+      qkv       : [batch, max_len, total*head_dim]，padding 行为 0。
+      positions : [batch, max_len]，真实段为 0..n-1，padding 段为 0。
+      mask      : [batch, max_len] bool，True=真实 token，False=padding；
+                  下游 attention / 写回时据此跳过 padding（RoPE 对 padding 算出的
+                  角度无意义，必须靠 mask 屏蔽，这正是变长方案省掉 mask 的原因）。
+      例 real_lens=[3,5], max_len=5 →
+        positions=[[0,1,2,0,0],[0,1,2,3,4]]，mask 第 0 行后两位为 False。
+    """
+    # 固定随机种子：保证每次构造的 qkv 可复现，便于和 make_inputs_qkv 对照验证。
+    torch.manual_seed(seed)
+    # 每 token 的总 head 数 = Q 头 + K 头 + V 头；乘 head_dim 即每 token 的特征宽度。
+    total = num_heads_q + num_heads_k + num_heads_v
+    # batch = 序列条数（real_lens 一条对应一序列）。
+    batch = len(real_lens)
+    # max_len 缺省取最长序列长度：此时只有比它短的序列才需要 padding。
+    if max_len is None:
+        max_len = max(real_lens)
+
+    # 全 0 起底：先把整块开成规整的 [batch, max_len, ...]，凡未被真实数据覆盖的
+    # 行/位天然就是 padding（值 0）。
+    #   - qkv      : [batch, max_len, total*head_dim]，padding 行整行为 0。
+    #   - positions: [batch, max_len]，padding 位取 0（任意值皆可，反正会被 mask 屏蔽）。
+    #   - mask     : [batch, max_len]，默认 False，下面只把真实 token 置 True。
+    qkv = torch.zeros(batch, max_len, total * head_dim, device=device, dtype=dtype)
+    positions = torch.zeros(batch, max_len, dtype=torch.long, device=device)
+    mask = torch.zeros(batch, max_len, dtype=torch.bool, device=device)
+
+    # 逐序列填充：b 为序列下标，n 为该序列真实 token 数。
+    for b, n in enumerate(real_lens):
+        # 真实长度不能超过对齐长度，否则无处安放（max_len 即每条序列的容量上限）。
+        if n > max_len:
+            raise ValueError(f"real_lens[{b}]={n} 超过 max_len={max_len}")
+        # 仅填该序列前 n 个 token 的真实数据；[n, max_len) 这段保持 0，即尾部 padding。
+        qkv[b, :n] = torch.randn(n, total * head_dim, device=device, dtype=dtype)
+        # 真实段 position = 0..n-1（每条序列各自从 0 重新计数）。
+        positions[b, :n] = torch.arange(n, device=device)
+        # 该序列前 n 个标记为真实 token；其余仍为 False 表示 padding。
+        mask[b, :n] = True
+
+    # 三者均为 [batch, max_len, ...] 规整形状，下游据 mask 屏蔽 padding。
+    return qkv, positions, mask
+
 
 def _rotate_half(x):
     """neox 风格旋转辅助：把最后一维分成前后两半 [x1, x2] -> [-x2, x1]。"""

@@ -13,6 +13,7 @@ run_params:
 # ---- 模型架构参数（合并 qkv 模型 FusedQKVNormRope；键须与 Runner.__init__ 形参一一对应）----
 model_arch:
   head_dim: 64          # 每个头的特征维（RMSNorm/RoPE 作用维，须为偶数）
+  rotary_dim: null      # 每头参与 RoPE 旋转的维度数(<=head_dim，须偶数)；null→全旋转=head_dim
   eps: 1.0e-6           # RMSNorm 的数值稳定项
   base: 10000.0         # RoPE 频率底数
   max_token_size: 4096  # 模型上下文最大 token 数（cos/sin cache 行数 max_position）

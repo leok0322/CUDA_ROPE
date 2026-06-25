@@ -31,15 +31,16 @@ class RMSNormRoPEreplacePass:
     """合并 qkv 的 QK-Norm+RoPE 子图 → 融合算子 的 search / replace 定义。"""
 
     def __init__(self, eps, num_heads_q, num_heads_k, num_heads_v, head_dim,
-                 op_name, interleave, rotary_dim=None):
+                 op_name, interleave, rotary_dim):
         self.eps = eps                       # search(rsqrt 常量) + replace(op 入参)
         self.num_heads_q = num_heads_q       # Q 头数 Hq
         self.num_heads_k = num_heads_k       # K 头数 Hk
         self.num_heads_v = num_heads_v       # V 头数 Hv（透传，不处理）
         self.head_dim = head_dim
-        # rotary_dim<head_dim 时每头只旋转前 rotary_dim 维、其余透传；默认全旋转
-        self.rotary_dim = rotary_dim if rotary_dim is not None else head_dim
-        assert self.rotary_dim % 2 == 0, "rotary_dim需要是2的倍数" 
+        # rotary_dim<head_dim 时每头只旋转前 rotary_dim 维、其余透传。
+        # 【必传】：由 Runner 统一解析(None→head_dim)并校验后传入，此处不再兜底，保证 model 与
+        #   search_fn 用同一 rotary_dim(子图才对得上)；去掉死代码默认值，契约更显式。
+        self.rotary_dim = rotary_dim
         self.half = self.rotary_dim // 2
         # 融合算子全名(命名空间::算子名)，供 Installer 注册 fake/meta 实现用
         self.op_name = op_name
