@@ -1,0 +1,277 @@
+================================================================================
+类模板 与 函数模板，以及特化(specialization)：区别、规则与举例
+================================================================================
+
+本项目相关：
+  · 类模板 + 特化：_typeConvert<T>、packed_as<T,N>、ScalarTypeToCPPType<N>（trait）
+  · 函数模板（靠推导/重载，不偏特化）：throw_runtime<Msg>、launch kernel<...>
+
+
+================================================================================
+一、模板是什么
+================================================================================
+  模板 = 让编译器【按你给的类型/值，自动生成一份具体代码】的“代码生成器”。
+  分两种：
+    · 类模板  template<...> struct/class X { ... };     —— 生成“类型”
+    · 函数模板 template<...> 返回类型 f(...) { ... };    —— 生成“函数”
+  共同点：模板本身不是代码，被【实例化(instantiation)】后才生成真正的类/函数。
+
+
+================================================================================
+二、函数模板(function template)
+================================================================================
+
+  定义与调用：
+      template <typename T>
+      T max_(T a, T b) { return a > b ? a : b; }
+
+      max_(3, 5);          // T 由实参【推导】为 int → 实例化 max_<int>
+      max_<double>(3, 5);  // 也可显式指定（一般不必）
+
+  ── 实参推导(template argument deduction) ──────────────────────────────────
+    函数模板的最大特点：能从【函数实参】反推模板参数，故调用时通常【不写 <...>】。
+        std::max(3, 5);      // 推 T=int
+        std::swap(a, b);     // 推类型
+    仅当推导不出来时才必须显式写 <...>：
+        template <typename T> T make();   // T 只在返回类型，无从推导
+        auto x = make<int>();             // ✓ 必须 <int>
+    （详见 docs/c++/template_scope_alias_and_deduction.txt 附五。）
+
+  ── 转发引用 + 完美转发（常见模式）──────────────────────────────────────────
+      template <typename Msg>
+      [[noreturn]] inline void throw_runtime(Msg&& msg) {       // 本项目用例
+        throw std::runtime_error(std::forward<Msg>(msg));
+      }
+    （见 docs/c++/std_forward.txt、rvalue_ref_and_forwarding_ref.txt。）
+
+
+================================================================================
+三、类模板(class template)
+================================================================================
+
+  定义与使用：
+      template <typename T>
+      struct Box { T value; T get() const { return value; } };
+
+      Box<int> b{42};         // 实例化 Box<int>
+      Box<std::string> s{"x"};
+
+  ── 与函数模板的关键差异：类模板（C++17 前）【必须显式写 <...>】 ──────────────
+      std::vector<int> v;     // 必须写 <int>（无实参可推）
+      Box<int> b;             // 必须写
+    C++17 起有 CTAD（类模板实参推导），少数情况能省：
+      std::vector v{1,2,3};   // C++17 推出 vector<int>
+      Box b{42};              // 若有合适推导指引
+
+  ── 非类型模板参数(non-type template parameter) ───────────────────────────
+    模板参数不只可是类型，也可是【编译期常量值】（整型/枚举/指针等）：
+      template <typename T, int N> struct Array { T data[N]; };
+      Array<float, 4> a;      // N=4 是编译期常量
+    本项目：packed_as<float, 4>、ScalarTypeToCPPType<ScalarType::Half>、
+            launch_kernel<..., headDIM> 都用了非类型模板参数（值必须编译期可知）。
+
+
+================================================================================
+三·补、★模板实参必须是【编译期常量】——挪进函数参数就退化为运行时变量
+================================================================================
+
+  铁律：模板实参（无论类型实参还是非类型值实参）必须在【编译期】就确定。
+        非类型模板参数只能填【编译期常量表达式】，【不能】填运行时变量。
+
+      template <int N> struct Array { int data[N]; };
+      constexpr int C = 4;
+      int r = read();              // 运行时值
+      Array<C> a;                  // ✓ C 是编译期常量
+      Array<r> b;                  // ✗ r 是运行时变量 → 不是常量表达式
+
+  ── ★关键：把“编译期常量”挪到【函数参数】里，常量就变成了【变量】──────────────
+    函数参数永远是【运行时变量】：一份函数体要应对【任意实参】，编译器不能假设它是某个值，
+    所以参数在函数体里【不是常量表达式】——哪怕你调用时传的实参是 constexpr。
+
+      void f(int n) {              // n 是普通函数参数 = 运行时变量
+        Array<n> a;               // ✗ n 不是常量表达式 → 不能做模板实参
+        std::array<int, n> s;     // ✗ 同理
+        static_assert(n > 0);     // ✗ 同理
+      }
+      constexpr int C = 4;
+      f(C);                        // 即便传 constexpr C，进了 f，n 也只是运行时 int
+
+    原因：值被【拷贝】进来了，但“编译期可知”这个【属性没有跟着传进去】。
+          调用点的 C 是常量；函数内的 n 只是“用 C 的值初始化的一个运行时变量”。
+
+  ── 要在函数内保留“编译期常量”，别用函数参数，要用【模板参数】──────────────────
+      // ✗ 运行时参数：value 进来就成变量，不能做模板实参
+      void g(int value) { kernel<value>(); }                 // 编译错误
+
+      // ✓ 模板参数：N 编译期可知，可做模板实参
+      template <int N> void g() { kernel<N>(); }
+      g<128>();                                              // 把 128 作为编译期参数传入
+
+  ── 本项目：这正是 dispatch 用 switch 的根本原因 ──────────────────────────────
+    head_dim 是 int64_t【函数参数】→ 运行时值 → 不能直接 launch_kernel<..., head_dim>。
+    ROPE_DISPATCH_HEAD_DIM 用 switch 把“运行时参数”翻成“编译期常量”：
+
+      switch (head_dim) {                       // 运行时分发
+        case 128: {                             // ← 128 是【编译期常量】case 标签
+          constexpr uint headDIM = 128;         // ← 编译期常量
+          launch_kernel<..., headDIM>(...);     // ✓ headDIM 可做模板实参
+        }
+      }
+    同理 qkv.scalar_type()（运行时枚举值）也要先经 switch 落到 case，才用编译期常量枚举值
+    去实例化 ScalarTypeToCPPTypeT<enum_type>。本质都是“运行时值 → 编译期常量/类型”的桥
+    （见 docs/c++/scalartype_to_cpptype.txt、switch_case_fallthrough_and_warnings.txt）。
+
+  小结：模板实参 = 编译期常量；函数参数 = 运行时变量。把常量传进函数参数，常量性丢失、
+        退化成变量，就不能再做模板实参/数组大小/static_assert——要保留编译期性，用模板参数。
+
+
+================================================================================
+四、特化(specialization)：为特定实参给出“专门版本”
+================================================================================
+
+  主模板给“通用实现”，特化给“某些实参的特殊实现”。分两种：
+
+  ── (A) 全特化 full specialization：把【所有】模板参数都定死 ──────────────────
+    类模板、函数模板【都允许】。
+
+      // 类模板全特化
+      template <typename T> struct Hash { size_t operator()(const T&) const; };
+      template <> struct Hash<bool> { size_t operator()(bool b) const { return b; } };
+
+      // 函数模板全特化
+      template <typename T> void dump(T);
+      template <> void dump<int>(int) { /* int 专版 */ }
+
+  ── (B) 偏特化 partial specialization：只定死【部分】参数，其余仍是模板参数 ──
+    ★【只有类模板能偏特化；函数模板【不能】偏特化】★
+
+      // 类模板偏特化：合法
+      template <typename A, typename B> struct Pair { /* 通用 */ };
+      template <typename B>            struct Pair<int, B> { /* A 固定 int */ };  // ✓
+      template <typename T>            struct Pair<T, T>   { /* 两参相同 */ };    // ✓
+      template <typename T>            struct Box<T*>      { /* 指针特化 */ };    // ✓
+
+      // 函数模板偏特化：非法
+      template <typename A, typename B> void f(A, B);
+      template <typename B> void f<int, B>(int, B) { }   // ✗ 编译错误：函数模板不能偏特化
+
+  ── ★“函数模板不能偏特化”对【非类型参数】同样成立 ──────────────────────────
+    参数是“类型”还是“值(非类型)”都不影响：函数模板【一律不能偏特化】，只能全特化
+    （把【所有】参数——含非类型参——都定死）。
+
+      template <typename T, int N> void f(/*...*/);     // 类型参 T + 非类型参 N
+      template <> void f<int, 4>(/*...*/) { }           // ✓ 全特化：T、N 全部定死(N=4)
+      template <typename T> void f<T, 4>(/*...*/) { }   // ✗ 偏特化(只定 N=4，留 T) → 非法
+      template <int N> void f<int, N>(/*...*/) { }      // ✗ 偏特化(只定 T=int，留 N) → 非法
+
+    · 单个非类型参把它定死 = 全特化（允许），不是“偏”：
+        template <int N> void g();
+        template <> void g<4>() { }                     // ✓ 全特化(唯一参数 N 定成 4)
+    · 留下任何一个参数没定死（无论类型参还是非类型参）= 偏特化 → 函数模板不允许。
+
+    对照类模板：类模板对【非类型参】也能偏特化（这正是分水岭）：
+        template <typename T, int N> struct S { };
+        template <typename T> struct S<T, 4> { };       // ✓ 类模板按非类型值偏特化
+        template <int N>      struct S<int, N> { };      // ✓
+
+    ⚠ 想“按某个非类型值定制函数行为”时，注意【重载也帮不上】——不能写两个“只差一个
+      非类型值”的函数模板（无法按值重载）。可行路子见第五节：if constexpr / 委托类模板
+      （类模板可按值偏特化）/ tag dispatch（用 std::integral_constant<int,N> 把值变类型再重载）。
+
+
+================================================================================
+五、函数模板“想偏特化”怎么办：用重载 / 委托类模板 / if constexpr
+================================================================================
+
+  既然函数模板不能偏特化，要“对部分参数特化”，用下面三招之一：
+
+  (1) 函数重载(overload) —— 最常用
+      template <typename A, typename B> void f(A, B) { /* 通用 */ }
+      template <typename B>            void f(int, B) { /* A=int 版 */ }  // ✓ 重载，非特化
+      // 编译器按【重载决议 + 偏序】选更匹配者（注意别造成二义性）。
+
+  (2) 委托给类模板（类模板能偏特化）—— trait 的标准做法
+      template <typename A, typename B> struct FImpl { static void call(A,B){/*通用*/} };
+      template <typename B> struct FImpl<int,B> { static void call(int,B){/*A=int*/} }; // ✓
+      template <typename A, typename B> void f(A a, B b){ FImpl<A,B>::call(a,b); }
+      //   本项目 _typeConvert / packed_as / ScalarTypeToCPPType 都走这条：用【类模板特化】
+      //   做“类型→类型/值”的映射，正因为类模板能(全/偏)特化、能携带成员类型。
+
+  (3) C++17 if constexpr —— 单个模板内按编译期条件分支
+      template <typename A, typename B> void f(A a, B b) {
+        if constexpr (std::is_same_v<A,int>) { /* A=int 分支 */ }
+        else                                 { /* 通用分支 */ }
+      }
+
+
+================================================================================
+六、特化的硬性规则（易错点）
+================================================================================
+
+  1) 特化前【主模板必须先声明】：编译器要先知道“X 是个模板”，才能理解 X<...> 是在特化它。
+       template <typename T> struct X;        // 主模板（声明即可，不必定义）
+       template <> struct X<int> { ... };     // 特化依附于它
+     （详见 template_scope_alias_and_deduction.txt 附一。）
+
+  2) 主模板可以【只声明不定义】，当“白名单”：未特化的实参用了会“不完整类型”报错。
+       template <typename T> struct packed_as;            // 只声明
+       template <> struct packed_as<float,4>{using type=float4;};  // 只放支持的
+       // packed_as<其它> 会因不完整类型报错 → 起到“只允许特化过的类型”的作用。
+
+  3) 特化必须出现在【首次使用该实参实例化之前】，且与主模板【同一命名空间】。
+
+  4) 函数模板更推荐用【重载】而非全特化：函数模板全特化【不参与重载决议】、有反直觉规则，
+     易踩坑；多数场景用重载或委托类模板更稳。
+
+
+================================================================================
+七、类模板 vs 函数模板：对照表
+================================================================================
+
+  | 维度              | 函数模板                      | 类模板                          |
+  |-------------------|-------------------------------|---------------------------------|
+  | 生成什么          | 函数                          | 类型                            |
+  | 调用/使用写 <...> | 通常【不写】（实参推导）       | C++17 前【必须写】（CTAD 后可省）|
+  | 实参推导          | 有（从函数实参）              | 有限（C++17 CTAD）              |
+  | 全特化            | ✅ 允许                        | ✅ 允许                          |
+  | 偏特化            | ❌ 【不允许】                  | ✅ 允许                          |
+  | 携带成员类型      | 不便                          | ✅ 用 `using type = ...`（trait）|
+  | “对部分参数特化”  | 用重载 / 委托类模板 / ifconstexpr | 直接偏特化                   |
+
+  经验法则：
+    · 要“按类型/值选实现”，尤其需要【成员类型映射(type→type)】或【偏特化】→ 用【类模板】
+      (trait)。本项目的 _typeConvert / packed_as / ScalarTypeToCPPType 皆如此。
+    · 写“可对多类型通用的算法函数”、靠实参推导调用 → 用【函数模板】；要分流就用【重载】。
+
+
+================================================================================
+八、本项目实例串讲
+================================================================================
+
+  · packed_as<scalar_t, num>（类模板 + 全特化）：宽度→向量类型映射
+        template<typename T,uint N> struct packed_as;          // 主模板(只声明)
+        template<> struct packed_as<float,4>{using type=float4;};  // 全特化
+    用类模板，因为要 `using type = ...`（函数模板给不出成员类型）。
+
+  · ScalarTypeToCPPType<N>（类模板 + 全特化，X-macro 批量生成）：枚举值→C++类型
+        template<c10::ScalarType N> struct ScalarTypeToCPPType;  // 非类型模板参 N(枚举值)
+        template<> struct ScalarTypeToCPPType<...Half>{using type=c10::Half;};
+    同样靠成员类型 `type`，必须类模板。
+
+  · _typeConvert<T>（类模板 + 全特化）：torch 标量类型→CUDA 类型/转换函数(trait)
+        既给成员类型(hinType/hinType2)又给成员函数(convert)，是类模板特化的典型。
+
+  · throw_runtime<Msg>（函数模板，靠推导，不特化）：完美转发抛异常
+        无需特化——一份模板靠 std::forward 通吃所有 Msg 类型。
+
+  · 启动 kernel<scalar_t, headDIM>（函数/类模板的非类型参 headDIM）：
+        headDIM 必须编译期常量 → 由 dispatch 的 switch 从运行时 head_dim 翻译而来
+        （见 docs/c++/scalartype_to_cpptype.txt、switch_case_fallthrough_and_warnings.txt）。
+
+
+相关文件：
+    docs/c++/template_scope_alias_and_deduction.txt  —— 主模板必须先声明、实参推导、typename
+    docs/c++/scalartype_to_cpptype.txt               —— ScalarTypeToCPPType 类模板特化详解
+    docs/c++/std_forward.txt                         —— throw_runtime 完美转发
+    docs/c++/static_vs_dynamic_polymorphism.txt      —— 类模板特化 = 静态多态
+    src/typeConvert.cuh / src/dispatch.h             —— 实际代码
