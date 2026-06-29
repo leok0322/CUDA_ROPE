@@ -4,8 +4,11 @@
 #include <cuda_runtime.h>                      // float2/float4、uint(template<...,uint num>)；CUDA 基础类型
 #include <cuda_fp16.h>                          // __half/__half2 + fp16 intrinsics
                                                 //   (__half2float/__half22float2/__float2half_rn/__float22half2_rn)
+                                                //   ★也提供 __ldg(const __half*) 重载 → ROPE_LDG(cos/sin) 对 fp16 可用
 #include <cuda_bf16.h>                          // ★必需：__nv_bfloat16/__nv_bfloat162 + bf16 intrinsics
                                                 //   (__bfloat162float/__bfloat1622float2/__float2bfloat16_rn/__float22bfloat162_rn)
+                                                //   ★也提供 __ldg(const __nv_bfloat16*) 重载 → ROPE_LDG(cos/sin) 对 bf16 可用
+                                                //   (float 的 __ldg 由 cuda_runtime.h 内置；故 cos/sin 三种 T_cache 都有 __ldg)
                                                 //   —— 之前漏了它，bf16 特化全靠其它头“传递包含”才编过，脆弱。
 #include <torch/headeronly/util/Half.h>         // c10::Half        ← 轻量 headeronly 头
 #include <torch/headeronly/util/BFloat16.h>     // c10::BFloat16    ← 取代重型 <torch/extension.h>
