@@ -1,0 +1,188 @@
+================================================================================
+NVIDIA 命令行工具速查 + 架构↔SM(计算能力)↔显卡对应表 + 各架构新增功能
+（cp.async / CUDA Graph / Thread Block Cluster / Tensor Core / bf16 / fp8 / TMA …）
+================================================================================
+
+本机：NVIDIA GeForce RTX 3060 Laptop GPU，Ampere，计算能力 sm_86；
+      nvcc(Toolkit) CUDA 12.9，Driver 596.08（最高支持运行时 CUDA 13.2）。
+
+
+================================================================================
+一、nvidia-smi 常用命令
+================================================================================
+
+  nvidia-smi
+      默认表：GPU 名称 / 驱动版本 / 最高支持的 CUDA 版本 / 显存 / 功耗 / 利用率 / 进程。
+      ★注意：默认表【不含】计算能力(compute capability / SM)！要查见下。
+
+  nvidia-smi -L
+      简列每张 GPU 一行（名称 + UUID）。
+
+  nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
+      ★查【计算能力 compute_cap】(如 8.6) 等指定字段；--format=csv,noheader 去表头便于脚本解析。
+      （本项目 CMakeLists 正是用 `--query-gpu=compute_cap` 拿到 8.6 → 设 TORCH_CUDA_ARCH_LIST。）
+
+  nvidia-smi -q
+      全量详细信息（ECC、时钟、温度、PCIe、各进程显存…）；-q -d MEMORY 只看显存段。
+
+  nvidia-smi -i 0
+      只看 0 号 GPU；多卡时配合各命令使用。
+
+  nvidia-smi dmon
+      逐秒滚动监控（sm/mem 利用率、功耗、温度、时钟）；适合跑 kernel 时观察。
+
+  nvidia-smi pmon
+      按【进程】滚动监控各 GPU 上进程的 sm/mem 占用。
+
+  nvidia-smi topo -m
+      打印多 GPU / GPU-CPU 的互联拓扑（NVLink / PCIe / NUMA 亲和）。
+
+  nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+      列出正在用 GPU 的进程及其显存。
+
+  其它管理（需权限）：
+      nvidia-smi -pm 1                 持久模式（减少首次启动延迟）
+      nvidia-smi -pl 70                设功耗上限(W)
+      nvidia-smi -lgc 1500,1500        锁定 GPU 核心时钟（benchmark 去抖动很有用）
+      nvidia-smi -rgc                  解除时钟锁定
+      nvidia-smi mig -lgip             列出 MIG 实例规格（仅 A100/H100 等支持 MIG）
+
+  环境变量（不是 nvidia-smi，但常配套）：
+      CUDA_VISIBLE_DEVICES=0           只暴露 0 号卡给进程（改变程序看到的设备编号）
+      本项目脚本用的 DEVICE=0 → cudaSetDevice(0)。
+
+
+================================================================================
+二、nvcc / 架构编译参数
+================================================================================
+
+  nvcc --version            查 Toolkit 版本（本机 CUDA 12.9）。
+  nvcc --list-gpu-arch       列出本 nvcc 支持的 compute_XX（虚拟架构 PTX）。
+  nvcc --list-gpu-code       列出支持的 sm_XX（真实 SASS）。
+
+  指定目标架构：
+    nvcc -arch=sm_86 ...                          只为 sm_86 生成 SASS（最常用）
+    nvcc -gencode arch=compute_86,code=sm_86 ...   等价、更显式
+    多架构 fat binary：
+      -gencode arch=compute_80,code=sm_80
+      -gencode arch=compute_86,code=sm_86
+      -gencode arch=compute_86,code=compute_86    （附带 PTX，便于未来架构 JIT 向前兼容）
+
+  概念：compute_XX = 虚拟架构(生成 PTX)；sm_XX = 真实架构(生成 SASS 机器码)。
+        只带 PTX 时，新卡运行旧程序会在驱动里 JIT 编译 PTX → 向前兼容。
+
+  CMake（本项目）：
+    set(CMAKE_CUDA_ARCHITECTURES 86)  或  TORCH_CUDA_ARCH_LIST="8.6"
+    PyTorch 扩展据此决定为哪些架构编 kernel。
+
+
+================================================================================
+三、profiler 与其它工具
+================================================================================
+
+  nsys profile ./prog        Nsight Systems：系统级时间线（kernel/内存拷贝/CPU-GPU 重叠）。
+  ncu ./prog                 Nsight Compute：单 kernel 微架构指标（带宽、occupancy、stall 原因）。
+  ncu --set full -o rep ./prog   采全量指标存 rep.ncu-rep，用 ncu-ui 打开。
+  compute-sanitizer ./prog   内存越界/竞争检测（取代旧 cuda-memcheck）。
+  cuobjdump -sass a.out       反汇编看 SASS；nvdisasm 同类。
+  CUDA Samples 的 deviceQuery 也能打印 compute capability、SM 数、各项硬件上限。
+
+
+================================================================================
+四、架构 ↔ SM(计算能力) ↔ 代表显卡
+================================================================================
+
+  计算能力 = "major.minor"，编译写作 sm_<major><minor>（如 8.6 → sm_86）。
+  同一架构可有多个 minor（如 Ampere 有 8.0/8.6/8.7），功能/上限略有差别。
+
+  ┌────────────┬──────────────┬──────────────────────────────────────────────┐
+  │ 架构        │ SM(计算能力) │ 代表显卡                                       │
+  ├────────────┼──────────────┼──────────────────────────────────────────────┤
+  │ Fermi      │ 2.0 / 2.1    │ GTX 480/580、GTX 560                           │
+  │ Kepler     │ 3.0/3.5/3.7  │ GTX 680/780、Tesla K40/K80                     │
+  │ Maxwell    │ 5.0 / 5.2    │ GTX 750Ti、GTX 970/980、Titan X(Maxwell)       │
+  │ Pascal     │ 6.0 / 6.1    │ Tesla P100(6.0)、GTX 10 系/Titan Xp(6.1)       │
+  │ Volta      │ 7.0 / 7.2    │ V100、Titan V(7.0)；Jetson Xavier(7.2)         │
+  │ Turing     │ 7.5         │ RTX 20 系、GTX 16 系、Tesla T4、Quadro RTX     │
+  │ Ampere     │ 8.0         │ A100、A30（数据中心）                          │
+  │            │ 8.6         │ ★RTX 30 系、A10/A40/A16（★本机 RTX 3060=8.6）  │
+  │            │ 8.7         │ Jetson Orin                                    │
+  │ Ada Lovelace│ 8.9        │ RTX 40 系、L4、L40、RTX 6000 Ada               │
+  │ Hopper     │ 9.0         │ H100、H200、GH200（数据中心）                  │
+  │ Blackwell  │ 10.0（较新） │ B100/B200/GB200（数据中心）                    │
+  │            │ 12.0（较新） │ RTX 50 系（消费，如 RTX 5090）                 │
+  └────────────┴──────────────┴──────────────────────────────────────────────┘
+
+  规律：消费显卡和数据中心卡常分属不同 minor（如 Ampere：数据中心 8.0 vs 消费 8.6；
+        Blackwell：数据中心 10.0 vs 消费 12.0），功能集（FP8/TMA/cluster 等）以
+        【具体 SM】为准，不能只看"同代架构"。
+
+
+================================================================================
+五、各架构新增功能 ↔ 最低 SM 要求
+================================================================================
+
+★先分清两类"支持"：
+  · 【硬件特性，按 SM 门控】：cp.async、bf16、TMA、cluster… → 要求 GPU 的【计算能力】达标，
+    且代码里常用 `#if __CUDA_ARCH__ >= XXX` 分支（如 cp_async_shared_global_ca 的 800 分支）。
+  · 【软件/驱动特性，按 CUDA 版本】：CUDA Graph(host 构图重放)等 → 看 CUDA Toolkit/Driver 版本，
+    几乎所有还被支持的卡都能用，【不】按 SM 门控（细节见下）。
+
+  ── 按 SM 解锁的硬件特性 ──────────────────────────────────────────────────────
+
+  SM 7.0 (Volta)：
+    · Tensor Core 第 1 代（FP16 矩阵乘累加，wmma API）
+    · 独立线程调度(Independent Thread Scheduling) → __shfl_*/__ballot 等必须带 _sync
+
+  SM 7.5 (Turing)：
+    · Tensor Core 增 INT8 / INT4（推理量化）
+
+  SM 8.0 (Ampere，含 8.6/8.7)：
+    · ★cp.async：global→shared 异步拷贝(绕寄存器)，配 commit_group/wait_group 做双缓冲
+      （本项目 async_util.cuh 的 cp.async.ca/.cg 分支即要求 __CUDA_ARCH__>=800）
+    · ★bfloat16 原生算术（__nv_bfloat16）；Tensor Core 增 TF32、BF16、2:4 结构化稀疏
+    · 异步 barrier（mbarrier / cuda::barrier 的 arrive-wait）
+    · L2 cache 驻留控制（access policy window，把热数据钉在 L2）
+
+  SM 8.9 (Ada Lovelace)：
+    · FP8（E4M3 / E5M2）Tensor Core；更大 L2
+
+  SM 9.0 (Hopper)：
+    · ★Thread Block Cluster（线程块簇）+ Distributed Shared Memory(DSMEM)：
+      一簇 block 可跨 SM 互访彼此的 shared memory，cluster 级同步
+    · ★TMA（Tensor Memory Accelerator，cp.async.bulk / bulk tensor copy）：
+      硬件批量张量搬运（多维、自动地址计算），比 cp.async 更强
+    · Transformer Engine（FP8 动态缩放）；线程束组 wgmma
+    · ★Device Graph Launch：可【从设备端】启动 CUDA Graph（host 端 graph 见下，不同事）
+
+  SM 10.0 / 12.0 (Blackwell，较新)：
+    · 第 5 代 Tensor Core，新增 FP4 / FP6 微缩放格式；第 2 代 Transformer Engine；TMA 增强
+
+  ── 与 SM 关系不大的"软件特性"（易混淆，单列澄清）──────────────────────────────
+
+  · CUDA Graph（主机端：把一串 kernel/拷贝录成图，一次 launch 重放，省 CPU launch 开销）：
+      是 CUDA 10.0(2018) 起的【运行时/驱动特性】，凡支持该 CUDA 版本的 GPU（Kepler 及以后）
+      基本都能用，【不】按计算能力门控。本项目 torch.compile 的 CUDA Graph 即属此类。
+      （区别：上面 Hopper 的 "Device Graph Launch" = 从【设备端】启动图，那个才要 SM 9.0。）
+  · Cooperative Groups 的 grid 级同步(grid.sync)：需 SM 6.0+ 且用 cooperative launch。
+  · Warp 级原语 __shfl_*_sync / __ballot_sync：SM 3.0+ 即有；Volta(7.0) 起必须用 _sync 版本。
+
+
+================================================================================
+六、本机落点（RTX 3060 Laptop, sm_86, Ampere）
+================================================================================
+
+  · 编译目标：sm_86（CMake 经 `nvidia-smi --query-gpu=compute_cap` 自动探测到 8.6）。
+  · ✅ 支持：cp.async（async_util.cuh 走 >=800 硬件分支）、bfloat16、TF32、异步 barrier、
+            L2 驻留控制、第 3 代 Tensor Core、CUDA Graph（软件特性，本就可用）。
+  · ❌ 不支持（需 Hopper 9.0+）：Thread Block Cluster / DSMEM、TMA(cp.async.bulk)、
+            FP8 Tensor Core(需 Ada 8.9 / Hopper 9.0)、Device Graph Launch。
+  · 故本项目 fused kernel 用到的 __shfl_xor_sync(7.0+)、（如启用）cp.async(8.0+) 都在 8.6 范围内；
+    而 cluster/TMA 这类 Hopper 特性在本机用不了，相关代码若有须有 SM 门控回退。
+
+
+相关：
+  src/inference/async_util.cuh                     —— cp.async 封装（__CUDA_ARCH__>=800 分支）
+  docs/cuda/shfl_xor_sync.txt                      —— warp shuffle 规约（7.0+ 的 _sync 语义）
+  docs/cuda/gpu_hardware_constraints.txt           —— 每 block/SM 的线程/寄存器/SMEM 上限
+  CMakeLists.txt                                   —— nvidia-smi 探测 compute_cap → TORCH_CUDA_ARCH_LIST
