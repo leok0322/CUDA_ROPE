@@ -1,0 +1,266 @@
+================================================================================
+设备指针(cudaMalloc) vs 设备符号(__device__/__constant__)
+——host 端如何写入二者，差异与示例
+================================================================================
+
+核心一句话：
+  · 【设备指针】= cudaMalloc 返回、存在 host 变量里的一个值，这个【值本身就是设备地址】
+    → 直接用 cudaMemcpy(dptr, ...) 写。
+  · 【设备符号】= __device__ / __constant__ 静态声明的设备全局变量，按【名字】引用；host 端
+    只有它的占位 stub，&sym 是【主机地址】、不是设备地址
+    → 必须用 cudaMemcpyToSymbol(sym, ...) 写（让 runtime 由符号解析真实设备地址）。
+  二者【不能互换】写法。
+
+
+================================================================================
+一、两类"设备数据句柄"的本质区别
+================================================================================
+
+  ┌────────────┬──────────────────────────────┬──────────────────────────────┐
+  │            │ 设备指针(device pointer)      │ 设备符号(device symbol)       │
+  ├────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ 怎么来的    │ cudaMalloc(&dptr, n)         │ __device__/__constant__ 全局声明 │
+  │ host 端是啥 │ 一个 float*，其【值=设备地址】│ 一个【符号】，host 仅有占位 stub │
+  │ 设备地址何来│ cudaMalloc 运行时分配并写入   │ 模块加载到设备时由驱动定位     │
+  │ &它 是什么  │ &dptr = 存指针的 host 变量地址│ &sym = host 占位对象的【主机地址】│
+  │ 传给拷贝函数│ 传【dptr 的值】(= 设备地址)   │ 传【符号本身】(由名字解析)     │
+  │ 写入 API    │ cudaMemcpy(dptr, ...)        │ cudaMemcpyToSymbol(sym, ...)  │
+  └────────────┴──────────────────────────────┴──────────────────────────────┘
+
+  关键：cudaMemcpy 只认【裸设备地址】、不做符号解析。
+        - dptr 的值【就是】设备地址 → 直接可用；
+        - &sym 是【主机地址】→ 当成设备地址用会报错/写错，到不了设备内存。
+
+
+================================================================================
+二、设备指针：cudaMalloc + cudaMemcpy（最常见）
+================================================================================
+
+  float* dA = nullptr;
+  // cudaMalloc 第一参是 void**：把分配到的【设备地址】写进 host 变量 dA
+  cudaCheck(cudaMalloc(reinterpret_cast<void**>(&dA), sizeof(float) * N));
+
+  // H2D：dst = dA，dA 的【值】就是设备地址 → 合法
+  cudaCheck(cudaMemcpy(dA, hA, sizeof(float) * N, cudaMemcpyHostToDevice));
+
+  kernel<<<grid, block>>>(dA);                  // 把设备地址传给 kernel
+
+  // D2H：读回
+  cudaCheck(cudaMemcpy(hOut, dOut, sizeof(float) * N, cudaMemcpyDeviceToHost));
+  cudaCheck(cudaFree(dA));
+
+  注意：dA 是"装着设备地址的指针变量"。传 cudaMemcpy 的是【dA 的值】，不是 &dA。
+        （&dA 是"存这个指针的 host 变量"的地址，也不是设备地址。）
+
+
+================================================================================
+三、设备符号：__constant__ / __device__ + cudaMemcpyToSymbol
+================================================================================
+
+  __constant__ float c_coef[256];     // 常量内存符号（设备端只读，host 写）
+  __device__   float g_table[1024];   // 设备全局内存符号
+  __device__   int   g_flag;
+
+  // host：必须用 ToSymbol（传【符号】，不是 &符号）
+  cudaCheck(cudaMemcpyToSymbol(c_coef,  hCoef,  sizeof(float) * 256));
+  cudaCheck(cudaMemcpyToSymbol(g_table, hTable, sizeof(float) * 1024));
+  cudaCheck(cudaMemcpyToSymbol(g_flag,  &hFlag, sizeof(int)));
+
+  // ✗ 错误写法：&c_coef 是主机地址，cudaMemcpy 当设备地址用 → invalid argument / 写错
+  // cudaMemcpy(&c_coef, hCoef, sizeof(float)*256, cudaMemcpyHostToDevice);   // 不要这样
+
+  签名（有默认参数）：
+    cudaError_t cudaMemcpyToSymbol(const void* symbol, const void* src,
+                                   size_t count, size_t offset = 0,
+                                   cudaMemcpyKind kind = cudaMemcpyHostToDevice);
+    · offset：写符号内部偏移处（只更新一部分）；
+    · kind：默认 H2D，也可 cudaMemcpyDeviceToDevice（src 为设备指针时）。
+
+  为什么必须这样：c_coef 的真实设备地址在【模块加载到某 GPU 时由驱动决定】，host 编译期不知道；
+    runtime 维护"符号→(当前设备上)设备地址"的注册表，ToSymbol 据此查到地址再拷。
+
+  ── 符号的可见范围：默认【.cu 内可见】(类内链接)，跨 .cu 需 extern + -rdc(类外链接)────
+   · 默认(whole-program 编译, -rdc=false)：每个 .cu 各自把 __device__/__constant__ 符号编进
+     【自己的设备模块】，互不共享 —— 效果【类似内链接(internal linkage)】：哪怕两个 .cu 写了
+     同名符号，也是各自独立的两份，cudaMemcpyToSymbol 只动当前 TU 这份。
+   · 跨 .cu 共享同一个符号 —— 效果【类似外链接(external linkage)】，须两件事齐备：
+       ① 一个 .cu【定义】，其它 .cu 用 extern【声明】(只声明不分配)；
+       ② 开【可重定位设备代码】并做 device link：nvcc -rdc=true（CMake：set_target_properties(
+          tgt PROPERTIES CUDA_SEPARABLE_COMPILATION ON)）。否则 extern 链接不上 / 退化成各自一份。
+   · 说明：是"效果类似"——host C++ 里命名空间作用域变量本是外链接，但【设备代码】默认按模块/TU
+     生成，不开 -rdc 时设备侧符号不跨 TU 解析，故表现得像内链接。
+
+   示例（跨 .cu 共享一个 __constant__）：
+     // a.cu —— 定义（分配这份常量）
+     __constant__ float c_coef[256];
+     __global__ void useA() { float v = c_coef[threadIdx.x]; }
+
+     // b.cu —— extern 声明，引用 a.cu 里那【同一个】符号
+     extern __constant__ float c_coef[256];          // 只声明，不再分配
+     __global__ void useB() { float v = c_coef[blockIdx.x]; }
+
+     // host（任意 .cu）：仍用 ToSymbol 写那一份
+     cudaMemcpyToSymbol(c_coef, hCoef, sizeof(float) * 256);
+
+     // 编译（必须 -rdc=true，否则 b.cu 的 extern c_coef 链接错误 / 各自一份）：
+     //   nvcc -rdc=true a.cu b.cu -o app
+     //   CMake：set_target_properties(app PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+   ⟹ 不开 -rdc：符号【.cu 内可见】(类内链接)，跨 .cu 同名也是两份；
+      开 -rdc + extern：符号【跨 .cu 共享一份】(类外链接)。
+      （这与第六篇 l1_constant_readonly_cache.txt "模块 vs 设备" 一致：模块=编译链接到一起的
+        设备代码，-rdc 正是把多 .cu 的设备代码链成一个模块，符号才跨 .cu 解析。）
+
+
+================================================================================
+四、配套 API（同一套符号机制）
+================================================================================
+
+  cudaMemcpyFromSymbol(dst, sym, count[, offset, kind]);  // 从符号【读回】host/device
+  cudaGetSymbolAddress(&dptr, sym);   // 取符号在【当前设备】上的真实设备地址
+  cudaGetSymbolSize(&bytes, sym);     // 取符号字节数
+
+  "手动等价"（看清 ToSymbol 内部在干嘛）：
+    void* dptr;
+    cudaGetSymbolAddress(&dptr, c_coef);                 // 符号 → 真实设备地址
+    cudaMemcpy(dptr, hCoef, n, cudaMemcpyHostToDevice);  // 这才是合法设备地址
+  ⟹ cudaMemcpyToSymbol = "符号查地址 + memcpy" 两步合一，推荐直接用它。
+
+
+================================================================================
+五、哪些情形【不需要】符号 API
+================================================================================
+
+  · cudaMalloc 的设备指针(如 dA)        → 普通 cudaMemcpy（dptr 的值就是设备地址）
+  · cudaMallocManaged 统一内存(托管指针) → host 直接读写，通常无需 cudaMemcpy（自动迁移）
+  · __managed__ 变量(托管符号)           → host 可【直接赋值】，无需 ToSymbol（例外！）
+  · kernel 实参 <<<>>>(args)             → runtime 自动放进常量 bank，不用你 copy
+
+  判据：要写"静态声明、按名引用的设备全局符号"(__device__/__constant__ 且非 __managed__)
+        → 用 cudaMemcpyToSymbol；其余(裸设备指针/托管/实参)各按各的来。
+
+
+================================================================================
+六、★__managed__（托管变量）：为什么 host 端是"可直接用的地址"而非"占位符号"
+================================================================================
+
+  声明：__managed__ float m_buf[256];   （等价 __device__ __managed__ float m_buf[256];）
+
+  ── 一句话 ──────────────────────────────────────────────────────────────────
+  __managed__ 变量住在【统一内存(Unified Memory)】里，有一个【host 与 device 共用的、真实可用
+  的统一虚拟地址(UVA)】。所以在 host 代码里 m_buf / &m_buf 是【真地址、能直接解引用】——
+  host 直接按名读写即可，【不需要】cudaMemcpyToSymbol。这正是它和普通 __device__/__constant__
+  符号的根本差别。
+
+  ── 为什么普通符号"不是地址"、而 __managed__"是地址" ────────────────────────────
+  · 普通 __device__/__constant__：数据只在【设备专属内存】里。host 端的名字只是个【占位 stub】，
+    &sym 是【主机地址】、压根不指向设备内存 → host 不能直接解引用，必须经 cudaMemcpyToSymbol
+    让 runtime 由"符号"查出设备地址再拷（"符号"语义）。
+  · __managed__：数据在【统一内存】里，host 和 device 看到的是【同一个 UVA 地址】。runtime 把
+    这个符号的存储直接落在该统一地址上 → host 端 m_buf 就是那块真实内存、&m_buf 就是可用指针，
+    host 直接读写、kernel 也用同一地址访问，缺页时由系统【自动在 host/device 间迁移页】。
+    ⟹ 对 host 而言它表现得像"一个普通可寻址变量(地址)"，而不是"要 ToSymbol 解析的符号"。
+
+  （严格说：__managed__ 在【链接/可见性】层面【仍是符号】——见下一条；"是地址不是符号"是就
+    "host 如何访问它"而言：有真实统一地址、可直接访问，无需符号拷贝 API。）
+
+  ── 使用示例 ────────────────────────────────────────────────────────────────
+    __managed__ int  m_flag;            // 托管标量
+    __managed__ float m_buf[256];       // 托管数组
+
+    __global__ void k() {
+        m_buf[threadIdx.x] *= 2.0f;     // device 直接按名访问同一地址
+        if (threadIdx.x == 0) m_flag = 42;
+    }
+
+    int main() {
+        for (int i = 0; i < 256; ++i) m_buf[i] = i;   // ★host 直接写，无需 cudaMemcpy*
+        k<<<1, 256>>>();
+        cudaDeviceSynchronize();                       // ★必须：等 kernel 写完，再 host 读(见下)
+        printf("%d %f\n", m_flag, m_buf[0]);           // ★host 直接读
+    }
+
+  对比普通符号（必须拷贝）：
+    __device__ float d_buf[256];
+    // host：d_buf[i] = i;            // ✗ 非法：host 不能直接访问设备符号
+    cudaMemcpyToSymbol(d_buf, h, sizeof(float)*256);   // 只能这样
+
+  ── 注意事项 ────────────────────────────────────────────────────────────────
+  · 同步：kernel 可能正在读写托管内存，host 在【kernel 之后访问前必须 cudaDeviceSynchronize()】
+    (Pascal+ 支持并发缺页，但正确性仍要同步；老架构/部分平台 kernel 运行期间 host 访问直接非法)。
+    ↓ 详见下方"同步与并发访问"专栏。
+  · 硬件/平台：需统一内存支持(计算能力 ≥3.0，6.0+ 体验最佳)；本机 sm_86 支持。
+  · 链接可见性仍是【符号】那套：默认 .cu 内可见，跨 .cu 共享同一个 __managed__ 仍需
+    `extern __managed__ ...` + 可重定位设备代码(-rdc=true)（见第三节"可见范围"小节）。
+  · 它解决的是"host/device 同一地址、自动迁移、免显式拷贝"，代价是迁移有运行时开销、且需同步；
+    性能关键路径仍常用 cudaMalloc + 显式 cudaMemcpy（如本项目 validation.cu）。
+
+  ── 同步与并发访问：两代统一内存模型（kernel 运行期间 host 能否碰托管内存）────────────
+   关键设备属性：concurrentManagedAccess（1=CPU/GPU 可并发访问托管内存）。
+     查询：cudaDeviceGetAttribute(&v, cudaDevAttrConcurrentManagedAccess, dev) 或
+           cudaGetDeviceProperties(&p,dev); p.concurrentManagedAccess。本机 sm_86/Linux = 1。
+
+   (A) 老架构 / concurrentManagedAccess==0（Pascal 之前；或 Windows-WDDM 等）：
+       整块迁移模型——kernel 启动时把托管内存整体迁到 GPU 并【解除 CPU 端页映射】。
+       ⟹ 只要有 kernel 在跑，host 读/写【任何】托管内存 = 段错误/【直接非法】(时机违规)。
+          必须 cudaDeviceSynchronize() 后(内存迁回、CPU 页重映射)才能 host 访问。
+
+   (B) Pascal+(sm_60+) / concurrentManagedAccess==1（典型 Linux）：
+       硬件页错误 + 按需(按页)迁移 ⟹ host【可以】在 kernel 运行期间访问托管内存(缺页即迁)，
+       访问时机不再非法。
+
+   ★但"并发缺页 ≠ 免同步"：缺页只解决"页在哪"，不解决"读写先后(happens-before)"。
+     只要有 host↔kernel 的【数据依赖】(kernel 写、host 读)，仍必须同步，否则是数据竞争：
+
+       __managed__ float m_buf[256];
+       __global__ void k() { m_buf[threadIdx.x] *= 2.0f; }   // kernel 异步写
+
+       k<<<1,256>>>();
+       // float v = m_buf[0];        // ✗ 不同步：与 kernel 写竞争 → 读到旧值/UB
+       cudaDeviceSynchronize();      // ✓ 建立 happens-before：kernel 写完 → host 再读
+       float v = m_buf[0];           // ✓ 此时保证看到 kernel 的结果
+
+     不同步的后果：老架构(A) = 崩/非法；Pascal+(B) = 数据竞争、读到旧值(UB)。
+
+   对照：
+     |                         | 老架构 / ==0        | Pascal+ / ==1        |
+     | kernel 运行时 host 访问 | 非法(段错误)        | 允许(缺页迁移)        |
+     | 不同步的后果            | 崩/非法             | 竞争/读旧值(UB)       |
+     | 是否仍需同步            | 必须                | 仍需                  |
+
+   实践结论：不论哪代，**host 要读 kernel 写过的托管数据，都先 cudaDeviceSynchronize()**
+            （上面"使用示例"里 kernel 后那行同步即为此）；区别只在不同步时是"崩"还是"读旧值"。
+
+  小结：__managed__ = "符号的声明形式" + "统一内存的存储" → host 端拿到的是【真实统一地址、可直接
+        访问】，故【免 cudaMemcpyToSymbol】；而普通 __device__/__constant__ 的 host 名字只是占位，
+        必须经符号拷贝 API。host↔kernel 有数据依赖时仍须 cudaDeviceSynchronize() 同步。
+
+
+================================================================================
+七、对照速查
+================================================================================
+
+  目标                              | 写法
+  ----------------------------------|--------------------------------------------
+  cudaMalloc 的设备指针 dA          | cudaMemcpy(dA, h, n, H2D)
+  __constant__ / __device__ 符号    | cudaMemcpyToSymbol(sym, h, n)
+  从符号读回                        | cudaMemcpyFromSymbol(h, sym, n)
+  托管内存(cudaMallocManaged/__managed__) | 直接读写，一般免 cudaMemcpy
+  kernel 实参                       | <<<>>>(args) 直接传
+
+  易错点：dA 传【值】(设备地址) ✓；sym 不能传 &sym(主机地址) ✗，要传符号本身。
+
+
+================================================================================
+八、本项目落点
+================================================================================
+
+  · src/validation.cu：用 cudaMalloc + cudaMemcpy(dA/dout/..., cudaMemcpyHostToDevice/…)
+    —— 经典"设备指针 + 显式拷贝"模型，dA 的值就是设备地址，故直接 cudaMemcpy（非统一内存）。
+  · 本项目当前未用 __constant__/__device__ 全局符号；若日后把 RoPE 的常量(如 base/theta 表)
+    或一组 kernel 参数放进 __constant__，则需改用 cudaMemcpyToSymbol 写入。
+
+相关：
+  docs/cuda/l1_constant_readonly_cache.txt          —— __constant__ 与常量缓存、作用域/设备维度
+  docs/cuda/nvidia_cli_arch_sm_and_features.txt     —— 统一内存等内存模型背景
+  src/validation.cu                                 —— cudaMalloc + cudaMemcpy 的实际用法

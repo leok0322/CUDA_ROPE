@@ -1,0 +1,131 @@
+================================================================================
+两个易混淆的宏：__CUDA_ARCH__（编译器内置）vs USE_ROCM（构建系统注入）
+——它们各由谁定义、何时有定义、表示什么、怎么用
+================================================================================
+
+背景：src/inference/async_util.cuh 等(从 vLLM 搬来的)代码里常见这种多分支：
+    #if   defined(USE_ROCM)                          // AMD 路径
+    #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800   // NVIDIA Ampere+
+    #elif defined(__CUDA_ARCH__)                     // 更老的 NVIDIA 设备
+    #else                                            // 主机编译
+    #endif
+  这里 __CUDA_ARCH__ 和 USE_ROCM 性质完全不同，下面分别说清。
+
+
+================================================================================
+一、__CUDA_ARCH__ —— nvcc 的【内置预定义宏】
+================================================================================
+
+  · 谁定义：**nvcc 编译器内置预定义**，你只能【测试】它，不需要也不应自己定义。
+  · 何时有定义：**只在【设备代码】编译 pass 里有**；**主机(host)编译 pass 里【未定义】**。
+    （nvcc 对一个 .cu 至少编译两类 pass：host pass 无 __CUDA_ARCH__；device pass 有。
+      若 -gencode 指定多架构，device pass 会【按每个架构各编一遍】，每遍取对应值。）
+  · 值：整数 = **100*major + 10*minor**（三位数形式）：
+        sm_70→700  sm_75→750  sm_80→800  sm_86→860  sm_89→890  sm_90→900
+        （所以判 `__CUDA_ARCH__ >= 800` 意为 "Ampere(8.0) 及以后"。本机 sm_86 → 860。）
+  · 表示：当前正在为【哪个目标计算能力】编译设备代码 / 当前是否处于设备编译。
+
+  两个核心用途：
+
+  (1) 区分【设备 vs 主机】代码（因为 host pass 里它没定义）：
+        __host__ __device__ void f() {
+        #if defined(__CUDA_ARCH__)
+            // 设备端：可用 GPU intrinsic / 内联 PTX
+        #else
+            // 主机端：普通 CPU 实现（如 async_util.cuh 的 #else 空实现）
+        #endif
+        }
+
+  (2) 按【目标架构】选 intrinsic / 指令（不同架构编出不同实现）：
+        #if __CUDA_ARCH__ >= 800
+            asm volatile("cp.async.ca.shared.global ...");   // Ampere+ 才有
+        #else
+            /* 老架构同步拷贝回退 */
+        #endif
+
+  注意事项：
+    · 别用它去改变【函数签名 / 跨 host-device 可见的行为】——host pass 看不到它，会造成
+      host/device 不一致甚至 ODR 问题；只用它【选实现细节(intrinsic/PTX/回退)】。
+    · 它【不是】运行时判断：是【编译期】按目标架构裁剪代码。运行时查能力用
+      cudaDeviceProp.major/minor 或 cudaDeviceGetAttribute。
+
+
+================================================================================
+二、USE_ROCM —— 【构建系统注入】的宏（非编译器内置）
+================================================================================
+
+  · 谁定义：**不是 CUDA/编译器内置**，而是【构建系统注入】——通常 PyTorch / vLLM 在构建
+    **ROCm/HIP(AMD) 后端**时用 `-DUSE_ROCM` 编译选项加上。
+  · 表示："**当前在为 AMD ROCm/HIP 编译，而不是 NVIDIA CUDA**"。
+  · 何时有定义：取决于【构建配置】——选 ROCm 后端构建时整段编译都有；选 CUDA 时没有。
+  · 用途：CUDA 代码经 "hipify" 后可在 AMD GPU 上跑，但两边并非处处等价（如 AMD 无 NVIDIA 的
+    `cp.async`、`__ldg` 等），用 USE_ROCM 分流到 AMD 合适的【回退实现】。
+
+  例（src/inference/cuda_compat.h）：
+    #ifndef USE_ROCM
+    #define VLLM_LDG(arg) __ldg(arg)     // NVIDIA：只读缓存加载
+    #else
+    #define VLLM_LDG(arg) *(arg)         // AMD：普通解引用
+    #endif
+
+  本项目：**只面向 NVIDIA，从不定义 USE_ROCM** → 所有 `#if defined(USE_ROCM)` 分支都是
+    【永不编译的死代码】，纯粹是从 vLLM 上游搬代码时一并带来的跨平台样板。
+
+
+================================================================================
+三、对照表
+================================================================================
+
+  ┌────────────┬──────────────────────────────┬──────────────────────────────┐
+  │            │ __CUDA_ARCH__                 │ USE_ROCM                      │
+  ├────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ 谁定义      │ nvcc【内置预定义】           │ 构建系统【-D 注入】(PyTorch/vLLM) │
+  │ 何时有定义  │ 仅【设备代码】编译 pass      │ 该构建选了 ROCm 后端时(整个编译) │
+  │ 有没有值    │ 有：100*major+10*minor       │ 一般【无值】，只看 defined 与否 │
+  │ 表示        │ 目标计算能力 / 处于设备编译  │ 目标后端是 AMD ROCm/HIP       │
+  │ 典型用途    │ host vs device；按架构选实现 │ NVIDIA vs AMD（移植回退）     │
+  │ 运行时还是编译期 │ 编译期裁剪              │ 编译期裁剪                    │
+  │ 本项目      │ 设备代码里用(如 >=800 走cp.async) │ 从不定义；AMD 分支是死代码 │
+  └────────────┴──────────────────────────────┴──────────────────────────────┘
+
+
+================================================================================
+四、典型多分支：为什么这样排序
+================================================================================
+
+  #if   defined(USE_ROCM)                                 // ① AMD 先判
+      ...AMD 回退(同步拷贝 / 普通解引用)...
+  #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800    // ② NVIDIA Ampere+ 设备
+      ...cp.async / 新 intrinsic...
+  #elif defined(__CUDA_ARCH__)                            // ③ 更老的 NVIDIA 设备
+      ...老架构回退...
+  #else                                                   // ④ 主机编译(无 __CUDA_ARCH__)
+      ...host 空实现 / CPU 实现...
+  #endif
+
+  · USE_ROCM 放最前：确保 **AMD 一定走 AMD 分支**，不依赖 __CUDA_ARCH__ 在 HIP 下是否/如何定义。
+  · 然后才按 __CUDA_ARCH__ 区分 NVIDIA 的新/老设备架构。
+  · 最后 #else 兜住主机 pass（__CUDA_ARCH__ 未定义、也非 ROCm）。
+
+
+================================================================================
+五、相关的其它宏（顺带认识，便于读 vLLM/HIP 代码）
+================================================================================
+
+  · __CUDACC__        ：用 nvcc 编译 .cu 时定义（host+device 两 pass 都有）→ 区分"是否 nvcc 编的"。
+  · __NVCC__          ：nvcc 定义。
+  · __HIPCC__         ：用 hipcc 编译时定义。
+  · __HIP_PLATFORM_AMD__ / __HIP_PLATFORM_NVIDIA__ ：HIP 的目标平台。
+  · __HIP_DEVICE_COMPILE__ ：HIP 里【设备编译 pass】的标志（≈ AMD 侧的 __CUDA_ARCH__ 角色）。
+
+  小结口径：
+    · "是不是设备代码 / 哪个 NV 架构" → __CUDA_ARCH__（内置、设备 pass、有值）。
+    · "是不是 AMD 后端" → USE_ROCM（注入、按构建配置）。
+    · 二者正交：一个管【架构/编译 pass】，一个管【后端平台】。
+
+
+相关：
+  src/inference/async_util.cuh        —— USE_ROCM / __CUDA_ARCH__>=800 多分支(cp.async)
+  src/inference/cuda_compat.h         —— USE_ROCM 分流的 VLLM_LDG 等
+  docs/cuda/nvidia_cli_arch_sm_and_features.txt  —— 计算能力↔架构、各 SM 特性
+  docs/cuda/l1_constant_readonly_cache.txt       —— __ldg / 只读缓存(被 VLLM_LDG 包装)

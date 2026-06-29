@@ -1,0 +1,257 @@
+================================================================================
+CUDA_ROPE 编译流程与命令行详解
+（配置阶段 → 编译阶段；CMake 变量 → 编译器 -D 宏 的桥梁；CLion 四操作；两个 target）
+================================================================================
+
+本项目两个产物（target）：
+  · ROPE_cuda  ：Python 扩展共享库（无 main()，由 python `import ROPE_cuda` dlopen 加载）
+                 → 输出到【项目根】ROPE_cuda.cpython-313-x86_64-linux-gnu.so
+  · validation ：C++ 基准/校验可执行（有 main()，`./validation <kernel_num>` 直接跑）
+                 → 输出到【项目根】./validation
+
+构建目录：cmake-build-release/（CMakeCache.txt / build.ninja / .o 在此；.so 和 validation 落项目根）。
+
+
+================================================================================
+一、完整流水线（以 cmake -DROPE_VARIANT=2 -DBLOCK_SIZE=512 为例）
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ 阶段一：配置阶段（CLion 的 "Reload CMake Project"）                          │
+│ 触发命令：                                                                   │
+│   cmake -DROPE_VARIANT=2 -DBLOCK_SIZE=512                                    │
+│         -DCMAKE_BUILD_TYPE=Release                                           │
+│         -DCMAKE_PREFIX_PATH=<venv>/lib/python3.13/site-packages/torch/share/cmake │
+│         -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv        │
+│         -G Ninja                                                            │
+│         -S /home/liam/cpp_linux/CUDA_ROPE                                   │
+│         -B /home/liam/cpp_linux/CUDA_ROPE/cmake-build-release               │
+└────────────────────────────────────────────────────────────────────────────┘
+      │  -D 标志写入 CMakeCache.txt：ROPE_VARIANT="2"、BLOCK_SIZE="512"、CMAKE_BUILD_TYPE="Release" …
+      ▼  cmake 逐行执行 CMakeLists.txt：
+
+  CMakeLists.txt 命令                          配置阶段做的事
+  ──────────────────────────────────────────────────────────────────────────
+  set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")  锁定 nvcc 路径
+  set(CMAKE_CXX_COMPILER  "/usr/bin/g++")              锁定 g++ 路径
+  project(CUDA_ROPE LANGUAGES CXX CUDA)                探测 g++/nvcc，启用两语言
+  find_package(CUDAToolkit REQUIRED)                   CUDAToolkit_INCLUDE_DIRS、CUDA::cudart
+  find_package(Python3 ... Interpreter Development)    Python3_EXECUTABLE / Python3_INCLUDE_DIRS
+  execute_process(nvidia-smi --query-gpu=compute_cap)  _GPU_CC="8.6"
+  (string REPLACE)                                     _GPU_CC_NUM="86"
+  set(TORCH_CUDA_ARCH_LIST "8.6")                      ★必须在 find_package(Torch) 之前
+  unset(CMAKE_CUDA_ARCHITECTURES CACHE)                避免 Torch 的 architectures 警告
+  find_package(Torch REQUIRED)                         TORCH_INCLUDE_DIRS / TORCH_LIBRARIES /
+                                                       TORCH_CXX_FLAGS(-D_GLIBCXX_USE_CXX11_ABI=1)
+  set(CMAKE_CUDA_ARCHITECTURES 86)                     → build.ninja: -gencode arch=compute_86,code=sm_86
+  find_library(TORCH_PYTHON_LIBRARY ...)               libtorch_python.so 路径
+  set(CMAKE_CXX_STANDARD 20)                           全局 C++20（.cpp 继承）
+
+  set(ROPE_VARIANT 1 CACHE STRING "")                  cache 已有 "2"(-D 传入) → 不覆盖
+  set(BLOCK_SIZE   256 CACHE STRING "")                cache 已有 "512" → 不覆盖
+      （cache 无值时才写默认；优先级见第三节）
+
+  add_compile_options(                                 按 配置×语言 写入 build.ninja：
+    $<Debug,CUDA:-G>                                    Debug+CUDA: nvcc -G
+    $<Release,CUDA:-lineinfo>                           Release+CUDA: nvcc -lineinfo
+    $<Release,CUDA:--use_fast_math>                     Release+CUDA: nvcc --use_fast_math
+    $<CUDA:--ptxas-options=-v>                          所有 CUDA: nvcc --ptxas-options=-v
+  )
+  add_compile_options(${TORCH_CXX_FLAGS_LIST})         追加 -D_GLIBCXX_USE_CXX11_ABI=1
+
+  Python3_add_library(ROPE_cuda MODULE WITH_SOABI      注册扩展库 target，声明源文件：
+      src/interface.cpp        → g++ 编译                WITH_SOABI 自动产出
+      src/run_kernel.cu)       → nvcc 编译                ROPE_cuda.cpython-313-...so（去 lib 前缀 + SOABI 后缀）
+
+  target_compile_definitions(ROPE_cuda PRIVATE         ★关键桥梁：CMake 变量 → 编译器 -D（写进 build.ninja）：
+      TORCH_EXTENSION_NAME=ROPE_cuda                     -DTORCH_EXTENSION_NAME=ROPE_cuda
+      ROPE_VARIANT=${ROPE_VARIANT}                       -DROPE_VARIANT=2     ← CMake "2" → 编译器宏
+      BLOCK_SIZE=${BLOCK_SIZE})                          -DBLOCK_SIZE=512     ← CMake "512" → 编译器宏
+
+  target_include_directories(ROPE_cuda PRIVATE         写 -I（同时进 compile_commands.json，供 IDE 跳转）：
+      ${CUDAToolkit_INCLUDE_DIRS}                        -I/usr/local/cuda/include
+      ${TORCH_INCLUDE_DIRS}                              -I<venv>/.../torch/include
+      ${Python3_INCLUDE_DIRS})                           -I<venv>/include/python3.13
+
+  target_link_libraries(ROPE_cuda PRIVATE              写链接库：
+      CUDA::cudart ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})  -lcudart -ltorch ... -ltorch_python
+
+  set_target_properties(ROPE_cuda PROPERTIES           CXX_STANDARD 20 / CUDA_STANDARD 20 /
+      ... LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})  .so 输出到【项目根】(python 直接 import)
+
+  add_executable(validation                            注册可执行 target（全 nvcc 编译）：
+      src/validation.cu src/runner.cu                    主程序 + kernel 启动函数 +
+      src/inference/fused_qknorm_rope_kernel.cu)         fused QK-Norm+RoPE kernel(stable ABI)
+  target_compile_definitions(validation PRIVATE USE_CUDA)
+  target_include_directories(... CUDAToolkit + /usr/include/x86_64-linux-gnu(cudnn.h))
+  target_link_libraries(validation PRIVATE CUDA::cudart cudnn torch)
+  set_target_properties(validation ... RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})  → ./validation
+  ──────────────────────────────────────────────────────────────────────────
+
+  配置阶段输出（cmake-build-release/）：
+    CMakeCache.txt         变量持久化（ROPE_VARIANT=2、BLOCK_SIZE=512 …）
+    build.ninja            完整编译规则（所有 -D / -I / -l / -std / -gencode）
+    compile_commands.json  IDE 头文件跳转索引（含所有 -I）
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ 阶段二：编译阶段（CLion 的 "Build"）                                        │
+│ 触发命令（二选一，等价）：                                                   │
+│   cmake --build cmake-build-release --target ROPE_cuda -- -j $(nproc)        │
+│   ninja -C cmake-build-release ROPE_cuda -j $(nproc)                         │
+└────────────────────────────────────────────────────────────────────────────┘
+      │ ninja 读 build.ninja，并行启动编译
+      │
+      ├─ g++  src/interface.cpp   -std=c++20 -I... -DTORCH_EXTENSION_NAME=ROPE_cuda
+      │       -D_GLIBCXX_USE_CXX11_ABI=1 -o interface.cpp.o
+      │   预处理：-DTORCH_EXTENSION_NAME=ROPE_cuda ≡ #define TORCH_EXTENSION_NAME ROPE_cuda
+      │           TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) / PYBIND11_MODULE(...) → 入口符号名带 ROPE_cuda
+      │
+      ├─ nvcc src/run_kernel.cu   -std=c++20 -gencode arch=compute_86,code=[sm_86,compute_86]
+      │       -I... -lineinfo --use_fast_math --ptxas-options=-v
+      │       -DROPE_VARIANT=2 -DBLOCK_SIZE=512 -DTORCH_EXTENSION_NAME=ROPE_cuda
+      │       -D_GLIBCXX_USE_CXX11_ABI=1 -o run_kernel.cu.o
+      │   预处理：-DROPE_VARIANT=2 ≡ #define ROPE_VARIANT 2
+      │           #ifndef ROPE_VARIANT → 已定义 → 跳过默认值 1，dispatch 用 variant 2
+      │   设备代码：SASS(sm_86) 本机直接跑 + PTX(compute_86) 供未来架构 JIT
+      │
+      └─ 链接：ld -shared interface.cpp.o run_kernel.cu.o -lcudart -ltorch ... -ltorch_python
+              -o <项目根>/ROPE_cuda.cpython-313-x86_64-linux-gnu.so
+
+  编译阶段输出：项目根/ROPE_cuda.cpython-313-x86_64-linux-gnu.so（validation 同理 → 项目根/validation）
+
+  Python 加载（.so 在项目根，runner.py 已把项目根加进 sys.path）：
+    import torch, ROPE_cuda            # dlopen → 触发 TORCH_LIBRARY 注册
+    torch.ops.ROPE_cuda.fused_qkv_norm_rope_neox(qkv, q_weight, k_weight, cos, sin, ...)
+
+
+================================================================================
+二、★核心桥梁：CMake 变量 → 编译器 -D 宏 → C 预处理器宏
+================================================================================
+
+  target_compile_definitions(ROPE_cuda PRIVATE ROPE_VARIANT=${ROPE_VARIANT})
+  把【配置阶段的 CMake 变量值】写成【build.ninja 里的编译器 -D 标志】，编译时由预处理器变成宏：
+
+    cmake -DROPE_VARIANT=2          （CMake 变量 "2" 写入 cache）
+        → build.ninja: nvcc ... -DROPE_VARIANT=2
+        → 预处理:      #define ROPE_VARIANT 2
+        → 源码:        #ifndef ROPE_VARIANT  /* 已定义→跳过 */  #define ROPE_VARIANT 1  #endif
+                       ... dispatch 据 ROPE_VARIANT 选实现
+
+  ── ★两个 -D 长得一样，却是【两个不同程序】的选项，含义完全不同 ──────────────────────
+   `cmake -DROPE_VARIANT=2` 和 `nvcc/g++ -DROPE_VARIANT=2` 都写 `-D`，但分属不同层、不同程序：
+
+   ┌──────────────┬──────────────────────────────┬──────────────────────────────┐
+   │              │ cmake -DROPE_VARIANT=2        │ nvcc/g++ -DROPE_VARIANT=2     │
+   ├──────────────┼──────────────────────────────┼──────────────────────────────┤
+   │ -D 是谁的选项 │ 【cmake】的                  │ 【编译器(nvcc/g++)】的        │
+   │ 设的是什么    │ 一个【CMake cache 变量】     │ 一个【C 预处理器宏】          │
+   │ 作用层        │ 构建系统：CMakeLists 用 ${..}│ 源代码：#ifdef/#if/记号替换   │
+   │ 存在哪        │ CMakeCache.txt（持久）       │ 仅这条编译命令（不持久）      │
+   │ 能否直接进源码│ 【不能】(要经下面这座桥转)   │ 【能】(直接等价 #define)      │
+   │ 谁消费它      │ cmake 解释 CMakeLists        │ 编译器的预处理器              │
+   │ 无值时        │ 设为空                       │ -DFOO(无=) ≡ #define FOO 1    │
+   └──────────────┴──────────────────────────────┴──────────────────────────────┘
+
+   · `cmake -DROPE_VARIANT=2`：只把 CMake 变量设成 "2"，存进 cache、供 CMakeLists 里 ${ROPE_VARIANT}
+     使用；它【本身不是 C 宏、run_kernel.cu 的预处理器看不到它】。
+   · `nvcc -DROPE_VARIANT=2`：直接给源码定义预处理宏 ROPE_VARIANT=2（≡ #define），影响 #ifndef/#if。
+   · 二者靠 target_compile_definitions(... ROPE_VARIANT=${ROPE_VARIANT}) 这【桥】连接：它读 CMake
+     变量值、生成编译器 -D 写进 build.ninja。【没有这行】：cmake -D 设的值【到不了源码】→ 源码
+     #ifndef 兜底用默认 1，你传的 2 白费。
+   · 两边同名只是【手动镜像的约定】，并非必然：写成
+       target_compile_definitions(ROPE_cuda PRIVATE KERNEL_VARIANT=${ROPE_VARIANT})
+     则编译器宏叫 KERNEL_VARIANT、CMake 变量仍叫 ROPE_VARIANT —— "CMake 变量名"与"编译器宏名"
+     是两套命名，可不同。
+
+  注：BLOCK_SIZE 经 -D 注入；而 src/kernels/common.cuh 里的 BLOCK_SIZE_X 是【源码内 #ifndef 默认】，
+      autotune_block_size_x.sh 用 sed 直接改那行（两者是不同的宏/不同的改法）。
+
+
+================================================================================
+三、宏取值的三级优先级（CMake cache 默认 / -D 覆盖 / 源码兜底）
+================================================================================
+
+  以 ROPE_VARIANT 为例，从高到低：
+    1. cmake -DROPE_VARIANT=2           最高：写入 cache，覆盖一切
+    2. set(ROPE_VARIANT 1 CACHE STRING) cache 无值时的 CMake 层默认（不会覆盖 -D）
+    3. #ifndef ROPE_VARIANT / #define 1 build.ninja 没传 -D 时的【编译器层兜底】
+
+  ⟹ 改了 -D 参数（ROPE_VARIANT / BLOCK_SIZE）必须先【Reload（重配置）】再【Build】，
+     否则 build.ninja 仍是旧 -D，#ifndef 兜底也不会触发新值。
+
+
+================================================================================
+四、两个 target 的差异
+================================================================================
+
+  ┌──────────────┬─────────────────────────────┬─────────────────────────────┐
+  │              │ ROPE_cuda（扩展库）          │ validation（可执行）         │
+  ├──────────────┼─────────────────────────────┼─────────────────────────────┤
+  │ CMake 命令    │ Python3_add_library(MODULE WITH_SOABI) │ add_executable         │
+  │ 有无 main()   │ 无（dlopen 加载）           │ 有（./validation N）        │
+  │ 源文件        │ interface.cpp + run_kernel.cu │ validation.cu+runner.cu+    │
+  │              │                             │ inference/fused_..._kernel.cu │
+  │ -D 宏         │ TORCH_EXTENSION_NAME/ROPE_VARIANT/BLOCK_SIZE │ USE_CUDA      │
+  │ 链接          │ cudart + TORCH_LIBRARIES + torch_python │ cudart + cudnn + torch │
+  │ 输出目录      │ 项目根（LIBRARY_OUTPUT_DIRECTORY） │ 项目根（RUNTIME_OUTPUT_DIRECTORY）│
+  │ 用途          │ Python 自定义算子（torch.ops）│ C++ kernel 基准/正确性     │
+  └──────────────┴─────────────────────────────┴─────────────────────────────┘
+
+
+================================================================================
+五、CLion 四个操作 ↔ 命令行
+================================================================================
+
+【Reload CMake Project】重跑 CMakeLists，更新 build.ninja；不编译、不删 .o。
+  时机：改了 CMakeLists.txt，或改了 -DROPE_VARIANT/-DBLOCK_SIZE 等参数后。
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_PREFIX_PATH=<venv>/lib/python3.13/site-packages/torch/share/cmake \
+          -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \
+          -DROPE_VARIANT=1 -DBLOCK_SIZE=256 \
+          -G Ninja \
+          -S /home/liam/cpp_linux/CUDA_ROPE \
+          -B /home/liam/cpp_linux/CUDA_ROPE/cmake-build-release
+  · -S/-B：源码目录 / 构建目录（CMake 3.13+，免 cd）；-S . = 当前目录。
+  · -G Ninja：Make 每次扫整棵依赖树启动慢；Ninja 配置期已生成依赖图、构建期查图、增量快。
+  · CLion 配置入口：Settings → Build, Execution, Deployment → CMake → CMake options，
+    至少填 -DCMAKE_PREFIX_PATH（torch/share/cmake）与 -DPython3_ROOT_DIR（.venv）。
+
+【Clean】删 .o/.so，保留 build.ninja。
+    cmake --build cmake-build-release --target clean
+
+【Build（增量）】只重编改动的源文件，复用其余 .o，再链接。
+    cmake --build cmake-build-release --target ROPE_cuda -- -j 18
+    │      │      │                    │       │            │  └ 并行进程数（传给 ninja/make）
+    │      │      │                    │       │            └ "--" 之后透传给底层构建工具
+    │      │      │                    │       └ 只构建 ROPE_cuda（或 validation）
+    │      │      │                    └ --target 指定目标
+    │      │      └ 构建目录（含 build.ninja）
+    │      └ --build：构建模式
+    └ cmake 主程序
+  · cmake --build 是封装，实际执行 `ninja -C cmake-build-release ROPE_cuda -j 18`；
+    cmake --build 生成器无关、可在任意目录；ninja/make 须在含 build.ninja/Makefile 的目录。
+  · ★改了 -DROPE_VARIANT/-DBLOCK_SIZE 后必须先 Reload 再 Build（见第三节）。
+
+【Rebuild】= Clean + Build（增量状态混乱/头文件依赖错乱时用）：
+    cmake --build cmake-build-release --target clean
+    cmake --build cmake-build-release --target ROPE_cuda -- -j 18
+
+
+================================================================================
+六、常见工作流
+================================================================================
+  改 CMakeLists.txt                     → Reload → Build
+  改 -DROPE_VARIANT / -DBLOCK_SIZE      → Reload → Build（宏值变化必须重配置）
+  只改 .cu/.cpp（含 kernels/*.cuh）     → Build（增量，只重编改动的）
+  改 common.cuh 的 BLOCK_SIZE_X（或 autotune sed 后）→ Build（它是源码 #define，无需 Reload）
+  链接报奇怪错 / 状态混乱               → Rebuild
+  彻底重来                              → 删 cmake-build-release/ → Reload → Build
+  ★跑 Python 脚本(test/benchmark/plot)前：确保 ROPE_cuda 已重新 Build（.so 在项目根是最新的）
+
+
+相关：
+  CMakeLists.txt                                   —— 本文所述全部命令的出处
+  docs/cuda/cuda_arch_and_use_rocm_macros.txt      —— -gencode/__CUDA_ARCH__ 与 USE_CUDA/USE_ROCM 宏
+  docs/cuda/nvidia_cli_arch_sm_and_features.txt    —— nvcc/-arch、compute_cap 探测
+  src/scripts/fused_ROPE_RMSNorm/autotune_block_size_x.sh —— sed 改 common.cuh + 重编 ROPE_cuda
+  src/interface.cpp / src/run_kernel.cu            —— ROPE_cuda 的两个源文件
