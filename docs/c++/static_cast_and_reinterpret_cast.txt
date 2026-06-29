@@ -135,7 +135,7 @@ static_cast 与 reinterpret_cast：适用场景、不适用场景与示例
   (2) 从 void(类型) 转成任何类型 —— 不可能(无值)
         int x = reinterpret_cast<int>( <void 表达式> );   // ✗
 
-  (3) 去 const/volatile —— 不能(那是 const_cast 的活)
+  (3) 去 const/volatile —— 不能(那是 const_cast 的活；详见第四点五)
         reinterpret_cast 不能去掉 cv 限定。
 
   (4) 用它“绕过类型系统”后【按错类型访问】 —— 编译过，运行 UB
@@ -148,6 +148,78 @@ static_cast 与 reinterpret_cast：适用场景、不适用场景与示例
         float f = 3.0f;
         int   n = reinterpret_cast<int&>(f);   // n 不是 3，而是 3.0f 的 IEEE754 位模式
         int   m = static_cast<int>(f);         // 这才是 3（数值转换）
+
+
+================================================================================
+四点五、const 与 cast：指针/引用【只能加 const，不能减】(static_cast / reinterpret_cast 都不能去 const)
+================================================================================
+
+铁律：static_cast、reinterpret_cast 都【不能去掉 const/volatile】；唯有 const_cast 能增删 cv。
+      方向【不对称】：加 const 安全(隐式即可)，去 const 危险(只能 const_cast，写真 const 对象=UB)。
+      （“值(by value)”不受此限——顶层 const 拷贝时被忽略，详见 docs/c++/type_conversion.txt；
+        这里只讲【指针/引用】的低层 const。）
+
+【一】去 const：static_cast / reinterpret_cast 都报错
+
+    const int* pc = &x;
+    int* a = static_cast<int*>(pc);       // ✗ 报错：static_cast 不能去 const
+    int* b = reinterpret_cast<int*>(pc);  // ✗ 报错：reinterpret_cast 也不能去 const
+    int* c = const_cast<int*>(pc);        // ✓ 仅 const_cast；但若 pc 指向真正 const 对象，写它=UB
+
+  典型报错（与本项目早期 kernel 一致）：
+    "Cannot cast from const void* to T* via static_cast"
+
+【二】加 const：随便加，隐式即可（安全方向）
+
+    int* p = &x;
+    const int* cp = p;                          // ✓ 隐式：int* → const int*
+    const int* cp2 = static_cast<const int*>(p);// ✓
+    int& r = x;  const int& cr = r;             // ✓ 引用同理
+
+【三】reinterpret_cast 时要【保留】源指针的 const
+
+    源是“指向 const”的指针时，reinterpret 的【目标类型也必须带 const】，否则=去 const→报错：
+
+    const T_cache* cos = ...;                   // 只读数据
+    // ✓ 保留 const：
+    auto v = reinterpret_cast<const T_vec*>(&cos[off])[0];
+    // ✗ 漏写 const = 去 const → 报错：
+    auto w = reinterpret_cast<T_vec*>(&cos[off])[0];
+
+  注意：reinterpret_cast 可以【顺带加】const，但【不能减】：
+    T_cache* p = ...;
+    reinterpret_cast<const T_vec*>(p);   // ✓ 加 const，合法
+    const T_cache* q = ...;
+    reinterpret_cast<T_vec*>(q);         // ✗ 减 const，非法
+
+【四】为什么不对称（指针/引用 vs 值）
+
+    · 指针/引用是原对象的【别名】：去 const 后能通过它改写【真正 const 的对象】→ UB → 故被禁。
+    · 值是【拷贝的新对象】：改副本动不了原对象，源的顶层 const 无意义 → 被忽略，双向自由
+      （const int → int 隐式即可，见 type_conversion.txt）。
+
+【五】本项目实例
+
+    // 权重 / cos / sin 都是只读 → 声明成 const 指针
+    const void* q_weight_void;                  // kernel 形参
+    auto* qw = static_cast<const T_in*>(q_weight_void);   // ✓ 保留 const
+    // auto* qw = static_cast<T_in*>(q_weight_void);      // ✗ 去 const → 报错
+
+    const T_cache* cos = static_cast<const T_cache*>(cos_void);
+    auto vec = reinterpret_cast<const T_cosSin*>(&cos[off])[0];  // ✓ 保留 const
+
+  正解：只读数据【顺着 const 用】(const T*)，而不是去 const。绝不用 const_cast 强去
+  （写真 const 对象是 UB；这里也根本不需要写）。
+
+【六】速记表
+
+    | 转换（指针/引用）           | static_cast | reinterpret_cast | const_cast |
+    |-----------------------------|-------------|------------------|------------|
+    | 加 const (T* → const T*)    | ✅          | ✅               | ✅(没必要) |
+    | 去 const (const T* → T*)    | ❌          | ❌               | ✅(写=UB)  |
+    | 重解释 + 保留 const         | —           | ✅(目标带 const) | —          |
+    | 重解释 + 顺带加 const       | —           | ✅               | —          |
+    | 重解释 + 去 const(同时)     | —           | ❌(要先 const_cast)| —        |
 
 
 ================================================================================

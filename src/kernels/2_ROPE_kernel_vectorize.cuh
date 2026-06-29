@@ -16,8 +16,8 @@ __global__ void ROPE_kernel_vectorize(index_t totalRow, index_t totalCol, index_
   //  coupleNum ≥ 32，row不变，colGroup改变，所以可以合并访问事务。
   scalar_t4 vecA { reinterpret_cast<scalar_t4 *>(&A[row * totalCol + colGroup * 4])[0] };
 
-  float theta_i1 {1.0f / powf(theta, 2.0f * colGroup * 2 / static_cast<float>(totalCol))};
-  float theta_i2 {1.0f / powf(theta, 2.0f * (colGroup * 2 + 1) / static_cast<float>(totalCol))};
+  float theta_i1 {1.0f / powf(rope_theta, 2.0f * colGroup * 2 / static_cast<float>(totalCol))};
+  float theta_i2 {1.0f / powf(rope_theta, 2.0f * (colGroup * 2 + 1) / static_cast<float>(totalCol))};
 
   scalar_t4 vecOut { };
   vecOut.x = static_cast<scalar_t>(cosf(row * theta_i1)) * vecA.x - static_cast<scalar_t>(sinf(row * theta_i1)) * vecA.y;

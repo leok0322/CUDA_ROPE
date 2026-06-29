@@ -1,0 +1,112 @@
+================================================================================
+为什么 fused QK-Norm + RoPE kernel 对 BLOCK_SIZE_X 几乎不敏感
+（autotune_block_size_x.sh 扫描结果分析）
+================================================================================
+
+相关：
+  src/scripts/fused_ROPE_RMSNorm/autotune_block_size_x.sh   —— 扫 BLOCK_SIZE_X 的调优脚本
+  src/scripts/fused_ROPE_RMSNorm/benchmark_fused_qknorm_rope.py —— 被调用的 benchmark
+  src/kernels/3_fuesd_QKNorm_and_ROPE_kernel.cuh            —— 被调优的 kernel
+  src/run_kernel.cu                                         —— launch_ 里用 BLOCK_SIZE_X 设 blockSize/grid
+
+
+================================================================================
+一、现象
+================================================================================
+
+对 BLOCK_SIZE_X ∈ {32,64,128,256,512,1024} 各重编译 .so + 跑 benchmark（固定配置：
+fp16 × head_dim=128 × neox × num_tokens=4096 × (Hq,Hk,Hv)=(8,8,8)），结果：
+
+  BLOCK_SIZE_X    op median     op GFLOPS
+  ------------    ---------     ---------
+  32             0.2140ms      274.4
+  64             0.2140ms      274.4
+  128            0.2140ms      274.4
+  256            0.2140ms      274.4
+  512            0.2140ms      274.4
+  1024           0.2140ms      274.4
+
+op 时间【逐位相同】(0.2140ms)；而同列的 eager 在 2.41~2.47ms 间正常抖动（~2% 噪声）。
+op 这种"逐位不变"本身就提示：跑的是【同一段有效路径】，BLOCK_SIZE_X 没改变它。
+
+
+================================================================================
+二、先排除"sed 没生效 / .so 没重编"（已确认：都生效了）
+================================================================================
+
+  (1) BLOCK_SIZE_X 是否被外部 -D 覆盖？
+      common.cuh 用 `#ifndef BLOCK_SIZE_X / #define ... / #endif` 守卫——若别处(CMake
+      target_compile_definitions 或其它头)已定义，sed 改的这行会被 #ifndef 跳过、形同无效。
+      实测：BLOCK_SIZE_X 只在 common.cuh 出现定义，【无外部覆盖】→ sed 改的值确实生效。
+
+  (2) cmake 每轮真的重编了吗？
+      autotune 日志里每个 BLOCK_SIZE_X 都有：
+        [ 33%] Building CUDA object .../src/run_kernel.cu.o
+        [ 66%] Linking CXX shared module .../ROPE_cuda.*.so
+        [100%] Built target ROPE_cuda
+      共 6 次重编 + 6 次重链；benchmark 每轮是【独立子进程】重新 import 这个新 .so。
+
+  ⟹ 值改了、kernel 重生成了、新 .so 也加载了，但 op 时间不变。
+     故是【物理上不敏感】，不是"没改到"。
+
+
+================================================================================
+三、根因：BLOCK_SIZE_X 在本设计里不改变"总工作量/总并行度/总访存"
+================================================================================
+
+并行模型是【warp-per-head】：一个 warp(32 lane)处理一个 (token, QK-head)，lane 均分 head_dim。
+launch 里（src/run_kernel.cu）：
+    warpsPerBlock = BLOCK_SIZE_X / 32
+    gridSize      = ceil(totalWarps / warpsPerBlock)
+    blockSize     = BLOCK_SIZE_X
+
+  ① BLOCK_SIZE_X 只决定"每个 block 装几个 warp"
+     总 warp 数(totalWarps)、每个 warp 干的活，都与 BLOCK_SIZE_X 【无关】。
+     改它只是把【同样多的 warp】换一种方式分组进 block——不增减并行度、不改访存量。
+
+  ② kernel 是【访存带宽瓶颈】
+     它本质是把 qkv 流进、(RMSNorm+RoPE 少量计算)、流回；时间 ≈ 总字节数 / 实测带宽。
+     总字节数与 BLOCK_SIZE_X 无关；RMSNorm/RoPE 的算术量相对访存极小。
+
+  ③ warp 数【远超饱和点】
+     本配置 totalWarps = num_tokens × (Hq+Hk) = 4096 × 16 = 65536 个 warp，
+     远远超过填满 GPU 所需。无论每 block 装 1 个(BSX=32)还是 32 个(BSX=1024)warp，
+     SM 都被喂满、带宽都被打满 → 实测带宽几乎一样 → 时间几乎一样。
+
+  ④ benchmark 测的是【整条 compiled forward】，kernel 只是其中一段
+     计时对象是 torch.compile(model) 的整个前向（含未融合的其它算子 + launch/框架固定开销）。
+     融合 kernel 即便有微小变化，也被这部分【固定开销】稀释。op 恒为 0.2140ms 正说明它被
+     一个【固定下限】(启动 + 非 kernel 部分)主导，而非 kernel 本身在变。
+
+
+================================================================================
+四、什么时候 BLOCK_SIZE_X 才会显著影响性能（本 kernel 都不沾边）
+================================================================================
+
+  · 共享内存分块：block 越大，块内共享数据复用越多 → 本 kernel【无共享内存】。
+  · occupancy 受限：寄存器/SMEM 限制每 SM 驻留多少 block/warp，block 大小是占用率旋钮
+    → 本 kernel warp 内自洽、寄存器用量低(20~30)、且 warp 数已过剩，占用率不是瓶颈。
+  · block 内协作/规约：跨 warp 在 block 内同步/归约时 block 大小影响通信
+    → 本 kernel 规约只在【warp 内】用 __shfl_xor_sync 完成，不跨 warp。
+
+  ⟹ 这三类"让 block 大小生效"的机制本 kernel 一个都没有 → BLOCK_SIZE_X 自然≈无效旋钮。
+
+
+================================================================================
+五、结论与建议
+================================================================================
+
+  · autotune 没出错：BLOCK_SIZE_X 对这个 warp-per-head、带宽瓶颈、warp 数过剩的 kernel
+    本就几乎无影响；脚本选了并列最优里最小的 32（小 block 启动/调度略省，差异也在噪声内）。
+
+  · 想"调 BLOCK_SIZE_X 有意义"，得是它能改变性能的 kernel（引入共享内存分块、或让它成为
+    occupancy/寄存器权衡的旋钮）。当前 kernel 不是这类，调它收益≈0。
+
+  · 对本 kernel 真正值得调的旋钮（都指向"减少访存 / 提高合并效率"，因为瓶颈在带宽）：
+      - 每个 warp 处理几个 head/token（提高指令级并行与访存合并粒度）；
+      - 向量化宽度（packed_as 的 N：float2/float4 决定每次 load/store 多宽）；
+      - grid 映射方式（让相邻 warp 访问相邻内存，提升 coalescing）。
+    op 已是 eager 的 ~11×，继续提升要从访存效率入手，而非 block 大小。
+
+  一句话：重编确实生效（日志可证、无外部 -D），但 BLOCK_SIZE_X 在本 kernel 里只改"warp 分组
+  方式"、不改总访存与总并行度，所以时间几乎不变——它不是这个 kernel 的有效性能旋钮。

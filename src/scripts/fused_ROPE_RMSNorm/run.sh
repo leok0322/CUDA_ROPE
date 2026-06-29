@@ -7,14 +7,18 @@
 #   加了 pipefail：cmd_fail(1) | tee(0) → 管道退出码=1 → set -e 触发，脚本终止
 set -euo pipefail
 
-# 可执行文件路径（CMakeLists.txt 中 add_executable 的输出路径）
+# 本脚本在 src/scripts/fused_ROPE_RMSNorm/ 下，cd 到项目根(上溯 3 级)，
+#   使 ./validation 与 logs 这些相对路径基于项目根（否则会落到脚本所在目录）。
+cd "$(dirname "$0")/../../.." || exit 1
+
+# 可执行文件路径（CMakeLists.txt 中 add_executable 的输出路径，位于项目根）
 EXEC="./validation"
 # 日志目录
 LOG_DIR="logs"
 
 mkdir -p "$LOG_DIR"
 
-for i in $(seq 0 0); do
+for i in $(seq 2 2); do
     LOG_FILE="$LOG_DIR/kernel_${i}.log"
     echo "Running kernel ${i} → ${LOG_FILE}"
     # ── tee 方案：同时输出到 terminal 和文件 ────────────────────────────────

@@ -148,7 +148,7 @@ def main() -> None:
     # ── 坐标轴 / 图例 ─────────────────────────────────────────────────────────
     ax.set_xlabel("Kernel", fontsize=12)
     ax.set_ylabel("Performance (GFLOPS)", fontsize=12)
-    ax.set_title("CUDA ROPE Kernel Performance  (○ square  △ non-square)", fontsize=13)
+    ax.set_title("CUDA fused_ROPE_RMSNorm Kernel Performance  (○ square  △ non-square)", fontsize=13)
     ax.set_xticks(x_positions)
     ax.set_xticklabels([kernel_labels[k] for k in kernel_ids],
                        rotation=25, ha="right")

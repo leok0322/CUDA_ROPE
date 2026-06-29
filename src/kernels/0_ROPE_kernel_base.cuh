@@ -33,7 +33,7 @@ __global__ void ROPE_kernel_base(index_t totalRow, index_t totalCol,index_t coup
   //     写法二：        (2 * colGroup) / static_cast<float>(totalCol)  ← 显式 cast，语义更清晰
   //     写法三：        static_cast<float>(2 * colGroup) / totalCol    ← 分子 cast，同样触发浮点除法
   //   三种写法中只要除法任意一侧是 float，C++ 就将另一侧提升为 float，整数截断消失。
-  float theta_i {1.f / powf(theta,(2 * colGroup) / (2.0f * coupleNum)) };
+  float theta_i {1.f / powf(rope_theta,(2 * colGroup) / (2.0f * coupleNum)) };
 
 
   scalar_t newElement1 {static_cast<scalar_t>(cosf(row * theta_i)) * element1 - static_cast<scalar_t>(sinf(row * theta_i)) *  element2};

@@ -26,6 +26,7 @@
 #include <string>                                // std::to_string（head_dim 报错信息）
 #include <stdexcept>                             // std::runtime_error
 #include <utility>                               // std::forward
+#include <type_traits>                           // std::is_same_v（head_dim 宏按 dtype 分流）
 
 // [[noreturn]] 抛出辅助：让编译器【确知】此调用不会返回 → switch 的 default 走它之后
 //   控制流不可达，既无 -Wimplicit-fallthrough（穿透）顾虑，也不必靠 break 兜。
@@ -111,93 +112,55 @@ template <typename Msg>
   ROPE_DISPATCH_SWITCH(TYPE, NAME,ROPE_DISPATCH_CASE_FLOATING_TYPES(__VA_ARGS__))
 
 
-#define ROPE_DISPATCH_HEAD_DIM(TYPE,HEAD_DIM,NAME,...)    \
-  ROPE_DISPATCH_HEAD_DIM_TMPL(ROPE_ST_TORCH_CHECK,TYPE,HEAD_DIM,NAME,__VA_ARGS__)
+// ─────────────────────────────────────────────────────────────────────────────
+// ROPE_DISPATCH_HEAD_DIM(HEAD_DIM, NAME, lambda)
+//
+// ★本宏的【根本作用】：把【运行时】的 head_dim(int64_t 值) → 落成【编译期常量】headDIM，
+//   供 launch_fused_QKNorm_and_ROPE_kernel<..., headDIM> 当【非类型模板实参】。
+//   —— 模板实参必须是编译期常量，而 head_dim 是运行时函数参数；把"运行时值"桥成"编译期常量"
+//      的唯一办法，就是 switch 逐个【列举】可能值、每个 case 里给一个 `constexpr uint headDIM`。
+//      这正是本宏存在的理由，与 packed_as 合不合法【无关】。
+//
+//   "只列 {64,128,256}"是这件事的【副产品】，不是目的：switch 只能桥接【有限个】枚举出来的值，
+//   你想支持哪些 head_dim 就在这里列哪些。即便 packed_as 对所有 N 都特化、即便没有 if constexpr，
+//   本宏照样必需(否则 head_dim 永远是运行时值，模板根本无法实例化)。
+//
+//   ── (dtype, head_dim) 的【合法性】不在这里判 ──
+//   合法性(如 float×256 → packed_as<float,8> 未特化)由【模板函数 launch_...】里的
+//   if constexpr(numPerFourBytes<=4) 负责(方案B)。原因：本宏展开在 interleave 的普通 lambda
+//   (非模板上下文)，那里的 if constexpr/switch 都【不丢弃】未取分支 → launch_...<float,256>
+//   照样被实例化 → 仍触发 packed_as<float,8>；只有在【模板】launch_ 内 if constexpr 才真正丢弃、
+//   不实例化非法组合。两者是【接力】：本宏先把 head_dim 变编译期 → launch_ 再用 if constexpr
+//   按 (dtype,head_dim) 裁掉非法组合(运行期则 TORCH_CHECK)。
+//   详见 docs/c++/switch_case_fallthrough_and_warnings.txt 第九/十节。
+//
+//   switch(HEAD_DIM) 是对【整型】(int64_t)分支，不触发 -Wswitch(-enum)，无需 PUSH/POP。
+// ─────────────────────────────────────────────────────────────────────────────
+#define ROPE_DISPATCH_HEAD_DIM(HEAD_DIM,NAME,...)    \
+  ROPE_DISPATCH_HEAD_DIM_TMPL(ROPE_ST_TORCH_CHECK,HEAD_DIM,NAME,__VA_ARGS__)
 
 
-#define ROPE_DISPATCH_HEAD_DIM_TMPL(CHECK_NOT_IMPLEMENTED,TYPE,HEAD_DIM,NAME,...)    \
-  C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wswitch-enum")                        \
-  switch (TYPE) {                                                                    \
-    case torch::headeronly::ScalarType::Float: {                                      \
-      switch (HEAD_DIM) {                                                               \
-        case 32:{                                                                     \
-         constexpr uint headDIM = 32;                                                  \
-         return __VA_ARGS__();                                                         \
-        }                                                                             \
-        case 64:{                                                                      \
-        constexpr uint headDIM = 64;                                                  \
-        return __VA_ARGS__();                                                         \
-        }                                                                             \
-        case 128:{                                                                      \
-        constexpr uint headDIM = 128;                                                  \
-        return __VA_ARGS__();                                                         \
-        }                                                                             \
-        default:                                                                     \
-        CHECK_NOT_IMPLEMENTED(                                                      \
-        false,                                                                      \
-        '"',                                                                        \
-        NAME,                                                                      \
-        "\" not implemented for HEAD_DIM '",                                        \
-        std::to_string(HEAD_DIM),                                                     \
-        "'");                                                                        \
-      }                                                                               \
-    }                                                                              \
-    case torch::headeronly::ScalarType::Half: {                                        \
-      switch (HEAD_DIM) {                                                               \
-        case 64:{                                                                     \
-         constexpr uint headDIM = 64;                                                  \
-         return __VA_ARGS__();                                                         \
-        }                                                                             \
-        case 128:{                                                                      \
-        constexpr uint headDIM = 128;                                                  \
-        return __VA_ARGS__();                                                         \
-        }                                                                             \
-        case 256:{                                                                      \
-        constexpr uint headDIM = 256;                                                  \
-        return __VA_ARGS__();                                                         \
-        }                                                                             \
-        default:                                                                     \
-        CHECK_NOT_IMPLEMENTED(                                                      \
-        false,                                                                      \
-        '"',                                                                        \
-        NAME,                                                                      \
-        "\" not implemented for HEAD_DIM'",                                         \
-        std::to_string(HEAD_DIM),                                                     \
-        "'");                                                                        \
-      }                                                                               \
-    }                                                                                 \
-    case torch::headeronly::ScalarType::BFloat16: {                                    \
-      switch (HEAD_DIM) {                                                               \
-        case 64:{                                                                     \
-         constexpr uint headDIM = 64;                                                  \
-         return __VA_ARGS__();                                                         \
-        }                                                                             \
-        case 128:{                                                                      \
-        constexpr uint headDIM = 128;                                                  \
-        return __VA_ARGS__();                                                         \
-        }                                                                             \
-        case 256:{                                                                      \
-        constexpr uint headDIM = 256;                                                  \
-        return __VA_ARGS__();                                                         \
-        }                                                                             \
-        default:                                                                     \
-        CHECK_NOT_IMPLEMENTED(                                                      \
-        false,                                                                      \
-        '"',                                                                        \
-        NAME,                                                                      \
-        "\" not implemented for HEAD_DIM '",                                        \
-        std::to_string(HEAD_DIM),                                                     \
-        "'");                                                                        \
-      }                                                                              \
-    }                                                                                 \
-    default:                                                                          \
-      CHECK_NOT_IMPLEMENTED(                                                          \
-      false,                                                                          \
-      '"',                                                                            \
-      NAME,                                                                           \
-      "\" not implemented for dtype '",                                               \
-      torch::headeronly::toString(TYPE),                                              \
-      "'");                                                                           \
-  }                                                                                   \
-  C10_DIAGNOSTIC_POP()
+#define ROPE_DISPATCH_HEAD_DIM_TMPL(CHECK_NOT_IMPLEMENTED,HEAD_DIM,NAME,...)    \
+  switch (HEAD_DIM) {                                                           \
+    case 64:{                                                                   \
+      constexpr uint headDIM = 64;                                             \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+    case 128:{                                                                 \
+      constexpr uint headDIM = 128;                                           \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+    case 256:{                                                                 \
+      constexpr uint headDIM = 256;                                           \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+    default:                                                                   \
+      CHECK_NOT_IMPLEMENTED(                                                    \
+      false,                                                                   \
+      '"',                                                                     \
+      NAME,                                                                    \
+      "\" not implemented for head_dim '",                                     \
+      std::to_string(HEAD_DIM),                                                \
+      "'");                                                                    \
+  }
 

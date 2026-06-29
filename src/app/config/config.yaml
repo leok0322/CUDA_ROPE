@@ -17,7 +17,7 @@ model_arch:
   eps: 1.0e-6           # RMSNorm 的数值稳定项
   base: 10000.0         # RoPE 频率底数
   max_token_size: 4096  # 模型上下文最大 token 数（cos/sin cache 行数 max_position）
-  interleave: true     # RoPE 风格：false=neox(前后半配对)，true=interleave(相邻配对)
+  interleave: false     # RoPE 风格：false=neox(前后半配对)，true=interleave(相邻配对)
 
   # ---- 合并 qkv + 仅 QK 处理 + 分离 q/k 权重（贴近真实 vLLM kernel）----
   num_heads_q: 8        # Q 头数 Hq

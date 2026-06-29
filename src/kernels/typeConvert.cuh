@@ -25,6 +25,11 @@ struct packed_as<float,2> {
   using type = float2;
 };
 
+template <>
+struct packed_as<float,1> {
+  using type = float;
+};
+
 
 // _typeConvert：类型转换 traits，实现【静态多态(编译期多态)】。它把 torch/C++ 标量类型
 //   (float / c10::Half / c10::BFloat16) 映射到 CUDA 端使用的类型，并提供值转换。
@@ -110,6 +115,11 @@ struct _typeConvert<c10::Half> {
   static constexpr bool exists {true};
   using hinType = __half;
   using hinType2 = __half2;
+  // 为何 convert 用 __half2float / __float2half_rn 等 intrinsic，而不是 static_cast：
+  //   __half/__nv_bfloat16 ↔ float 的转换运算符在 host/device、CUDA/HIP 版本、GPU 架构间
+  //   【不一致、不可靠】（device-only、bf16 需 SM80+ 等），裸 static_cast 不能稳定使用；
+  //   故统一改用官方数值转换 intrinsic（成对版如 __half22float2 还借硬件一次转 2 个）。
+  //   注意：reinterpret_cast 更不行——half/bf16/float 位格式与宽度都不同，按位重解释是垃圾值。
   __device__ __forceinline__ static float convert(hinType x) {
     return __half2float(x);
   }

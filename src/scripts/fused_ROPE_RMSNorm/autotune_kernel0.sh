@@ -7,11 +7,11 @@ set -o pipefail
 # 搜索空间：BLOCK_SIZE 必须是 32 的倍数（覆盖完整 warp），且 <= 1024（CUDA 每 block 线程数上限）
 BS_VALUES=(32 64 128 256 512 1024)
 
-# 切换到项目根目录（使脚本在任意目录下调用均正确）
-cd "$(dirname "$0")"
+# 切换到项目根目录（本脚本在 src/scripts/fused_ROPE_RMSNorm/ 下，上溯 3 级；使脚本在任意目录下调用均正确）
+cd "$(dirname "$0")/../../.." || exit 1
 
 COMMON="src/kernels/common.cuh"
-OUTPUT="autotune/kernel_0_autotune_results.txt"
+OUTPUT="autotune/ROPE_kernel_0_autotune_results.txt"
 
 mkdir -p "$(dirname "$OUTPUT")"
 echo "" > "$OUTPUT"

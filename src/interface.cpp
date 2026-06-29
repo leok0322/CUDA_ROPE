@@ -16,7 +16,7 @@
 //   ⚠ 但这只限【C++ 签名】；下方 schema 字符串(m.def)里【只能写 Tensor】，
 //      写 at::Tensor / torch::Tensor 都会解析失败。
 // ───────────────────────────────────────────────────────────────────────────
-void fused_QKNorm_and_ROPE_interleave(
+void fused_QKNorm_and_ROPE_neox(
     at::Tensor& qkv,                  // [num_tokens, (Hq+Hk+Hv)*head_dim]  ★就地改写
     const at::Tensor& q_weight,       // [head_dim]  Q 的 RMSNorm γ
     const at::Tensor& k_weight,       // [head_dim]  K 的 RMSNorm γ
@@ -32,13 +32,13 @@ void fused_QKNorm_and_ROPE_interleave(
 //   schema Tensor(a!) ↔ at::Tensor&（就地改写）
 // 写法③(void in-place)：本函数返回 void、把结果就地写回 qkv；Python 侧 replace_fn 以
 //   op(qkv,...); return qkv 把被改写的 qkv 交出去(算子本身无返回)。
-void run_fused_QKNorm_and_ROPE_cuda_interleave(
+void run_fused_QKNorm_and_ROPE_cuda_neox(
     at::Tensor qkv, at::Tensor q_weight, at::Tensor k_weight,
     at::Tensor cos, at::Tensor sin,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
     int64_t head_dim, int64_t rotary_dim, double eps) {
     // ★ 必须把【全部参数转发】给真正的 kernel，否则 kernel 收不到数据、什么也算不了。
-    fused_QKNorm_and_ROPE_interleave(qkv, q_weight, k_weight, cos, sin,
+    fused_QKNorm_and_ROPE_neox(qkv, q_weight, k_weight, cos, sin,
                                      num_heads_q, num_heads_k, num_heads_v,
                                      head_dim, rotary_dim, eps);
 }
@@ -89,7 +89,7 @@ TORCH_LIBRARY(ROPE_cuda, m) {   // ROPE_cuda = 命名空间(namespace)
     //   - 算子名【必须与 Python 侧 op_name 一字一致】：runner.py 用
     //     ROPE_cuda::fused_qkv_norm_rope_interleave，故这里也叫 fused_qkv_norm_rope_interleave，
     //     否则 _resolve_op 的 getattr 找不到 → AttributeError。
-    m.def("fused_qkv_norm_rope_interleave(Tensor(a!) qkv, Tensor q_weight, Tensor k_weight, "
+    m.def("fused_qkv_norm_rope_neox(Tensor(a!) qkv, Tensor q_weight, Tensor k_weight, "
           "Tensor cos, Tensor sin, int num_heads_q, int num_heads_k, int num_heads_v, "
           "int head_dim, int rotary_dim, float eps) -> ()");
     // 注：neox 风格需另注册一个 fused_qkv_norm_rope_neox(签名相同)，由 Runner 据 interleave 选用。
@@ -98,7 +98,7 @@ TORCH_LIBRARY(ROPE_cuda, m) {   // ROPE_cuda = 命名空间(namespace)
 TORCH_LIBRARY_IMPL(ROPE_cuda, CUDA, m) {   // 同一命名空间 ROPE_cuda 的 CUDA 实现
     // 把算子名 fused_qkv_norm_rope_interleave(须与上面 m.def 的一致)的 CUDA 实现，
     // 绑定到 C++ 封装函数 run_fused_QKNorm_and_ROPE_cuda_interleave。
-    m.impl("fused_qkv_norm_rope_interleave", &run_fused_QKNorm_and_ROPE_cuda_interleave);
+    m.impl("fused_qkv_norm_rope_neox", &run_fused_QKNorm_and_ROPE_cuda_neox);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -129,8 +129,8 @@ TORCH_LIBRARY_IMPL(ROPE_cuda, CUDA, m) {   // 同一命名空间 ROPE_cuda 的 C
 // ───────────────────────────────────────────────────────────────────────────
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // pybind 用的是 C++ 类型(不受 schema DSL 限制)；函数名与 torch.ops 那套保持一致即可。
-    m.def("fused_qkv_norm_rope_interleave", &run_fused_QKNorm_and_ROPE_cuda_interleave,
-          "Fused QKV-Norm and RoPE, interleave (CUDA, in-place on qkv)");
+    m.def("fused_qkv_norm_rope_neox", &run_fused_QKNorm_and_ROPE_cuda_neox,
+          "Fused QKV-Norm and RoPE, no interleave (CUDA, in-place on qkv)");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

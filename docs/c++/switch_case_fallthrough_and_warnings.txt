@@ -372,7 +372,316 @@ switch/case 全解：break/return 何时需要、穿透(fall-through)、
       → 内层必退出 → 外层 case 不穿透（治本，非压警告）。
 
 
+================================================================================
+九、★运行时 switch 会【编译/实例化所有 case 体】——含“运行时不可达”的分支
+================================================================================
+
+一句话：switch 是【运行时】分支 → 编译器为【每个 case 体都生成代码】→ 里面被 ODR-use 的模板
+        【都实例化】，哪怕该 case 运行时永远走不到。某个 case 若是【非法模板组合】，编译就挂。
+        要“按编译期条件裁掉不该实例化的分支”，只能用 if constexpr（且身处模板）；switch 做不到。
+
+──────────────────────────────────────────────────────────────────────────────
+0. 引子案例：case Float 为何会实例化 case 256（packed_as<float,8> 报错）
+──────────────────────────────────────────────────────────────────────────────
+  外层按 dtype 选编译期类型 qkv_scalar_t；内层(head_dim 宏)再 switch(dtype) 选 headDIM，
+  但 launch 的第 1 个模板实参用的是【外层定死的 qkv_scalar_t】：
+
+    ROPE_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), ..., [&]{
+      using qkv_scalar_t = scalar_t;                       // 外层定死，比如 = float（这是【类型】）
+      switch (qkv.scalar_type()) {                         // 内层 switch 的是【运行时值】，不是类型！
+        //     ^^^^^^^^^^^^^^^^^ 操作数必须是值；switch(qkv_scalar_t) 非法（qkv_scalar_t 是类型）
+        case ScalarType::Float: {
+          switch (head_dim) {
+            case 64:  { constexpr uint headDIM = 64;  launch<qkv_scalar_t, cache_t, headDIM>(...); break; }
+            case 128: { constexpr uint headDIM = 128; launch<qkv_scalar_t, cache_t, headDIM>(...); break; }
+            default: TORCH_CHECK(false, "bad head_dim");
+          }
+          break;
+        }
+        case ScalarType::Half: {
+          switch (head_dim) {
+            case 64:  { constexpr uint headDIM = 64;  launch<qkv_scalar_t, cache_t, headDIM>(...); break; }
+            case 128: { constexpr uint headDIM = 128; launch<qkv_scalar_t, cache_t, headDIM>(...); break; }
+            case 256: { constexpr uint headDIM = 256; launch<qkv_scalar_t, cache_t, headDIM>(...); break; }  // ★有 256
+            default: TORCH_CHECK(false, "bad head_dim");
+          }
+          break;
+        }
+        case ScalarType::BFloat16: {
+          switch (head_dim) {
+            case 64:  { constexpr uint headDIM = 64;  launch<qkv_scalar_t, cache_t, headDIM>(...); break; }
+            case 128: { constexpr uint headDIM = 128; launch<qkv_scalar_t, cache_t, headDIM>(...); break; }
+            case 256: { constexpr uint headDIM = 256; launch<qkv_scalar_t, cache_t, headDIM>(...); break; }  // ★有 256
+            default: TORCH_CHECK(false, "bad head_dim");
+          }
+          break;
+        }
+        default: TORCH_CHECK(false, "bad dtype");
+      }
+      // 三者别混：switch 的是【值】qkv.scalar_type()；case 是枚举【值】ScalarType::X；
+      //           qkv_scalar_t 是【类型】，只当 launch<...> 的模板实参。
+    });
+
+  即使外层是 float，switch 也把【Half 分支的 case 256】编译 → 实例化 launch<float,cache,256>
+    → float×256 → numPerFourBytesPerThread=8 → packed_as<float,8>(只特化 1/2/4) → ❌ incomplete type。
+  运行时根本走不到(qkv 是 float，永不进 Half 的 256)，但编译期照样实例化了它 → 编译就挂。
+  下面逐条拆“为什么”。
+
+──────────────────────────────────────────────────────────────────────────────
+1. 先分清两个词：编译/解析  vs  实例化（报错发生在“实例化”这一步）
+──────────────────────────────────────────────────────────────────────────────
+  · 编译/解析 = 看语法、认名字。
+  · 实例化   = 把模板的占位类型/值换成具体的，【真正生成那份代码】。
+  例：packed_as<float,8> 的 “incomplete type” 报在【实例化 fused_kernel<float,256>】这一步，
+      不是解析。⟹ 全节的问题只有一个：那一支【会不会被实例化】。
+
+──────────────────────────────────────────────────────────────────────────────
+2. switch 是运行时分支 → 编译器给【每个 case 体】都生成代码
+──────────────────────────────────────────────────────────────────────────────
+  走哪个 case 是运行时的值决定，编译期不知道 → 编译器不敢省任何一个，全部生成。
+  例：
+      switch (qkv.scalar_type()) {                       // 操作数是运行时值
+        case ScalarType::Float:    { /*...*/ break; }    // 三个 case 体
+        case ScalarType::Half:     { /*...*/ break; }    // 编译期【全部】生成代码
+        case ScalarType::BFloat16: { /*...*/ break; }
+        default: TORCH_CHECK(false, "bad dtype");
+      }
+  对比：if constexpr 的条件是编译期常量，编译期就确定只走一支，另一支可安全“不生成”。
+
+──────────────────────────────────────────────────────────────────────────────
+3. case 体里的模板调用 = ODR-use → “用到即实例化”（隐式实例化 [temp.inst]）
+──────────────────────────────────────────────────────────────────────────────
+  · ODR-use = 你【真的调用某函数/真的需要它有定义】。
+  · 隐式实例化 = 模板特化一旦被 ODR-use，就现场代入参数、生成那份代码。
+  例：case 256 体内 `launch<float,256>(...)` 是潜在求值的真实调用 → ODR-use
+      → 实例化 launch<float,256> → 连带 fused_kernel<float,256> → packed_as<float,8>。
+  反例(不算 ODR-use、不实例化)：sizeof(launch<...>)、decltype(...) 等不求值语境；
+      以及 if constexpr【被丢弃支】里的调用(实例化时根本不生成，见第 5 条)。
+
+──────────────────────────────────────────────────────────────────────────────
+4. 实例化是【编译期】动作，与【运行时是否走到】无关 → 永不命中的 case 也实例化
+──────────────────────────────────────────────────────────────────────────────
+  编译器不做运行时可达性分析；只要代码被生成，里面 ODR-use 的模板就都实例化。
+  例（这次 qkv_t = float）：
+      switch (the_type) {                                       // the_type 运行时值
+        case ScalarType::Float: { launch<float,128>(...); break; }   // 实例化 launch<float,128>
+        case ScalarType::Half:  { launch<float,256>(...); break; }   // ★照样实例化！即便运行时 the_type==Float 永不进此支
+        default: TORCH_CHECK(false, "bad dtype");
+      }
+  运行时进不了 case Half，但其代码编译期已实例化 launch<float,256> → 编译就挂，轮不到运行。
+
+──────────────────────────────────────────────────────────────────────────────
+5. 把 switch 放进模板也救不了——switch 仍“全 case 生成”
+──────────────────────────────────────────────────────────────────────────────
+  模板的“懒实例化”只决定【整个模板体要不要生成】；一旦生成，体内 switch 仍是全 case 生成。
+  例：
+      template<typename qkv_t> void f(ScalarType t) {     // 模板
+        switch (t) {                                                   // 运行时 switch
+          case ScalarType::Float: { launch<qkv_t,128>(...); break; }   // f<float> 运行时可能走这支（合法）
+          case ScalarType::Half:  { launch<qkv_t,256>(...); break; }   // ★这支也照样编译 → 实例化 launch<float,256>
+          default: break;                                              //   → float×256 → packed_as<float,8> → ❌
+        }
+      }
+      f<float>(...);   // 实例化 f<float>：体内 switch【全 case 生成】→ case Half 的 launch<float,256>
+                       //   仍被实例化 → 编译就挂；外围是模板也救不了（switch 不丢弃任何 case）。
+  对比第 4 条：差别只在“外围是不是模板”不影响结论——switch 在模板里同样全 case 实例化。
+  只有 if constexpr 能在“生成模板体”时主动跳过某支——这是它独有、switch 没有的语义。
+
+──────────────────────────────────────────────────────────────────────────────
+6. 能“丢弃不实例化”的是 if constexpr——但仅在【模板】里生效（两阶段+懒实例化）
+──────────────────────────────────────────────────────────────────────────────
+  · 阶段1(见模板定义)：依赖模板参数的部分(n、fused_kernel<qkv_t,head_dim>)先“冻结”，不求值不实例化。
+  · 阶段2(用具体参数实例化)：逐句生成代码；if constexpr 求值为 false 的支【整段不生成】
+    → 走不到里面的调用 → 不 ODR-use → 不实例化。链条在 if constexpr 处断掉。
+  例：
+      template<typename qkv_t, uint head_dim>
+      void launch_(...) {                                  // 是模板
+        constexpr uint n = head_dim/32*sizeof(qkv_t)/4;    // launch_<float,256> 此次 n=8
+        if constexpr (n <= 4) { fused_kernel<qkv_t,head_dim><<<...>>>(...); }  // n=8 时整段丢弃、不实例化
+        else { TORCH_CHECK(false, ...); }
+      }
+      launch_<float,256>：n=8 → true 支被丢弃 → fused_kernel<float,256> 从不实例化 ✅
+
+──────────────────────────────────────────────────────────────────────────────
+7. 非模板里 if constexpr 的【丢弃支也要 fully checked】→ 仍实例化
+──────────────────────────────────────────────────────────────────────────────
+  非模板没有“阶段2实例化”可跳过。“丢弃”≠“删除”：丢弃支仍是翻译单元里真实代码，按通用规则
+  (死代码也要良构)照常 check → 里面 ODR-use 照常触发实例化。
+  （if constexpr 被故意设计成【不等于 #if】：#if 删的是“文本”，if constexpr 丢的是“执行路径”，
+    文本还在就得良构，不允许藏非法代码。）
+  例（同一段，模板里能挡、非模板挡不住）：
+      template<int N> struct Need4 { static_assert(N <= 4); };
+      template<int N> void g() { if constexpr (N<=4) {} else { Need4<N> x; } }  // 模板
+      void h()                 { if constexpr (false) {     Need4<8> x;   } }   // 非模板
+      g<8>();   // ✅ else 被丢弃 → 不实例化 Need4<8>
+      h();      // ❌ 非模板 → 仍实例化 Need4<8> → static_assert 触发
+  ⟹ 同一段 if constexpr，差别只在【外围是不是模板】(有没有“跳过丢弃支”的阶段2)。
+
+──────────────────────────────────────────────────────────────────────────────
+8. 辨析：宏里 if constexpr 失效，主因是“非模板”，不是“外层是运行时 switch”
+──────────────────────────────────────────────────────────────────────────────
+  误解：“if constexpr 嵌在外层 runtime switch 里 → 它也变运行期 → 内层全 case 编译。”——归因错。
+  · if constexpr 选支是【编译期】定的：case Float 内 qkv_scalar_t 铁定=float，
+    is_same_v<float,float> 编译期 ==true、就丢 else；外层 runtime switch 不会“传染”它。
+  · else 里 case 256 仍被编译的唯一原因：所在函数 interleave【非模板】(丢弃支仍 fully checked)。
+  反证1（去掉外层 switch 照样错 → 锅不在 switch）：
+      void g() {                                  // 非模板，无任何外层 switch
+        if constexpr (std::is_same_v<float,float>) { /*...*/ }
+        else { launch<float,256>(...); }          // ❌ 仍 fully checked → 仍实例化 → 仍报错
+      }
+  反证2（加外层 runtime switch 但放进模板反而对 → 锅在“非模板”）：
+      template<typename qkv_t> void g(ScalarType t) {     // 模板
+        switch (t) {                                       // 外层就是运行时 switch
+          case ScalarType::Float: {
+            if constexpr (std::is_same_v<qkv_t,float>) { /*...*/ }
+            else { launch<qkv_t,256>(...); }               // ✅ qkv_t=float 实例化时 else 整段丢弃
+            break;
+          }
+          default: break;
+        }
+      }
+      g<float>(...);                                       // 不报错
+  ⟹ 两件事别混：外层 3 个 dtype case 都编译 ← 外层是【运行时 switch】；
+                 Float case 内 256 也编译   ← 内层在【非模板】里。各有各的原因，恰好同时发生。
+
+──────────────────────────────────────────────────────────────────────────────
+9. switch 不能替代 if constexpr（即便分支条件是 constexpr 值）
+──────────────────────────────────────────────────────────────────────────────
+  目标是“让非法那支【不被实例化】”，switch 编译所有 case → 必然实例化非法支。
+  例：
+      template<typename qkv_t, uint head_dim>
+      void launch_(...) {
+        constexpr uint n = head_dim/32*sizeof(qkv_t)/4;    // launch_<float,256> 此次 n=8
+        switch (n) {                          // 运行时 switch（即使 n 是 constexpr）
+          case 1: case 2: case 4:
+            fused_kernel<qkv_t,head_dim><<<...>>>(...);     // ★这支照样编译 → 实例化 fused_kernel<float,256> → ❌
+            break;
+          default: TORCH_CHECK(false, ...);
+        }
+      }
+  换成 `if constexpr (n>=1 && n<=4){★} else{TORCH_CHECK}`，n=8 时 ★整段丢弃、不实例化，才对。
+
+──────────────────────────────────────────────────────────────────────────────
+10. 解决方案：把判定放进【模板上下文】，用“会丢弃/不实例化”的机制
+──────────────────────────────────────────────────────────────────────────────
+  合法集回顾：每线程取 n = head_dim/32 * sizeof(qkv_t) / 4 个 4 字节，对应 packed_as<float,n>，
+  只特化 n∈{1,2,4}。⟹ half/bf16(2字节)：64/128/256 → n=1/2/4 合法；float(4字节)：64/128 → n=2/4
+  合法，而 float×256 → n=8 → packed_as<float,8> 非法。目标：永不【实例化】float×256 那一份。
+
+  能“丢弃/不实例化未选中支”的只有：if constexpr、模板特化/重载/SFINAE、#if(看不见 C++ 类型，
+  这里用不上)；switch 不在其列。下面 A/B/C 都满足“判定身处【模板】”这个前提。
+
+  ┌─ 方案B：在本就是模板的 launch_ 内用 if constexpr 兜底（★改动最小，推荐）──────────┐
+
+    // launch_ 本身是模板：head_dim、qkv_scalar_t 都是模板参数 → 内部 if constexpr 的条件
+    // 依赖模板参数 → 实例化时丢弃支【不实例化】。
+    template<typename qkv_scalar_t, typename cache_scalar_t, uint head_dim>
+    void launch_fused_QKNorm_and_ROPE_kernel(void* qkv_ptr, /* ...其余运行时参数... */) {
+      constexpr uint numElemsPerThread = head_dim / 32;
+      constexpr uint numPerFourBytes   = numElemsPerThread * sizeof(qkv_scalar_t) / 4;
+
+      if constexpr (numPerFourBytes >= 1 && numPerFourBytes <= 4) {
+        // —— 合法组合：照常 launch kernel ——
+        // 实例化 launch_<float,256> 时 numPerFourBytes==8 → 本支为【丢弃支】→ 整段不实例化，
+        // 故 fused_QKNorm_and_ROPE_kernel<float,...,256> 从不实例化 → 不碰 packed_as<float,8>。
+        dim3 grid = ..., block = ...;
+        fused_QKNorm_and_ROPE_kernel<qkv_scalar_t, cache_scalar_t, head_dim>
+            <<<grid, block>>>(qkv_ptr, /* ... */);
+        cudaCheck(cudaGetLastError());
+      } else {
+        // —— 非法组合(如 float×256)：本支被实例化，但它【不含 kernel】，故不触发 packed_as<float,8>。
+        //    运行期真请求到该组合时，抛错而非静默。
+        TORCH_CHECK(false, "[fused_QKNorm_and_ROPE] head_dim=", head_dim,
+                    " 不支持当前 dtype：每线程需 ", numPerFourBytes,
+                    " 个 4 字节(packed_as<float,", numPerFourBytes, ">)，仅支持 1/2/4。");
+      }
+    }
+
+    // 配套：head_dim 宏退回“只 switch head_dim、不按 dtype 分支、无 TYPE 参数”，对所有 dtype 放行
+    // {64,128,256}；非法组合交给上面 launch_ 的 if constexpr 兜。调用处：
+    //   ROPE_DISPATCH_HEAD_DIM(head_dim, "...", [&]{ launch_<qkv_scalar_t,cache_scalar_t,headDIM>(...); });
+
+    解析：dispatch 仍会“写出” launch_<float,256> 的调用并实例化【launch_ 本身】；但 launch_ 是
+          模板，其体内 if constexpr(numPerFourBytes<=4) 在 head_dim=256,float 时求值为 false →
+          含 fused_kernel 的真支被丢弃、不实例化 → 链条在此断掉。改动仅限 launch_ 一个函数。
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ 方案A：把 dispatch 段抽进【模板 helper】，让宏在模板里展开 → 宏内 if constexpr 真正丢弃 ─┐
+
+    // head_dim 宏保留“按 dtype 用 if constexpr 选 head_dim 集合”的写法(float:{64,128}；
+    // half/bf16:{64,128,256})。但它必须在【模板上下文】展开，故抽一个模板 helper 包住：
+    template<typename qkv_scalar_t, typename cache_scalar_t>
+    void dispatch_head_dim(int64_t head_dim, void* qkv_ptr, /* ...运行时参数... */) {
+      ROPE_DISPATCH_HEAD_DIM(qkv_scalar_t, head_dim, "fused_QKNorm_and_ROPE", [&]{
+        launch_fused_QKNorm_and_ROPE_kernel<qkv_scalar_t, cache_scalar_t, headDIM>(qkv_ptr, /* ... */);
+      });
+    }
+    // 宏内即： if constexpr (std::is_same_v<qkv_scalar_t, float>) { switch(head_dim){64,128} }
+    //         else                                              { switch(head_dim){64,128,256} }
+
+    // 入口(非模板)只负责把【运行时 dtype → 编译期类型】，然后转交模板 helper：
+    void fused_QKNorm_and_ROPE_interleave(at::Tensor& qkv, /* ... */) {
+      ROPE_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "...", [&]{
+        using qkv_scalar_t = scalar_t;
+        ROPE_DISPATCH_FLOATING_TYPES(cos.scalar_type(), "...", [&]{
+          using cache_scalar_t = scalar_t;
+          dispatch_head_dim<qkv_scalar_t, cache_scalar_t>(head_dim, qkv.data_ptr(), /* ... */);
+        });
+      });
+    }
+
+    解析：dispatch_head_dim 是模板。实例化 dispatch_head_dim<float, …> 时，宏内
+          if constexpr(is_same_v<float,float>) 取 true 支 → else(含 case 256)是【丢弃支】，
+          因处于模板实例化中【不实例化】→ launch_<float,256> 这串调用根本不生成 → 不实例化。
+          优点：dtype↔head_dim 的合法集中表达在宏里、launch_ 无需改；代价：多一个 helper 模板。
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ 方案C：模板特化/SFINAE——未选中的重载不实例化（不想用 if constexpr 时）──────────┐
+
+    // 用 enable_if 把 launch_ 拆成“合法组合”和“非法组合”两个重载，靠重载决议二选一；
+    // 【未被选中的重载不实例化】，与 if constexpr 同源。
+    // 合法组合(n≤4)：真正 launch kernel
+    template<typename qkv_scalar_t, typename cache_scalar_t, uint head_dim,
+             std::enable_if_t<(head_dim/32 * sizeof(qkv_scalar_t) / 4) <= 4, int> = 0>
+    void launch_fused_QKNorm_and_ROPE_kernel(void* qkv_ptr, /* ... */) {
+      fused_QKNorm_and_ROPE_kernel<qkv_scalar_t, cache_scalar_t, head_dim><<<...>>>(qkv_ptr, /* ... */);
+    }
+    // 非法组合(n>4，如 float×256)：仅抛错，【函数体内不含 kernel】
+    template<typename qkv_scalar_t, typename cache_scalar_t, uint head_dim,
+             std::enable_if_t<(head_dim/32 * sizeof(qkv_scalar_t) / 4) >  4, int> = 0>
+    void launch_fused_QKNorm_and_ROPE_kernel(void* qkv_ptr, /* ... */) {
+      TORCH_CHECK(false, "head_dim=", head_dim, " 不支持当前 dtype（需 packed_as<float,≤4>）。");
+    }
+
+    解析：对 launch_<float,256>：第一个重载的 enable_if 条件 (8<=4) 为假 → 该重载【SFINAE 出局、
+          不参与、不实例化】(含 fused_kernel<float,256> 的那份从不生成)；只剩第二个 stub 重载被选。
+          代价：两个重载、签名啰嗦；好处：不用 if constexpr，纯重载决议。
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  共同前提与本质：A 的 dispatch_head_dim、B/C 的 launch_ 都【是模板】。三者都靠“模板里未选中/
+  丢弃支不实例化”切断到 fused_kernel<float,256> 的实例化链。若把同样逻辑放进【非模板】，
+  if constexpr 丢弃支仍 fully checked、SFINAE 的 stub 仍要写出合法签名——但关键在“被剔除的那份
+  不实例化”，这点 SFINAE/if constexpr 在非模板里对【已具体化的调用】依旧不生效(见第 7、8 条)。
+  ⟹ 选 B（最小）：只在 launch_ 内加一段 if constexpr 兜底即可。
+
+──────────────────────────────────────────────────────────────────────────────
+最终对照 & 口诀
+──────────────────────────────────────────────────────────────────────────────
+  | 机制                  | 选择时机  | 未选中/未命中支     | 阻止非法实例化 |
+  |-----------------------|----------|---------------------|----------------|
+  | switch/case           | 运行时   | 仍编译、仍实例化    | ❌（本 bug 根源）|
+  | if constexpr（模板内）| 编译期   | 丢弃、不实例化      | ✅             |
+  | 模板特化/重载/SFINAE  | 编译期   | 未选中者不实例化    | ✅             |
+  | #if（预处理）         | 预处理期 | 文本删除            | ✅但看不见类型 |
+
+  口诀：switch 只控制“运行时跑哪段”，控制不了“编译期实例化哪段”；要裁掉不该实例化的模板组合，
+        用 if constexpr / 特化 / SFINAE，且必须身处【模板上下文】（非模板里它们同样不丢弃）。
+
+
 相关文件：
+    docs/c++/constexpr_function_and_if_constexpr.txt —— if constexpr 丢弃未取分支、不实例化
+    docs/c++/scalartype_to_cpptype.txt               —— 运行时 dtype → 编译期类型/常量的桥
+    docs/c++/class_and_function_templates.txt        —— 模板“用到即实例化”、非类型模板参数
     docs/c++/noreturn_and_reachability_analysis.txt  —— [[noreturn]] 与可达性分析
     docs/c++/enum_vs_enum_class.txt                  —— enum/enum class、ScalarType
     docs/c++/x_macro_scalartype_enum.txt             —— ScalarType 枚举值由 X-macro 生成

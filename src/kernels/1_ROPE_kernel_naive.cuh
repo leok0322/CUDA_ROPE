@@ -16,7 +16,7 @@ __global__ void ROPE_kernel_naive(index_t totalRow, index_t totalCol,scalar_t *A
   scalar_t element2 { A[row * totalCol + colGroup * 2 + 1] };
 
 
-  float theta_i { 1.0f / powf(theta, 2 * colGroup / static_cast<float>(totalCol) )  };
+  float theta_i { 1.0f / powf(rope_theta, 2 * colGroup / static_cast<float>(totalCol) )  };
   scalar_t newElement1 { static_cast<scalar_t>(cosf(row * theta_i) * element1 - sinf(row * theta_i) * element2) };
   scalar_t newElement2 { static_cast<scalar_t>(sinf(row * theta_i) * element1 + cosf(row * theta_i) * element2 ) };
 

@@ -15,32 +15,72 @@ void launch_fused_QKNorm_and_ROPE_kernel(
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
     int64_t num_tokens, int64_t rotary_dim, double eps) {
 
-  int64_t half { rotary_dim / 2};
-  // half(=rotary_dim/2)须为 BLOCK_SIZE_X 的整数倍：每个 head 的 half 维按 BLOCK_SIZE_X 分块，
-  // 不能整除会导致边界线程越界/漏算。不满足则：先 fprintf 打终端(stderr)日志，
-  // 再用 TORCH_CHECK(false, ...) 抛 c10::Error → Python 收到 RuntimeError(取代原 return 的静默)。
-  if (half % BLOCK_SIZE_X != 0) {
-    fprintf(stderr,
-            "[fused_QKNorm_and_ROPE] half(=rotary_dim/2=%lld) 必须是 BLOCK_SIZE_X(=%d) 的整数倍，"
-            "当前不满足，跳过 kernel 启动。\n",
-            static_cast<long long>(half), BLOCK_SIZE_X);
+  // ───────────────────────────────────────────────────────────────────────────
+  // ★(dtype, head_dim) 合法性守卫（方案B：必须放在【模板函数】里用 if constexpr）。
+  //   kernel 每线程做向量化 load/store，取 numPerFourBytes 个 4 字节，对应 packed_as<float,N>：
+  //       numPerFourBytes = (head_dim/32) * sizeof(qkv_scalar_t) / 4
+  //   packed_as 只特化 N∈{1,2,4}(float/float2/float4，最大 16 字节)，没有 float8(32 字节向量)。
+  //   合法：half/bf16 的 64/128/256(N=1/2/4)、float 的 64/128(N=2/4)；非法：float×256 → N=8。
+  //
+  //   守卫为何放这里：dispatch 仍会写出并实例化 launch_...<float,256> 本身；但本函数【是模板】，
+  //   实例化它时下面的 if constexpr 条件依赖模板参数(head_dim/qkv_scalar_t)，N=8 时含 kernel 的
+  //   真支【整段丢弃、不实例化】→ fused_QKNorm_and_ROPE_kernel<float,...,256> 从不实例化 →
+  //   不碰 packed_as<float,8>。运行期真撞上非法组合则走 else 抛 TORCH_CHECK(false)。
+  //   （若放进 dispatch 宏(非模板上下文)则丢弃支仍 fully checked、仍实例化，挡不住——见
+  //     docs/c++/switch_case_fallthrough_and_warnings.txt 第九节。）
+  // ───────────────────────────────────────────────────────────────────────────
+  constexpr uint numElemsPerThread {head_dim / 32};
+  constexpr uint numPerFourBytes {numElemsPerThread * static_cast<uint>(sizeof(qkv_scalar_t)) / 4};
+
+  if constexpr (numPerFourBytes >= 1 && numPerFourBytes <= 4) {
+    // ─────────────────────────────────────────────────────────────────────────
+    // 本 kernel【真正需要】的约束(都已在别处显式守住，此处汇总)：
+    //   ① head_dim % 64 == 0          —— static_assert(下方)。一个 head 由 32 lane 处理、每 lane
+    //                                    一次处理 2 个元素(成对 T_in2)，故 head_dim/32 须为偶 → %64。
+    //   ② BLOCK_SIZE_X % 32 == 0      —— static_assert(下方)。并行模型是"一个 warp(32 lane)负责一个
+    //                                    (token,head)"，blockDim.x 须为整 warp。
+    //   ③ rotary_dim % (head_dim/32)==0 —— TORCH_CHECK(下方)。RoPE 用 lane 级边界判定，rotary 边界
+    //                                    须落在 lane 边界(每条 lane 要么全旋转要么全不转)。
+    //   ④ (dtype,head_dim) 使 numPerFourBytes∈{1,2,4} —— 外层 if constexpr。packed_as<float,N> 须有特化。
+    //
+    // 注：曾有 `half(=rotary_dim/2) % BLOCK_SIZE_X == 0` 的检查，已删除——它是旧的"整块线程铺 half 维"
+    //     设计的遗留，与当前 warp-per-head 模型无关(BLOCK_SIZE_X 只决定每块几个 warp、用于算 grid，
+    //     和每个 head 内部的 half 维无关)。该检查会误杀 head_dim=64(half=32%64≠0)等合法配置。
+    // ─────────────────────────────────────────────────────────────────────────
+    static_assert(BLOCK_SIZE_X % 32 == 0, "BLOCK_SIZE_X需要是32的倍数，因为一个warp负责一行");
+    uint totalQKHeads {static_cast<uint>(num_tokens * (num_heads_q + num_heads_k))};
+    uint warpsPerBlock {BLOCK_SIZE_X / 32};
+    dim3 gridSize {1,cuda::ceil_div(totalQKHeads,warpsPerBlock),1};
+    dim3 blockSize {BLOCK_SIZE_X,1,1};
+
+
+    static_assert(head_dim % 64 == 0,"一个head被32个线程处理，每个线程一次处理2个元素，需要dim是64的倍数");
+
+    // RoPE 旋转用【lane 级】边界判定(kernel 里 if(cosSinInitDimPerThread<half) 一次性判整条 lane)，
+    // 故要求 rotary 边界【正好落在 lane 边界】：rotary_dim 必须是 numElemsPerThread(=head_dim/32) 的
+    // 整数倍 ⟹ 每条 lane 要么全旋转、要么全不旋转，无需在循环内逐对判。否则(边界落 lane 中间)会算错。
+    //   等价：half(=rotary_dim/2) 须为 (head_dim/32)/2 的整数倍。
+    // 实践：全旋转(rotary_dim==head_dim)恒满足；head_dim=64 因 rotary_dim 必偶也恒满足；
+    //       整齐的部分旋转(rotary_dim 为 8/16 倍数)通常满足。此处显式守住，违反则报错而非静默算错。
+    TORCH_CHECK(rotary_dim % numElemsPerThread == 0,
+                "[fused_QKNorm_and_ROPE] rotary_dim(=", rotary_dim, ") 必须是 head_dim/32(=",
+                numElemsPerThread, ") 的整数倍(RoPE lane 级边界判定要求 rotary 边界对齐 lane 边界)");
+
+    fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,head_dim><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
+         num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
+    cudaCheck(cudaGetLastError());
+  } else {
+    // 非法 (dtype, head_dim)：如 float×256(每线程 32 字节，需 packed_as<float,8>，无此向量类型)。
+    // 因在模板内，本支整段【不实例化】kernel；仅在运行期真撞上时抛错。
     TORCH_CHECK(false,
-                "[fused_QKNorm_and_ROPE] half(=rotary_dim/2=", half,
-                ") 必须是 BLOCK_SIZE_X(=", BLOCK_SIZE_X, ") 的整数倍");
+                "[fused_QKNorm_and_ROPE] head_dim=", head_dim,
+                " 不支持当前 dtype：每线程需 ", numPerFourBytes,
+                " 个 4 字节(packed_as<float,", numPerFourBytes,
+                ">)，仅支持 1/2/4(float/float2/float4)。例如 float×256 非法，请用 half/bf16。");
   }
-
-  static_assert(BLOCK_SIZE_X % 32 == 0, "BLOCK_SIZE_X需要是32的倍数，因为一个warp负责一行");
-  uint totalQKHeads {static_cast<uint>(num_tokens * (num_heads_q + num_heads_k))};
-  uint warpsPerBlock {BLOCK_SIZE_X / 32};
-  dim3 gridSize {1,cuda::ceil_div(totalQKHeads,warpsPerBlock),1};
-  dim3 blockSize {BLOCK_SIZE_X,1,1};
-
-
-  fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,head_dim><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
-       num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
 }
 
-void fused_QKNorm_and_ROPE_interleave(
+void fused_QKNorm_and_ROPE_neox(
     at::Tensor& qkv,                  // [num_tokens, (Hq+Hk+Hv)*head_dim]  ★就地改写
     const at::Tensor& q_weight,       // [head_dim]  Q 的 RMSNorm γ
     const at::Tensor& k_weight,       // [head_dim]  K 的 RMSNorm γ
@@ -68,7 +108,7 @@ void fused_QKNorm_and_ROPE_interleave(
     using qkv_scalar_t = scalar_t;
     ROPE_DISPATCH_FLOATING_TYPES(cos.scalar_type(), "fused_QKNorm_and_ROPE", [&] () -> void {
       using cache_scalar_t = scalar_t;
-      ROPE_DISPATCH_HEAD_DIM(qkv.scalar_type(),head_dim, "fused_QKNorm_and_ROPE",[&] () -> void {
+      ROPE_DISPATCH_HEAD_DIM(head_dim, "fused_QKNorm_and_ROPE",[&] () -> void {
         launch_fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,headDIM>(qkv_ptr,q_weight_ptr,k_weight_ptr,cos_ptr,sin_ptr,num_heads_q,num_heads_k,num_heads_v,num_tokens,rotary_dim,eps);
         //return;
       });

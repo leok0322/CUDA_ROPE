@@ -1,0 +1,224 @@
+═══════════════════════════════════════════════════════════════════════════════
+  GPU 内存访问分析：Bank Conflict & 合并事务（Coalesced Access）
+  参考实现：softmax_kernel_reduction（src/kernels/softmax_kernel_2.cuh）
+═══════════════════════════════════════════════════════════════════════════════
+
+启动配置：
+  block_size = dim3(BLOCK_DIM_X=1024, 1, 1)
+  grid_size  = dim3(1, totalRow, 1)
+  → 每个 block 负责 1 行，1024 个线程（threadIdx.x = colGroup）
+  → 1024 / 32 = 32 个 warp，warp k = colGroup 32k..32k+31
+
+───────────────────────────────────────────────────────────────────────────────
+一、基础概念
+───────────────────────────────────────────────────────────────────────────────
+
+【全局内存（GMEM）访问粒度】
+
+  Sector   = 32 字节（最小内存事务单位）
+  Cache line = 128 字节 = 4 个 sector（L1/L2 存储单位）
+
+  warp 32 线程访问全局内存的流程：
+    1. 硬件收集 32 个地址，按 sector 分组
+    2. 每个被触及的 sector 发出 1 次 32 字节内存事务
+    3. 连续对齐访问（32 float）→ 4 个 sector → 4 次事务（最优）
+    4. 随机散布访问 → 最多 32 个 sector → 32 次事务（最差）
+
+  Coalesced（合并访问）= warp 内线程访问连续地址，sector 事务数最少
+
+【L1/L2/DRAM 访问路径】
+
+  L1 hit：
+    数据在 L1 cache 中 → L1 按 sector 粒度定位，直接送给 warp
+    不产生 L2 / DRAM 流量
+
+  L1 miss / L2 hit：
+    L1 向 L2 请求对应 cache line（128 字节）
+    L2 以 sector（32 字节）× 4 送往 L1，填满 1 条 cache line
+
+  L2 miss（cold miss）：
+    L2 向 DRAM 发 4 次 sector 事务（各 32 字节）
+    → 填入 L2 cache line → 再由 L2 送往 L1
+
+【128 字节对齐的意义】
+
+  32 字节对齐  → sector 事务数最优（4 次），coalescing 的充分条件
+  128 字节对齐 → 额外保证 128 字节数据落在同一 cache line 内：
+    若跨 cache line 边界（如起始于 byte 32）：
+      数据落入 2 条 cache line，L2 cold miss 须取 2×128=256 字节
+      其中 128 字节无用 → DRAM 带宽浪费 50%
+    若 128 字节对齐：
+      数据完整在 1 条 cache line，DRAM 仅取 128 字节，利用率 100%
+
+  本 kernel 满足 128 字节对齐：
+    ① 基址 a：cudaMalloc 保证 256 字节对齐 → a % 128 == 0
+    ② 行首偏移 = (row + initRow) × totalCol × 4 字节
+       要求 totalCol × 4 % 128 == 0 → totalCol % 32 == 0
+       totalCol = 1024/2048/4096（2 的幂且 ≥ 32）均满足 ✓
+    ③ 行首地址 = (128 整数倍基址) + (128 整数倍偏移) = 128 字节对齐 ✓
+
+【Shared Memory Bank Conflict】
+
+  Shared memory 有 32 个 bank，每 bank 宽 4 字节
+  元素 reduction[k] → bank = k % 32
+
+  Bank conflict：同一条指令内，同一 warp 的多个线程访问同一 bank
+  无 conflict：同一条指令内，各线程访问不同 bank（或广播同一地址）
+  注意：两条不同指令分开判定，互不影响
+
+───────────────────────────────────────────────────────────────────────────────
+二、全局内存访问分析（GMEM Coalescing）
+───────────────────────────────────────────────────────────────────────────────
+
+循环模式：for (i = colGroup; i < totalCol; i += threadNum)
+  → 步进式（strided），warp 内相邻线程访问相邻地址 → coalesced ✓
+
+────────────────────────────────────
+2.1 Pass 1：求最大值
+────────────────────────────────────
+
+  代码：maxval = fmax(maxval, a[(row + initRow) * totalCol + i]);
+
+  warp 0（colGroup 0..31），第一次迭代（i = colGroup）：
+    thread 0  → a[base + 0]
+    thread 1  → a[base + 1]
+    ...
+    thread 31 → a[base + 31]
+    （base = (row + initRow) * totalCol）
+
+  地址连续，128 字节对齐 → 4 个 sector → 4 次事务
+  L1 状态：cold miss → L2 miss → DRAM 取 128 字节填入 L1
+
+  后续迭代（i = colGroup + 1024, +2048, ...）同理，仍 coalesced ✓
+
+────────────────────────────────────
+2.2 Pass 2：求 exp 之和
+────────────────────────────────────
+
+  代码：sum += __expf(a[(row + initRow) * totalCol + col] - maxval);
+
+  访问地址与 Pass 1 完全相同
+  L1 状态：Pass 1 已将同行数据加载到 L1 → L1 hit
+  → 不产生 L2 / DRAM 流量，4 个 sector 直接从 L1 送给 warp ✓
+
+────────────────────────────────────
+2.3 Pass 3：写出 softmax 结果
+────────────────────────────────────
+
+  代码：b[(row + initRow) * totalCol + i] =
+            __expf(a[(row + initRow) * totalCol + i] - maxval) / diversor;
+
+  读 a[]：
+    访问地址与 Pass 1/2 相同 → L1 hit，4 sector，不访问 DRAM ✓
+
+  写 b[]：
+    地址连续，128 字节对齐 → coalesced write，4 次 sector 事务
+    首次写入，b[] 不在 L1 cache → L2/DRAM 写事务
+
+────────────────────────────────────
+2.4 三个 Pass 的 GMEM 事务汇总
+────────────────────────────────────
+
+  Pass 1（读 a）：L2/DRAM 取数   → 4 次 sector 事务（cold miss）
+  Pass 2（读 a）：L1 hit          → 0 次 L2/DRAM 事务
+  Pass 3（读 a）：L1 hit          → 0 次 L2/DRAM 事务
+  Pass 3（写 b）：coalesced write → 4 次 sector 事务
+
+  每行共 8 次 sector 事务（128 字节读 + 128 字节写）
+  带宽利用率：sector 利用率 100%（每 sector 内 8 个 float 全部使用）
+
+───────────────────────────────────────────────────────────────────────────────
+三、共享内存访问分析（Shared Memory Bank Conflict）
+───────────────────────────────────────────────────────────────────────────────
+
+shared memory 声明：float __shared__ reduction[BLOCK_DIM_X];  // 1024 个 float
+reduction[k] → bank = k % 32
+
+────────────────────────────────────
+3.1 写入局部 max（Pass 1 结束后）
+────────────────────────────────────
+
+  代码：reduction[colGroup] = maxval;
+
+  warp k（colGroup 32k..32k+31）执行写指令：
+    thread 32k   → reduction[32k]   → bank (32k)   % 32 = 0
+    thread 32k+1 → reduction[32k+1] → bank (32k+1) % 32 = 1
+    ...
+    thread 32k+31→ reduction[32k+31]→ bank 31
+    → 32 线程访问 32 个不同 bank → 无 bank conflict ✓
+
+────────────────────────────────────
+3.2 树形规约求最大值
+────────────────────────────────────
+
+  代码：reduction[colGroup] = fmaxf(reduction[colGroup], reduction[colGroup+i]);
+
+  编译为 3 条独立 shared memory 指令（分开判定 conflict）：
+
+  Load A: reduction[colGroup]
+    活跃线程 colGroup 0..min(i-1, 31)，访问 bank 0..min(i-1, 31)，各不同 ✓
+
+  Load B: reduction[colGroup + i]
+    i ≥ 32（i=512,256,128,64,32）：colGroup 0..31 → bank (i%32)..(i%32+31)
+      因 i 是 32 的倍数，bank 范围仍为 0..31，各不同 ✓
+    i < 32（i=16,8,4,2,1）：colGroup 0..i-1 → bank i..2i-1，各不同 ✓
+
+  Store: reduction[colGroup]
+    同 Load A，各不同 ✓
+
+  结论：所有迭代均无 bank conflict ✓
+
+────────────────────────────────────
+3.3 写入局部 sum（Pass 2 结束后）
+────────────────────────────────────
+
+  代码：reduction[colGroup] = sum;
+
+  分析同 3.1，warp 内 32 线程 → 32 个不同 bank → 无 bank conflict ✓
+
+────────────────────────────────────
+3.4 树形规约求和
+────────────────────────────────────
+
+  代码：reduction[colGroup] += reduction[colGroup + i];
+
+  分析同 3.2（3 条指令，各自无 conflict）✓
+
+────────────────────────────────────
+3.5 共享内存访问汇总
+────────────────────────────────────
+
+  所有 shared memory 访问均无 bank conflict ✓
+
+  __syncthreads() 调用次数：
+    Pass 1 写后同步：1 次
+    max 树形规约：log₂(1024) = 10 次（每轮规约后）
+    Pass 2 写后同步：1 次（问题2修复：原代码缺少此处同步）
+    sum 树形规约：10 次
+    读 reduction[0] 前同步：1 次
+    共 23 次
+
+  注：kernel4 用 warp shuffle 将 __syncthreads() 减少到 4 次
+
+───────────────────────────────────────────────────────────────────────────────
+四、kernel_2（连续块）vs kernel_reduction（步进式）访问模式对比
+───────────────────────────────────────────────────────────────────────────────
+
+  kernel_2 Pass 1&2：for (i = ty*BLOCK_DIM_X; i < min(totalCol, (ty+1)*BLOCK_DIM_X); i+=1)
+    warp 0 第一次迭代：
+      ty=0  → a[base + 0]
+      ty=1  → a[base + 1024]    ← 间距 4096 字节
+      ty=2  → a[base + 2048]
+      ...
+      ty=31 → a[base + 31744]
+    → 32 线程各自触发不同 sector → 32 次 sector 事务 → 完全不 coalesced ✗
+
+  kernel_reduction Pass 1&2：for (i = colGroup; i < totalCol; i += threadNum)
+    warp 0 第一次迭代：
+      colGroup=0  → a[base + 0]
+      colGroup=1  → a[base + 1]    ← 间距 4 字节
+      ...
+      colGroup=31 → a[base + 31]
+    → 32 线程访问连续地址 → 4 次 sector 事务 → 完全 coalesced ✓
+
+  带宽利用率提升：32 次 → 4 次，提升 8×（Pass 1 和 Pass 2）
