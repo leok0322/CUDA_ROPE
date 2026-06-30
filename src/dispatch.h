@@ -24,19 +24,10 @@
 #include <torch/headeronly/util/Half.h>         // c10::Half        ← 轻量 headeronly 头
 #include <torch/headeronly/util/BFloat16.h>     // c10::BFloat16    ← 取代重型 <torch/extension.h>
 #include <string>                                // std::to_string（head_dim 报错信息）
-#include <stdexcept>                             // std::runtime_error
 #include <utility>                               // std::forward
 #include <type_traits>                           // std::is_same_v（head_dim 宏按 dtype 分流）
+#include "error_check.cuh"
 
-// [[noreturn]] 抛出辅助：让编译器【确知】此调用不会返回 → switch 的 default 走它之后
-//   控制流不可达，既无 -Wimplicit-fallthrough（穿透）顾虑，也不必靠 break 兜。
-//   inline + 在头文件中定义：多 TU 包含不冲突（隐式 inline 的 ODR 豁免）。
-namespace rope_dispatch {
-template <typename Msg>
-[[noreturn]] inline void throw_runtime(Msg&& msg) {
-  throw std::runtime_error(std::forward<Msg>(msg));
-}
-}  // namespace rope_dispatch
 
 #define ROPE_EMPTY(...)
 
@@ -89,20 +80,6 @@ template <typename Msg>
   C10_DIAGNOSTIC_POP()                                                    \
   }()
 
-
-#define ROPE_ST_TORCH_CHECK(cond, ...)                \
-  if (C10_UNLIKELY_OR_CONST(!(cond))) {           \
-  rope_dispatch::throw_runtime(STD_TORCH_CHECK_MSG( \
-  cond,                                     \
-  "",                                       \
-  __func__,                                 \
-  ", ",                                     \
-  __FILE__,                                 \
-  ":",                                      \
-  __LINE__,                                 \
-  ", ",                                     \
-  ##__VA_ARGS__));                          \
-  }
 
 
 #define ROPE_DISPATCH_SWITCH(TYPE, NAME, ...) \

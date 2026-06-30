@@ -3,6 +3,7 @@
 #include "kernels.cuh"
 #include <torch/extension.h>
 #include "dispatch.h"
+#include "validation.h"
 
 
 template<typename qkv_scalar_t,typename cache_scalar_t, uint head_dim>
@@ -88,6 +89,40 @@ void fused_QKNorm_and_ROPE_neox(
     const at::Tensor& sin,            // [num_tokens, rotary_dim/2]
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
     int64_t head_dim, int64_t rotary_dim, double eps) {
+
+
+  ROPE_CHECK(qkv)
+  ROPE_CHECK(q_weight)
+  ROPE_CHECK(k_weight)
+  ROPE_CHECK(cos)
+  ROPE_CHECK(sin)
+  ROPE_ST_TORCH_CHECK(qkv.dim()==2,"QKV tensor must be 2D: [num_tokens, "
+                  "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
+  ROPE_ST_TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
+  ROPE_ST_TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
+  ROPE_ST_TORCH_CHECK(cos.dim() == 2,
+                  "Cos/sin cache must be 2D: [num_tokens, rotary_dim/2] ]");
+  ROPE_ST_TORCH_CHECK(sin.dim() == 2,
+                  "Cos/sin cache must be 2D: [num_tokens, rotary_dim/2] ]");
+  ROPE_ST_TORCH_CHECK(q_weight.size(0) == head_dim,
+                  "Query weights size must match head dimension");
+  ROPE_ST_TORCH_CHECK(k_weight.size(0) == head_dim,
+                  "Key weights size must match head dimension");
+
+  ROPE_ST_TORCH_CHECK(cos.size(1) % 2 == 0, "rotary_dim must be even");
+  ROPE_ST_TORCH_CHECK(sin.size(1) % 2 == 0, "rotary_dim must be even");
+  ROPE_ST_TORCH_CHECK(cos.size(1) <= head_dim,
+                  "rotary_dim must be less than or equal to head_dim");
+  ROPE_ST_TORCH_CHECK(sin.size(1) <= head_dim,
+                  "rotary_dim must be less than or equal to head_dim");
+  ROPE_ST_TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
+                      qkv.scalar_type() == k_weight.scalar_type(),
+                  "qkv, q_weight and k_weight must have the same dtype");
+
+  int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
+  ROPE_ST_TORCH_CHECK(
+      qkv.size(1) == total_heads * head_dim,
+      "QKV tensor size must match total number of heads and head dimension");
 
   int64_t num_tokens { qkv.size(0) };
   auto qkv_ptr { qkv.data_ptr() };

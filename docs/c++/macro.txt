@@ -664,6 +664,19 @@ C/C++ 源文件从代码到可执行文件经过四个阶段：
     #cond = "x > 0" → 默认串 = "Expected x > 0 to be true…"；相邻字面量在【编译期】拼成一个、
     零运行期成本。为什么非宏不可：函数只拿到 cond 的【值】(true/false)，拿不到源码文本。
 
+    ★ 常见惯用法：用 #参数 把【变量名】嵌进错误信息（本项目 CHECK_CUDA 一类断言）
+        #define CHECK_CUDA(x)  STD_TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+      这里 x 既当【代码】用（x.is_cuda() → 正常替换求值），又被 #x 当【文本】用：
+        CHECK_CUDA(query);
+          ① x 替换：x.is_cuda()      → query.is_cuda()    （参与运算的代码）
+          ② #x 字符串化：#x          → "query"            （取实参的源码 token 文本，不求值）
+        ⟹ STD_TORCH_CHECK(query.is_cuda(), "query" " must be a CUDA tensor");
+      关键第二步靠【相邻字符串字面量自动拼接】(C++ 翻译阶段)："query" 与 " must be a CUDA
+      tensor" 紧挨 → 编译器拼成一个 "query must be a CUDA tensor"。于是断言失败时，报错信息里
+      【自动带上出错张量的变量名】：换成 CHECK_CUDA(key) 就自动变 "key must be a CUDA tensor"。
+      —— 一份宏，把不同实参名各自嵌进消息；函数做不到（函数只拿到张量的值，拿不到 "query" 这个名字）。
+      注意 #x 取的是【你写的 token 文本】，不求值：CHECK_CUDA(qkv[i]) 会得到 "qkv[i]" 这串文本。
+
   ── (3) ## ：记号粘接；以及 ##__VA_ARGS__（空变参删逗号）─────────────────────
     ## 把左右两个记号【粘成一个】：
         #define CAT(a, b) a##b

@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>  // cudaError_t, cudaGetErrorString
 #include <cstdio>          // fprintf, stderr
 #include <cstdlib>         // exit, EXIT_FAILURE
+#include <stdexcept>                             // std::runtime_error
 
 // cudaCheck(cudaError_t, const char*, int)：底层实现，三个参数版本
 //   error : CUDA API 返回的错误码（cudaSuccess 表示成功）
@@ -33,3 +34,31 @@ inline void cudaCheck(cudaError_t error, const char *file, int line) {
 //   __FILE__ / __LINE__ 在预处理阶段展开为调用处的文件名和行号，无运行时开销
 //   外层括号：防止宏展开结果在复杂表达式中因运算符优先级被截断（防御性写法）
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
+
+
+
+
+// [[noreturn]] 抛出辅助：让编译器【确知】此调用不会返回 → switch 的 default 走它之后
+//   控制流不可达，既无 -Wimplicit-fallthrough（穿透）顾虑，也不必靠 break 兜。
+//   inline + 在头文件中定义：多 TU 包含不冲突（隐式 inline 的 ODR 豁免）。
+namespace rope_error_check {
+  template <typename Msg>
+  [[noreturn]] inline void throw_runtime(Msg&& msg) {
+    throw std::runtime_error(std::forward<Msg>(msg));
+  }
+}  // namespace rope_dispatch
+
+
+#define ROPE_ST_TORCH_CHECK(cond, ...)                \
+if (C10_UNLIKELY_OR_CONST(!(cond))) {           \
+rope_error_check::throw_runtime(STD_TORCH_CHECK_MSG( \
+cond,                                     \
+"",                                       \
+__func__,                                 \
+", ",                                     \
+__FILE__,                                 \
+":",                                      \
+__LINE__,                                 \
+", ",                                     \
+##__VA_ARGS__));                          \
+}
