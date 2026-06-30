@@ -79,37 +79,95 @@
   为什么必须这样：c_coef 的真实设备地址在【模块加载到某 GPU 时由驱动决定】，host 编译期不知道；
     runtime 维护"符号→(当前设备上)设备地址"的注册表，ToSymbol 据此查到地址再拷。
 
-  ── 符号的可见范围：默认【.cu 内可见】(类内链接)，跨 .cu 需 extern + -rdc(类外链接)────
-   · 默认(whole-program 编译, -rdc=false)：每个 .cu 各自把 __device__/__constant__ 符号编进
-     【自己的设备模块】，互不共享 —— 效果【类似内链接(internal linkage)】：哪怕两个 .cu 写了
-     同名符号，也是各自独立的两份，cudaMemcpyToSymbol 只动当前 TU 这份。
-   · 跨 .cu 共享同一个符号 —— 效果【类似外链接(external linkage)】，须两件事齐备：
-       ① 一个 .cu【定义】，其它 .cu 用 extern【声明】(只声明不分配)；
-       ② 开【可重定位设备代码】并做 device link：nvcc -rdc=true（CMake：set_target_properties(
-          tgt PROPERTIES CUDA_SEPARABLE_COMPILATION ON)）。否则 extern 链接不上 / 退化成各自一份。
-   · 说明：是"效果类似"——host C++ 里命名空间作用域变量本是外链接，但【设备代码】默认按模块/TU
-     生成，不开 -rdc 时设备侧符号不跨 TU 解析，故表现得像内链接。
+──────────────────────────────────────────────────────────────────────────────
+【链接性】设备符号默认是【外链接】(不是内链接)——区别只在"有没有做 device 链接"
+──────────────────────────────────────────────────────────────────────────────
+   定性：__device__ / __constant__ / __managed__ 变量(命名空间作用域、非 static)默认【外部链接】；
+        加 static 才是【内部链接】。常见误区是把"默认模式下各 .cu 互不干扰"记成"内链接"——不是。
 
-   示例（跨 .cu 共享一个 __constant__）：
-     // a.cu —— 定义（分配这份常量）
-     __constant__ float c_coef[256];
-     __global__ void useA() { float v = c_coef[threadIdx.x]; }
+   · 默认 (-rdc=false, whole-program)：【没有 device 链接器】，外链接符号不跨 TU 解析 → 每个 .cu
+     把符号编进自己的设备模块、各留一份私有副本，cudaMemcpyToSymbol 只动【当前 TU】那份。
+     —— 这是"【没做链接】"，可观察行为像内链接，但本质仍是外链接。
+   · -rdc=true：做【跨 TU device 链接】，外链接才"显形"——
+       · 可用 extern 跨 .cu 共享【同一个】符号（示例①）；
+       · 同一符号若有【两份定义】则撞名 nvlink: Multiple definition（示例③）。
+   · 两条铁证是外链接：① extern + -rdc 能跨 .cu 接上(只有外链接 extern 才解析得了)；
+     ② -rdc 下两份定义撞名。真·内链接(各 TU 私有、-rdc 也不撞)要显式写 static。
 
-     // b.cu —— extern 声明，引用 a.cu 里那【同一个】符号
-     extern __constant__ float c_coef[256];          // 只声明，不再分配
-     __global__ void useB() { float v = c_coef[blockIdx.x]; }
+   变量 vs 函数，冲突【时机】不同(别混)：
+   · __device__/__constant__/__managed__【变量】：默认模式【不冲突】(各 TU 私有)，只有 -rdc 才在
+     nvlink 撞车。
+   · 普通 __device__【函数】：默认模式【就冲突】——nvcc 还给它留了 host 端强符号，多 TU include 在
+     【host ld】就报 multiple definition；-rdc 下则在 nvlink 报。(详见 linkage.txt 第五节实测小节。)
 
-     // host（任意 .cu）：仍用 ToSymbol 写那一份
-     cudaMemcpyToSymbol(c_coef, hCoef, sizeof(float) * 256);
-
-     // 编译（必须 -rdc=true，否则 b.cu 的 extern c_coef 链接错误 / 各自一份）：
-     //   nvcc -rdc=true a.cu b.cu -o app
+──────────────────────────────────────────────────────────────────────────────
+【三个示例】开 / 不开 -rdc（均实测 nvcc 12.9）
+──────────────────────────────────────────────────────────────────────────────
+   ── 示例①【开 -rdc】跨 .cu 共享【同一个】符号（定义 + extern）── 实测 42/42 真共享 ──
+     // a.cu —— 定义(分配，全程序唯一一份)
+     __constant__ int cval;
+     __global__ void readA(int* o){ *o = cval; }
+     void runA(int* o){ readA<<<1,1>>>(o); cudaDeviceSynchronize(); }
+     // b.cu —— extern 声明(只声明不分配)，引用 a.cu 那【同一个】符号
+     extern __constant__ int cval;
+     __global__ void readB(int* o){ *o = cval; }
+     void writeB(int v){ cudaMemcpyToSymbol(cval, &v, sizeof(int)); }   // host 写那唯一一份
+     void runB(int* o){ readB<<<1,1>>>(o); cudaDeviceSynchronize(); }
+     // 编译(必须 -rdc=true 才做跨 .cu device link)：
+     //   nvcc -rdc=true a.cu b.cu main.cu -o app
      //   CMake：set_target_properties(app PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+     // 运行：writeB(42) 后 readA、readB 都得 42。 ✅
 
-   ⟹ 不开 -rdc：符号【.cu 内可见】(类内链接)，跨 .cu 同名也是两份；
-      开 -rdc + extern：符号【跨 .cu 共享一份】(类外链接)。
-      （这与第六篇 l1_constant_readonly_cache.txt "模块 vs 设备" 一致：模块=编译链接到一起的
-        设备代码，-rdc 正是把多 .cu 的设备代码链成一个模块，符号才跨 .cu 解析。）
+   ── 示例②【不开 -rdc】不能跨 .cu 共享 → "定义+kernel+ToSymbol"放【同一个 .cu】(单 TU) ──
+     // single.cu
+     __constant__ int cval;
+     __global__ void readK(int* o){ *o = cval; }
+     int main(){
+       int* d; cudaMalloc(&d, sizeof(int));  int v = 42;
+       cudaMemcpyToSymbol(cval, &v, sizeof(int));    // 写本 TU 这份
+       readK<<<1,1>>>(d); cudaDeviceSynchronize();   // 读到 42 ✅
+     }
+     // nvcc single.cu -o app          （无需 -rdc）
+
+   ── 示例③【不开 -rdc】两个 .cu【各自定义】同名符号 → 互不干扰(各一份私有) ──
+     // a.cu : __constant__ int cval;  writeA(v){ToSymbol(cval,…)}  readA→cval
+     // b.cu : __constant__ int cval;  writeB(v){ToSymbol(cval,…)}  readB→cval   ← 没有 extern，各定义各的
+     // main : writeA(10); writeB(20);  runA→10  runB→20
+     实测：不开 -rdc → readA=10 readB=20，no error ✅(各自一份)；
+          -rdc=true → nvlink: Multiple definition of 'cval' ❌(两份定义撞名)。
+
+   ⚠ 反例：把示例①的【extern 跨 .cu 写法】用在【不开 -rdc】下 —— 失败在【运行期】，不是链接期：
+     实测 nvcc a.cu b.cu main.cu(无 -rdc)：能正常编译链接(不报 undefined/multiple)，但 b.cu 的
+     extern cval 未绑定到 a.cu 的定义 → 运行时 cudaMemcpyToSymbol 报 "invalid device symbol"、
+     readA/readB 都读到 0(未绑定的另一份)。这是【静默语义错误】，比链接报错更隐蔽。
+     （所以"不开 -rdc 跨 .cu 共享会链接错误"是错的——准确说是"能链接、运行期坏"。）
+
+──────────────────────────────────────────────────────────────────────────────
+【对照表】
+──────────────────────────────────────────────────────────────────────────────
+   (A) 两个 .cu / 同名符号 的三种情形：
+   ┌──────────────────────────────────────┬───────────────────────┬───────────────────────┐
+   │              写法                    │       不开 -rdc       │      -rdc=true        │
+   ├──────────────────────────────────────┼───────────────────────┼───────────────────────┤
+   │ 各自定义同名符号        (示例③)      │ ✅ 各一份独立(10/20)  │ ❌ Multiple definition│
+   │ 一个定义 + 另一个 extern(示例①)      │ ⚠ 链接过但运行期      │ ✅ 共享同一份(42/42)  │
+   │                                      │   invalid device symbol│                      │
+   │ 想跨 .cu【共享一份】                 │ 做不到                │ ✅ 定义+extern+-rdc   │
+   └──────────────────────────────────────┴───────────────────────┴───────────────────────┘
+
+   (B) 把【定义】放头文件、被多个 TU include（本质等价于"各自定义"，只是由 include 触发）：
+   ┌──────────────────────────┬──────────────────┬───────────────────────────────┐
+   │   .cuh 中的定义(多 TU)   │  -rdc=false 默认 │           -rdc=true           │
+   ├──────────────────────────┼──────────────────┼───────────────────────────────┤
+   │ __device__   int gv;     │ ✅ OK(各 TU 私有)│ ❌ nvlink Multiple definition │
+   │ __constant__ int cv;     │ ✅ OK(各 TU 私有)│ ❌ nvlink Multiple definition │
+   │ __managed__  int mv;     │ ✅ OK(各 TU 私有)│ ❌ nvlink Multiple definition │
+   │ static __device__ int gv;│ ✅ OK            │ ✅ OK(内链接，各自私有)       │
+   └──────────────────────────┴──────────────────┴───────────────────────────────┘
+
+   一句话：默认模式"各定义各的"安全独立；开 -rdc 做跨 TU 链接后，外链接符号要求【全程序唯一定义】，
+          同名重复即撞车，想共享须"定义 + extern"。这与上一篇 l1_constant_readonly_cache.txt
+          "模块 vs 设备"一致：-rdc 把多 .cu 的设备代码链成一个模块，外链接符号才跨 .cu 解析。
 
 
 ================================================================================
