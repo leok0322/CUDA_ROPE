@@ -1,0 +1,814 @@
+================================================================================
+CPU / GPU 架构与内存模型：寄存器、内存、DRAM、HBM、SMEM 的关系
+================================================================================
+
+核心结论：
+  · 寄存器是处理器核心内部的高速存储资源，不属于普通"内存地址空间"。
+  · 内存通常指可通过地址访问的存储区域，例如 CPU DRAM、GPU HBM/global memory、
+    GPU shared memory、local memory 等。
+  · CPU 栈和 CPU 堆都是 CPU 进程虚拟内存的一部分，物理上通常落在系统 DRAM。
+  · GPU global memory 通常位于显卡 HBM/GDDR，是 GPU 侧的 DRAM。
+  · GPU shared memory / SMEM 不属于 DRAM；它通常是 SM 片上的 SRAM，按 block 分配。
+  · GPU register file 也不属于 DRAM；它是每个 SM 内的寄存器文件，按线程分配寄存器。
+  · GPU constant memory 是 device 侧只读地址空间，容量小，通常以 HBM/GDDR 为后备存储，
+    通过 constant cache/广播路径优化 warp 内相同地址读取。
+
+
+章节导航：
+  一、CPU 架构简图
+  二、CPU 内存模型：寄存器、栈、堆、DRAM
+  三、GPU 架构简图
+  四、GPU 内存模型：global / HBM / SMEM / register / local / constant
+  五、"内存"和"寄存器"的关系
+  六、CPU 和 GPU 的"取地址"对比
+  七、CUDA 中几个容易混淆的"内存"
+  八、从性能角度看这些层级
+  九、总结表
+  十、回答"SMEM 属于 DRAM 吗"
+
+
+三个文件的关系：
+  · docs/c++/cpu_gpu_architecture_memory_model.txt
+    是总览文档。它先建立 CPU/GPU 架构、寄存器、DRAM、HBM、SMEM、local memory、
+    constant memory 的整体关系，帮助判断"某个对象大概属于哪类存储/地址空间"。
+
+  · docs/c++/gpu_cpu_address_spaces_64bit_32bit.txt
+    是地址专题文档。它展开解释 CPU/GPU 指针、64-bit 地址、GPU HBM/global 地址、
+    SMEM 32-bit 地址、generic pointer、__cvta_generic_to_shared、寄存器对象取址等问题。
+    它是本文中"地址空间/指针表示"相关内容的细化。
+
+  · docs/c++/cpu_call_stack_push_pop_rsp.txt
+    是 CPU 栈专题文档。它展开解释 CPU 调用栈、push/pop、rsp/rbp、返回地址、栈帧、
+    局部变量为什么可能在栈上等问题。它是本文中"CPU 栈/寄存器/内存"相关内容的细化。
+
+  推荐阅读顺序：
+    1) 先读本文，建立 CPU/GPU 内存模型全局框架。
+    2) 再读地址专题，深入理解指针、地址位宽、HBM/SMEM/generic pointer。
+    3) 最后按需要读 CPU 栈专题，补全函数调用、栈帧和 rsp/rbp 细节。
+
+
+================================================================================
+一、CPU 架构简图
+================================================================================
+
+  一个简化的 CPU 系统可以看成：
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │ CPU Socket                                                   │
+    │                                                              │
+    │  ┌─────────────┐   ┌─────────────┐                           │
+    │  │ CPU Core 0  │   │ CPU Core 1  │   ...                     │
+    │  │             │   │             │                           │
+    │  │ Registers   │   │ Registers   │   ← 每个 core 自己的寄存器 │
+    │  │ L1 Cache    │   │ L1 Cache    │                           │
+    │  └──────┬──────┘   └──────┬──────┘                           │
+    │         │                 │                                  │
+    │       L2 Cache          L2 Cache                              │
+    │         └────────┬────────┘                                  │
+    │                  │                                           │
+    │              L3 Cache                                        │
+    └──────────────────┬───────────────────────────────────────────┘
+                       │ Memory Controller
+                       │
+                    System DRAM
+
+  CPU 执行的基本路径：
+    · 指令操作寄存器。
+    · load 指令把内存数据读到寄存器。
+    · store 指令把寄存器数据写回内存。
+    · cache 是内存访问的缓存层，不改变"内存是按地址访问"这个事实。
+
+  例子：
+
+    int x = a[i] + 1;
+
+  机器层面大致是：
+    1. 从内存地址 &a[i] load 到 CPU 寄存器。
+    2. 在 CPU 寄存器里做加法。
+    3. 如果 x 需要保存到内存，再 store 到某个地址。
+
+
+================================================================================
+二、CPU 内存模型：寄存器、栈、堆、DRAM
+================================================================================
+
+  1. CPU 寄存器
+
+    · 位于 CPU core 内部。
+    · 通过寄存器名字访问，例如 x86-64 的 rax/rbx/rsp、AVX 的 xmm0/ymm0。
+    · 没有普通内存地址，不能被 C/C++ 指针直接指向。
+    · 编译器可以把局部变量只放在寄存器里。
+
+    例子：
+
+      int x = 123;
+
+    若 x 不需要真实地址，编译器可能只生成：
+
+      mov eax, 123
+
+    此时没有"存放 x 的内存地址"。
+
+  2. CPU 栈
+
+    · 栈是当前线程虚拟地址空间中的一段内存。
+    · 物理上通常落在系统 DRAM，并经过 CPU cache。
+    · 栈指针寄存器 rsp 保存当前栈位置；rsp 是寄存器，rsp 指向的是内存。
+
+    栈常见用途之一："函数调用帧"
+      · 每次函数调用通常会有一个 stack frame(栈帧)，保存这次调用需要的临时状态。
+      · 栈帧里可能包含返回地址、保存的寄存器、局部变量、临时 spill 槽、对齐填充等。
+      · 函数进入时通常调整栈指针，为当前调用留出一段栈空间；函数返回时再恢复。
+
+      示例：
+
+        void f(int a) {
+          int x = a + 1;
+          g(x);
+        }
+
+      f 的一次调用可能需要一个栈帧，用来保存调用 g 前后必须保留的状态。
+      注意：这里的 x 是源码层面的自动变量，不等于它一定在栈上。
+        · 如果编译器能直接用寄存器传递 g(x)，x 可能只存在于寄存器中。
+        · 如果优化后 x 被内联/常量传播/表达式合并，x 甚至可能没有独立实体。
+        · 只有当 x 需要真实地址、发生寄存器 spill、或 ABI/调试等原因要求落内存时，
+          它才会占用栈上的字节。
+
+    栈常见用途之二："返回地址"
+      · CPU 调用函数后，函数执行完必须知道回到哪里继续执行。
+      · x86-64 的 call 指令会把返回地址压入栈，再跳到被调函数。
+      · ret 是 x86-64 的函数返回指令，可以理解为：从当前栈顶读出返回地址，再跳到
+        这个代码地址继续执行。
+      · rsp 是 x86-64 的栈指针寄存器(stack pointer register)，它保存当前线程栈顶
+        的内存地址；rsp 本身是寄存器，[rsp] 才表示 rsp 指向的栈顶内存内容。
+      · [rsp] 不一定永远是返回地址。函数刚被 call 进入、尚未调整栈指针时，[rsp]
+        通常是返回地址；如果函数内部 sub rsp, 32 为局部变量开栈空间，新的 [rsp]
+        可能是局部变量/临时值，返回地址则可能位于 [rsp + 32] 或其他偏移处。
+      · 返回地址的"值"是代码地址/指令地址，指向调用者函数中 call 之后的下一条指令。
+      · 保存返回地址的"位置"是一个栈槽地址：也就是当前线程栈内存中的某个地址，
+        例如 [rsp] 或函数调整栈指针后的 [rsp + offset]。这个栈槽里存放的内容才是
+        返回地址的值。
+      · 因此不要把"返回地址"理解成调用者栈帧里的偏移；栈帧里保存的是这个代码地址。
+
+      示例：
+
+        f();
+        x = 1;
+
+      调用 f 时，"f 返回后继续执行 x = 1 的起始机器指令位置"就是返回地址。
+
+      概念地址图：
+
+        caller 的代码段(text segment):
+
+          0x401000: ...
+          0x401010: call f
+          0x401015: mov ...      ; call f 之后的下一条机器指令,通常是 x = 1 的第一条指令
+
+        当前线程的栈内存(stack):
+
+          0x7fffffffe0a8: 0x401015
+
+      这里：
+        · 0x401015 是返回地址的值：它是代码地址，指向 caller 中 call f 后的下一条机器指令。
+        · 0x7fffffffe0a8 是保存返回地址的栈槽地址：它是栈内存地址。
+        · ret 做的事情可以理解为：从 0x7fffffffe0a8 读出 0x401015，然后跳到 0x401015。
+
+    栈常见用途之三："保存调用前后必须保留的寄存器"
+      · ABI 会规定哪些寄存器由调用者保存，哪些由被调用者保存。
+      · 如果函数要使用某个必须保留的寄存器，它会先把旧值存到栈上，返回前再恢复。
+
+      概念汇编：
+
+        push rbx       ; 保存旧 rbx 到栈
+        ...            ; 函数内部使用 rbx
+        pop rbx        ; 返回前恢复旧 rbx
+
+    栈常见用途之四："放不进寄存器的参数或调用临时值"
+      · 函数参数通常优先通过寄存器传递。
+      · 参数太多、参数太大、可变参数函数、或调用约定要求时，一部分参数会放在栈上。
+      · 调用另一个函数前，当前函数也可能在栈上准备传参区域或临时值。
+
+      示例：
+
+        h(a0, a1, a2, a3, a4, a5, a6, a7, a8);
+
+      若寄存器参数槽不够，后面的参数可能通过栈传递。
+
+    栈常见用途之五："局部数组或较大的局部对象"
+      · 标量局部变量常能放寄存器。
+      · 局部数组、结构体、较大对象通常需要连续可寻址字节，常放在栈上。
+
+      示例：
+
+        void f() {
+          float buf[128];
+          buf[0] = 1.0f;
+        }
+
+      buf 需要 128 * sizeof(float) 字节连续存储，通常位于当前栈帧中。
+
+    栈常见用途之六："溢出的局部变量"
+      · 这里的"溢出"不是数值溢出，而是寄存器溢出(register spill)。
+      · CPU 寄存器数量有限；当编译器发现同时活跃的局部值太多，寄存器放不下时，
+        会把一部分值临时放到栈内存中。
+      · 之后需要这个值时，再从栈内存 load 回寄存器继续计算。
+
+      示例：
+
+        void f() {
+          // 假设优化后同时活跃的临时值很多，寄存器不够。
+          // 编译器可能把其中一些临时值 spill 到栈槽。
+        }
+
+      概念汇编：
+
+        mov [rsp+16], rax   ; 把寄存器值 spill 到栈
+        ...
+        mov rax, [rsp+16]   ; 之后再 reload 回寄存器
+
+    栈常见用途之七："需要取地址的自动变量"
+      · 自动变量是普通局部变量，生命周期随作用域自动开始和结束，例如函数里的 int x。
+      · 如果变量只参与计算，编译器可以把它只放在寄存器里。
+      · 如果代码需要 &x，并且这个地址不能被优化掉，x 必须有一个真实可寻址位置。
+      · 寄存器没有普通内存地址，所以编译器通常会把 x 放到栈内存里，让 &x 指向栈上的
+        那几个字节。
+
+      示例：
+
+        void use(int*);
+
+        void f() {
+          int x = 123;
+          use(&x);
+        }
+
+      如果 use(&x) 不能被优化掉，x 需要放在栈上，这样 &x 才是一个真实 CPU 地址。
+
+    栈常见用途之八："对齐和 ABI 保留空间"
+      · ABI 通常要求函数调用点的栈按 16 字节等边界对齐。
+      · 编译器可能在栈帧中加入 padding，只为满足对齐要求。
+      · 某些 ABI 还会规定 shadow space、red zone 等特殊栈区域；具体规则取决于平台。
+
+    GPU 中有对应现象：
+      · GPU 线程局部变量若寄存器不够，会 spill 到 local memory。
+      · GPU 线程局部变量若必须提供真实地址，也可能被放到 local memory。
+      · local memory 名字叫 local，但物理上通常在 GPU global memory/HBM 中，并经过缓存。
+
+    例子：
+
+      int x = 123;
+      int* p = &x;
+
+    如果 &x 必须真实存在，编译器会把 x 放到栈内存：
+
+      mov DWORD PTR [rsp+4], 123
+      lea rax, [rsp+4]       ; rax 保存 &x
+
+  3. CPU 堆
+
+    · malloc/new 从进程虚拟地址空间中分配内存。
+    · 物理上通常落在系统 DRAM，并经过 CPU cache。
+    · 返回的是 CPU 虚拟地址，64-bit 进程中指针通常是 64-bit。
+
+    例子：
+
+      float* hA = static_cast<float*>(malloc(sizeof(float) * N));
+
+    hA 的值是 CPU 地址；CPU 可以直接 hA[i]。
+
+  4. CPU DRAM
+
+    · 系统主内存。
+    · 栈、堆、全局变量、mmap 文件页等最终通常都映射到 DRAM 页面。
+    · CPU 不直接每次都访问 DRAM；通常先走 L1/L2/L3 cache。
+
+  关系总结：
+
+    CPU 寄存器：core 内部，有名字，无普通地址。
+    CPU cache ：DRAM 的缓存层。
+    CPU 栈/堆：CPU 虚拟内存区域，物理上通常在 DRAM。
+    CPU DRAM  ：系统主内存。
+
+
+================================================================================
+三、GPU 架构简图
+================================================================================
+
+  一个简化的 NVIDIA GPU 可以看成：
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │ GPU                                                          │
+    │                                                              │
+    │  ┌─────────────┐   ┌─────────────┐         ┌─────────────┐   │
+    │  │ SM 0        │   │ SM 1        │  ...    │ SM N        │   │
+    │  │             │   │             │         │             │   │
+    │  │ CUDA Cores  │   │ CUDA Cores  │         │ CUDA Cores  │   │
+    │  │ Registers   │   │ Registers   │         │ Registers   │   │
+    │  │ Shared Mem  │   │ Shared Mem  │         │ Shared Mem  │   │
+    │  │ L1 Cache    │   │ L1 Cache    │         │ L1 Cache    │   │
+    │  └──────┬──────┘   └──────┬──────┘         └──────┬──────┘   │
+    │         └─────────────────┴──────────┬────────────┘          │
+    │                                      │                       │
+    │                                  L2 Cache                    │
+    └──────────────────────────────────────┬───────────────────────┘
+                                           │
+                                      HBM / GDDR
+
+  GPU 执行模型：
+    · grid 由多个 block 组成。
+    · block 被调度到某个 SM 上执行。
+    · block 内线程按 warp 组织，一个 warp 通常 32 个线程。
+    · 每个线程有自己的寄存器。
+    · 每个 block 有自己的 shared memory。
+    · 所有 block 都可以访问 global memory / HBM。
+
+
+================================================================================
+四、GPU 内存模型：global / HBM / SMEM / register / local / constant
+================================================================================
+
+  1. GPU global memory / HBM
+
+    · cudaMalloc 分配的就是 GPU global memory。
+    · 物理上通常位于 HBM 或 GDDR，属于 GPU 侧 DRAM。
+    · 容量大，延迟高，带宽高。
+    · 所有 SM、所有 block 都可以访问。
+    · 生命周期从 cudaMalloc 到 cudaFree，跨 kernel 保留。
+
+    例子：
+
+      float* dA = nullptr;
+      cudaMalloc(reinterpret_cast<void**>(&dA), sizeof(float) * N);
+      kernel<<<grid, block>>>(dA);
+
+    dA 变量在 host 侧，但 dA 的值是 GPU global/HBM 地址。
+
+  2. GPU shared memory / SMEM
+
+    · 使用 __shared__ 或 extern __shared__ 声明。
+    · 每个 block 一份。
+    · 通常位于 SM 片上的 SRAM。
+    · 不属于 DRAM，不属于 HBM/GDDR。
+    · 生命周期只覆盖当前 block 执行期间。
+    · 同一个 block 内线程共享，其他 block 不能直接访问。
+
+    静态 shared memory：
+
+      __global__ void k() {
+        __shared__ float smem[256];
+      }
+
+    每个 block 分配：
+
+      256 * sizeof(float) 字节
+
+    动态 shared memory：
+
+      __global__ void k() {
+        extern __shared__ char smem[];
+      }
+
+      k<<<grid, block, smem_bytes>>>();
+
+    每个 block 分配：
+
+      smem_bytes 字节
+
+    回答关键问题：
+
+      gpu 的 smem 属于 dram 吗？
+
+    答案：
+
+      不属于。SMEM 通常是 SM 片上的 SRAM，属于 on-chip memory。
+      GPU global memory / HBM / GDDR 才是 GPU 侧 DRAM。
+
+  3. GPU register file
+
+    · 每个 SM 内有大量寄存器。
+    · 每个 CUDA thread 会被分配若干寄存器。
+    · 寄存器是线程私有的。
+    · 寄存器没有普通内存地址，不能被 C++ 指针直接指向。
+    · 寄存器数量会影响 occupancy：每线程寄存器越多，一个 SM 同时驻留的 warp/block 可能越少。
+
+    例子：
+
+      float x = threadIdx.x;
+
+    若 x 只在线程内部使用，通常放在寄存器。
+
+  4. GPU local memory
+
+    · 名字叫 local，但不是 SM 片上的本地 SRAM。
+    · 它是每线程私有的地址空间。
+    · 物理上通常位于 global memory / HBM，并经过 L1/L2 cache。
+    · 常见来源：
+        - 寄存器压力太大导致 register spill。
+        - 局部数组无法完全放寄存器。
+        - 对局部变量取地址，且编译器必须提供真实地址。
+
+    例子：
+
+      __device__ void foo(int*);
+
+      __global__ void k() {
+        int x = threadIdx.x;
+        foo(&x);
+      }
+
+    如果 foo 无法被内联或编译器无法证明 &x 不逃逸，x 可能被放到 local memory，
+    这样 &x 才有真实可传递的地址。
+
+  5. GPU constant / texture / read-only cache
+
+    先区分三个概念：
+
+      · constant memory：CUDA 的一个 device 侧只读地址空间，典型写法是 __constant__。
+      · read-only cache/path：对普通 global memory 只读数据使用的缓存/加载路径。
+      · texture path：面向 texture object/reference 的特殊读取路径，强调空间局部性、格式转换、
+        地址模式等图形/采样语义。
+
+    5.1 constant memory 是什么
+
+      · constant memory 是 GPU device 侧的只读地址空间。
+      · host 可以通过 cudaMemcpyToSymbol 等 API 写入/更新 constant symbol。
+      · device/kernel 通常只能读取，不能像写 global memory 一样在 kernel 中修改 __constant__ 对象。
+      · 它对所有 SM、所有 block、所有线程可见，不是每 block 一份，也不是每线程一份。
+      · 生命周期通常跟 CUDA module/context 中的 symbol 绑定，跨 kernel 保留，直到模块/上下文结束。
+      · 容量很小；常见 CUDA 编程模型中用户可用 constant memory 量级通常是几十 KiB
+        （经典公开限制常写作 64 KiB，具体以目标设备和 CUDA 文档为准）。
+
+    5.2 物理位置和 cache 路径
+
+      constant memory 的名字容易让人误以为它一定在 SM 片上。更准确地说：
+
+        · constant memory 的后备存储通常仍在 device memory，也就是 HBM/GDDR 这类 GPU DRAM。
+        · 每个 SM 有 constant cache / constant 读取路径，用来缓存 constant memory 数据。
+        · cache 命中时从片上 cache 返回；cache 未命中时仍要到 L2/HBM/GDDR 取数。
+
+      "后备存储"的意思是：某个逻辑存储空间的数据最终真正放在哪里。cache 里可能有副本，
+      但 cache 不是最终来源；cache 丢失/失效后，硬件还要回到后备存储重新取数。
+
+      对 constant memory 来说：
+
+        逻辑身份：
+          constant memory 地址空间
+
+        后备存储：
+          GPU HBM/GDDR 中的一段 device memory
+
+        访问加速层：
+          SM 上的 constant cache
+
+      读取路径可以理解为：
+
+        kernel 读取 __constant__ table[i]
+            -> 先查 constant cache
+            -> 命中：直接从片上 cache 返回
+            -> 未命中：去 L2/HBM/GDDR 取数，再填入 constant cache
+
+      因此，constant memory 和 cudaMalloc 得到的 global memory 通常共享同一类物理显存资源：
+
+        cudaMalloc 分配的数据：
+          HBM/GDDR 后备 + global memory 地址空间 + global load/store 路径
+
+        __constant__ 数据：
+          HBM/GDDR 后备 + constant memory 地址空间 + constant load/cache/broadcast 路径
+
+      也就是说：
+
+        · 它们通常都以后端 HBM/GDDR 作为物理存储。
+        · 它们不是同一个 CUDA 逻辑地址空间。
+        · 它们不走完全相同的访问路径。
+        · constant cache 是片上 cache，不是 HBM，也不是 shared memory。
+        · __constant__ 数据不是放在 SMEM 里。
+
+      所以它和 shared memory 不同：
+
+        shared memory  ：程序显式分配的 block-local SM 片上 SRAM。
+        constant memory：程序声明的 device-wide 只读地址空间，通常以 HBM/GDDR 为后备，
+                         通过 constant cache 加速读取。
+
+    5.3 典型声明和 host 写入
+
+      例子：声明一个小的只读查表数组。
+
+        __constant__ float c_scale[1024];
+
+        __global__ void k(float* out) {
+          int i = blockIdx.x * blockDim.x + threadIdx.x;
+          out[i] *= c_scale[i & 1023];
+        }
+
+        // host 侧：
+        float h_scale[1024];
+        cudaMemcpyToSymbol(c_scale, h_scale, sizeof(h_scale));
+        k<<<grid, block>>>(out);
+
+      这里：
+
+        · c_scale 的 1024 * sizeof(float) 字节分配在 device constant memory symbol 中。
+        · h_scale 是 CPU 侧普通数组，通常在 CPU 栈/堆/静态存储区。
+        · cudaMemcpyToSymbol 把 CPU 数据复制到 GPU constant symbol。
+        · kernel 内读取 c_scale[...] 时走 constant memory 读取语义。
+
+      注意：
+
+        · __constant__ 对象通常需要在文件/命名空间作用域声明，不能在 kernel 内声明成局部变量。
+        · cudaMemcpyToSymbol 与 kernel 之间要遵守 stream 顺序/同步关系；不能在一个 kernel 正在读
+          某个 constant symbol 时，无序地从 host 修改同一个 symbol。
+
+    5.4 和 C++ const / constexpr 不是一回事
+
+      不要把 __constant__ 和普通 C++ const 混为一谈：
+
+        __constant__ float table[256];
+
+      这是 CUDA 地址空间修饰符，表示 table 位于 device constant memory。
+
+        const float* p;
+
+      这里的 const 只是 C++ 类型限定，表示通过 p 不能修改它指向的数据；它不自动说明 p 指向
+      constant memory。p 可能指向 global memory、host memory、managed memory 等，取决于来源。
+
+        constexpr int N = 128;
+
+      constexpr 是编译期常量，编译器可能直接把 N 当立即数写进指令里，完全不需要任何内存读取。
+
+      因此：
+
+        __constant__  -> CUDA device constant 地址空间
+        const         -> C++ 只读类型语义
+        constexpr     -> 编译期常量/可能变成立即数
+
+    5.5 为什么 constant memory 对"warp 内相同地址"特别快
+
+      constant cache 的关键特性是 broadcast：
+
+        · 如果一个 warp 的 32 个线程读取同一个 constant 地址，硬件可以把这一次读取广播给整个 warp。
+        · 这种访问非常适合所有线程共享同一个标量参数、同一个小表项、同一个配置值。
+
+      例子：warp 内所有线程读同一个位置。
+
+        __constant__ float c_alpha;
+
+        __global__ void scale(float* out) {
+          int i = blockIdx.x * blockDim.x + threadIdx.x;
+          out[i] *= c_alpha;   // warp 内所有线程读同一个 constant 地址
+        }
+
+      这种模式很适合 constant memory。
+
+    5.6 什么时候 constant memory 反而不合适
+
+      如果 warp 内线程读取很多不同 constant 地址，constant memory 可能发生按不同地址分批服务，
+      等价于把一次 warp 访问拆成多次不同地址访问，吞吐会下降。
+
+      例子：warp 内每个 lane 读不同位置。
+
+        __constant__ float c_table[4096];
+
+        __global__ void k(float* out) {
+          int i = blockIdx.x * blockDim.x + threadIdx.x;
+          out[i] = c_table[i];   // 同一 warp 内 32 个线程通常读 32 个不同地址
+        }
+
+      这类模式不一定适合 constant memory。若访问是连续/coalesced 的大数组，普通 global memory
+      加 L1/L2/read-only cache 往往更自然；尤其数据量超过 constant memory 容量时，只能放 global。
+
+      简单判断：
+
+        · 小、只读、所有线程经常读同一个地址    -> constant memory 很合适。
+        · 大、连续、每个 lane 读不同相邻地址    -> global memory + cache/coalescing 往往更合适。
+        · 需要 kernel 内写入                    -> 不适合 __constant__，用 global/shared/local 等。
+
+    5.7 和 kernel 参数的关系
+
+      CUDA kernel 参数、编译器生成的只读常量、字面量等也可能使用 constant 相关的硬件路径或
+      constant 地址空间机制。但这不等于所有写成 const 的数据都在 __constant__ memory 中。
+
+      对用户代码来说，最明确、最可控的 constant memory 使用方式是：
+
+        __constant__ T symbol[...];
+        cudaMemcpyToSymbol(symbol, host_data, bytes);
+        kernel<<<...>>>();
+
+
+================================================================================
+五、"内存"和"寄存器"的关系
+================================================================================
+
+  宽泛说：
+    · 寄存器也是一种"能存值的硬件存储资源"。
+
+  严格讨论地址和指针时：
+    · 寄存器不是普通内存。
+    · 普通内存有地址，可以被 load/store 指令按地址访问。
+    · 寄存器有名字/编号，由指令直接引用，不能用 C/C++ 指针取地址。
+
+  CPU 示例：
+
+    mov eax, 1          ; eax 是寄存器
+    mov [rsp+4], eax    ; [rsp+4] 是栈内存地址
+
+  GPU PTX 示例：
+
+    .reg .u32 %r1;      // %r1 是寄存器
+    st.shared.u32 [addr], %r1;  // addr 指向 shared memory
+
+  所以：
+
+    寄存器 = 执行单元旁边的命名存储槽。
+    内存   = 可通过地址访问的存储空间。
+
+  这就是为什么：
+
+    int x = 1;
+
+  若 x 在寄存器中，它没有可取的内存地址。
+
+  而：
+
+    int* p = &x;
+
+  若 p 必须真实存在，编译器需要让 x 拥有一个可寻址位置：
+    · CPU 上通常放到栈内存。
+    · GPU 上通常放到 local memory。
+    · 如果能优化掉取址，则不会真的分配地址。
+
+
+================================================================================
+六、CPU 和 GPU 的"取地址"对比
+================================================================================
+
+  1. CPU 局部变量
+
+    int x = 1;
+    int* p = &x;
+
+    若 &x 必须真实存在：
+      · x 通常放在 CPU 栈内存。
+      · p 保存 CPU 虚拟地址。
+
+    若编译器能优化：
+      · x 可以只在寄存器中。
+      · p 和 &x 可能完全不存在于最终机器码中。
+
+  2. GPU 线程局部变量
+
+    __global__ void k() {
+      int x = threadIdx.x;
+      int* p = &x;
+    }
+
+    若 &x 必须真实存在：
+      · x 通常放到 GPU local memory。
+      · p 是 local/generic pointer。
+
+    若编译器能优化：
+      · x 可留在寄存器。
+      · p 和 &x 可被优化掉。
+
+  3. GPU shared memory
+
+    __shared__ int smem[256];
+    int* p = &smem[0];
+
+    · smem 本来就是可寻址 shared memory。
+    · p 在 CUDA C++ 中是普通指针语义，可能表现为 generic pointer。
+    · 普通 p[i] 访问由编译器生成 shared load/store。
+    · 若写内联 PTX cp.async，需要把 p 转成 shared 地址空间内部的 32-bit 地址：
+
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(p));
+
+  4. GPU global memory
+
+    float* dA = nullptr;
+    cudaMalloc(reinterpret_cast<void**>(&dA), bytes);
+
+    __global__ void k(float* dA) {
+      float* p = &dA[threadIdx.x];
+    }
+
+    · host dA 变量保存 GPU global 地址值。
+    · kernel 参数 dA 也保存 GPU global 地址值。
+    · &dA[i] 是 global/generic pointer，指向 HBM/global memory。
+
+
+================================================================================
+七、CUDA 中几个容易混淆的"内存"
+================================================================================
+
+  1. global memory
+
+    · CUDA 术语。
+    · 对所有 SM 可见。
+    · 通常物理位于 HBM/GDDR。
+    · 属于 GPU 侧 DRAM。
+
+  2. HBM / GDDR
+
+    · 物理显存技术。
+    · HBM 是 High Bandwidth Memory，GDDR 是 Graphics DDR。
+    · 它们是 GPU global memory 的常见物理载体。
+
+  3. shared memory / SMEM
+
+    · CUDA 术语。
+    · 每个 block 私有。
+    · 通常是 SM 片上 SRAM。
+    · 不属于 DRAM。
+
+  4. local memory
+
+    · CUDA 术语。
+    · 每线程私有地址空间。
+    · 名字容易误导；它通常物理在 global memory/HBM 中。
+    · 常由寄存器溢出或需要可寻址局部对象产生。
+
+  5. constant memory
+
+    · CUDA 术语。
+    · device-wide 只读地址空间，典型写法是 __constant__。
+    · host 通过 cudaMemcpyToSymbol 等 API 写入，kernel 通常只读。
+    · 后备存储通常在 HBM/GDDR，但读取经过 constant cache/广播路径。
+    · 适合小型只读数据，尤其 warp 内线程经常读取同一地址的场景。
+
+  6. register
+
+    · SM 内 register file。
+    · 每线程私有。
+    · 不属于 DRAM，也不是普通可寻址内存。
+
+  7. L1/L2 cache
+
+    · cache 是缓存层，不是程序显式分配的主要地址空间。
+    · global/local/constant 等访问可能经过 cache。
+    · shared memory 在 NVIDIA GPU 上常与 L1 使用同一片片上资源的不同配置，但语义上
+      shared memory 是显式管理的 block-local SRAM，L1 是硬件缓存。
+
+
+
+
+================================================================================
+八、从性能角度看这些层级
+================================================================================
+
+  大致趋势：
+
+    register      ：最快，线程私有，容量最小，不可通过普通地址访问。
+    shared memory ：很快，block 内共享，容量较小，显式管理，on-chip SRAM。
+    L1/L2 cache   ：硬件缓存层，服务 global/local 等访问。
+    HBM/GDDR      ：容量大，带宽高，但延迟远高于寄存器/SMEM。
+    CPU DRAM      ：CPU 主存；GPU 访问 CPU 内存通常更慢，需 PCIe/NVLink/UM 等机制。
+
+  CUDA kernel 优化常见目标：
+    · 尽量把当前线程短期数据留在寄存器。
+    · 把 block 内复用数据放到 shared memory。
+    · 让 global memory 访问 coalesced。
+    · 避免 register spill 到 local memory。
+    · 避免 shared memory bank conflict。
+
+
+================================================================================
+九、总结表
+================================================================================
+
+  ┌────────────────────┬──────────────────────┬────────────────────┬──────────────────────────────┐
+  │ 存储/地址空间       │ 物理位置               │ 是否 DRAM           │ 是否可用普通指针取地址         │
+  ├────────────────────┼──────────────────────┼────────────────────┼──────────────────────────────┤
+  │ CPU register        │ CPU core 内部          │ 否                  │ 否，若需地址则放栈或优化掉      │
+  │ CPU stack           │ CPU 虚拟内存，常在 DRAM │ 是，通常系统 DRAM    │ 是，CPU 虚拟地址               │
+  │ CPU heap            │ CPU 虚拟内存，常在 DRAM │ 是，通常系统 DRAM    │ 是，CPU 虚拟地址               │
+  │ GPU register        │ SM register file       │ 否                  │ 否，若需地址则放 local 或优化掉 │
+  │ GPU shared / SMEM   │ SM 片上 SRAM           │ 否                  │ 是；PTX shared 地址常需 cvta    │
+  │ GPU global          │ HBM/GDDR               │ 是，GPU 侧 DRAM      │ 是，device/global pointer       │
+  │ GPU local           │ 通常在 HBM/GDDR         │ 是，通常 GPU DRAM    │ 是，每线程私有 local/generic    │
+  │ GPU constant        │ 通常 HBM/GDDR + 常量缓存 │ 是，后备通常是 GPU DRAM│ device 按 symbol/只读地址访问    │
+  │                    │                      │                    │ host 通常用 symbol API 写入      │
+  │ L1/L2 cache         │ 片上 cache SRAM         │ 否                  │ 不是显式取址对象                │
+  └────────────────────┴──────────────────────┴────────────────────┴──────────────────────────────┘
+
+
+================================================================================
+十、回答"SMEM 属于 DRAM 吗"
+================================================================================
+
+  不属于。
+
+  更精确说：
+
+    SMEM / shared memory 是 SM 片上的 SRAM，属于 on-chip memory。
+    HBM/GDDR 才是 GPU 侧 DRAM，承载 global memory，也通常承载 local memory 的物理存储。
+
+  但是：
+
+    shared memory 和 L1 cache 在一些 NVIDIA 架构上可能共享同一片 on-chip 存储资源，
+    可以按配置在 L1 和 shared memory 之间划分容量。
+
+  这不改变它的语义：
+
+    shared memory 是程序显式声明、按 block 分配、block 内线程共享的片上 SRAM；
+    它不是 HBM/GDDR，也不是 DRAM。

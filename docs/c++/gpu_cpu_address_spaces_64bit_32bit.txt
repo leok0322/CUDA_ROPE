@@ -1,0 +1,715 @@
+================================================================================
+GPU / CPU 地址空间详解：64-bit 指针值、32-bit SMEM 地址、HBM / CPU 堆 / 寄存器
+================================================================================
+
+核心一句话：
+  · CPU 侧普通指针：通常是 64-bit 虚拟地址，指向 CPU 进程地址空间。
+  · cudaMalloc 返回的 device pointer：通常也是 64-bit 值，但它表示 GPU global/HBM
+    虚拟地址；这个值可以存在 CPU 变量里，也可以作为 kernel 参数传到 GPU。
+  · CUDA C++ 设备端普通指针：通常按 generic pointer 表示，可指向 global/shared/local
+    等地址空间，现代 CUDA 下通常是 64-bit 表达。
+  · shared memory 的 PTX 原生地址：通常是 shared 地址空间内部的 32-bit 地址/offset；
+    给 cp.async / shared 专用 PTX 指令时，需要用 __cvta_generic_to_shared 显式转换。
+  · 寄存器不是内存地址空间。真正放在寄存器里的变量没有可取的 C++ 指针地址；若代码
+    需要真实地址，编译器会优化掉取址，或把对象 materialize 到 local memory。
+
+
+章节导航：
+  一、先区分"指针变量本身"和"指针变量保存的地址值"
+  二、CPU 栈/堆/静态存储区的地址：64 位进程中通常都是 64-bit 虚拟地址
+  三、HBM/global 的 64-bit 地址与 SMEM 的 32-bit 地址
+  四、CPU 堆内存：malloc / new 分配的字节和地址
+  五、HBM / global memory：cudaMalloc 分配的字节和地址
+  六、shared memory / SMEM：分配的字节和地址
+  七、寄存器：分配的字节、是否可以取地址、编译器如何处理
+  八、寄存器对象上的 reinterpret_cast<T*>(&x) 是什么含义
+  九、汇总表
+  十、最容易混的三句话
+
+
+
+================================================================================
+一、先区分"指针变量本身"和"指针变量保存的地址值"
+================================================================================
+
+  例子 A：host 侧指针变量保存 GPU device 地址
+
+    float* dA = nullptr;
+    cudaMalloc(reinterpret_cast<void**>(&dA), sizeof(float) * N);
+
+  这里有两层含义：
+
+    1) dA 这个变量本身
+       · 在 host 代码里声明，是一个 CPU 侧普通局部变量。
+       · dA 本身就是一个普通变量,只不过它的类型是 float*。和 int x 一样,它也需要
+         某个地方保存自己的"变量值"。
+       · 如果 dA 需要真实可寻址存储,通常这个"保存 dA 变量值的位置"在当前线程的
+         CPU 栈内存中。栈槽里保存的是一个指针值。
+       · 从 C/C++ 抽象语义看它有一个对象位置；实际机器代码中，若不需要真实地址，
+         编译器可能把它只放在 CPU 寄存器里。
+       · 一旦需要真实地址，例如 cudaMalloc 传入 &dA，编译器必须让 dA 有可寻址存储，
+         通常是在当前线程的 CPU 栈内存中。栈本身是 CPU 进程内存的一段。
+       · &dA 是 CPU 进程地址空间里的地址，表示"存放这个指针变量的位置"。
+
+    2) dA 变量里保存的值
+       · cudaMalloc 在 GPU global memory / HBM 中分配 sizeof(float) * N 字节。
+       · cudaMalloc 把这段 GPU 内存的 device pointer 值写回 dA。
+       · dA 的值通常是 64-bit GPU 虚拟地址。
+
+  所以：
+
+    dA   = GPU global/HBM 地址值
+    &dA  = CPU 上保存 dA 这个变量的位置
+
+  可以画成：
+
+    CPU 栈内存:
+      &dA 这个地址处保存着 dA 的变量值
+
+    dA 的变量值:
+      cudaMalloc 写入的 GPU global/HBM 地址
+
+    GPU HBM/global memory:
+      dA 指向这里的 sizeof(float) * N 字节
+
+  不能混淆：
+
+    cudaMemcpy(dA, hA, bytes, cudaMemcpyHostToDevice);  // 对：dA 的值是设备地址
+    cudaMemcpy(&dA, hA, bytes, cudaMemcpyHostToDevice); // 错：&dA 是 host 变量地址
+
+  例子 B：host 侧指针变量保存 CPU 堆地址
+
+    float* hA = static_cast<float*>(malloc(sizeof(float) * N));
+
+  这里同样有两层含义：
+
+    1) hA 这个变量本身
+       · hA 是 CPU 侧自动变量,类型是 float*。
+       · 如果需要真实地址,&hA 通常是当前线程 CPU 栈内存中的某个地址。
+       · 栈槽里保存的是 hA 的变量值。
+
+    2) hA 变量里保存的值
+       · malloc 在 CPU 进程堆内存中分配 sizeof(float) * N 字节。
+       · malloc 返回这段堆内存的 CPU 虚拟地址,并把这个地址值赋给 hA。
+       · hA 的值通常是 64-bit CPU 进程虚拟地址。
+
+  所以：
+
+    hA   = CPU 堆内存地址值
+    &hA  = CPU 上保存 hA 这个指针变量的位置
+    hA[i] / *(hA + i) = 访问 hA 指向的堆内存中的第 i 个 float
+
+  可以画成：
+
+    CPU 栈内存:
+      &hA 这个地址处保存着 hA 的变量值
+
+    hA 的变量值:
+      malloc 返回的 CPU 堆内存地址
+
+    CPU 堆内存:
+      hA 指向这里的 sizeof(float) * N 字节
+
+  对比:
+    · dA 和 hA 变量本身都可以是 CPU 栈上的普通指针变量。
+    · dA 的值是 GPU device 地址,CPU 不能普通解引用 *dA。
+    · hA 的值是 CPU heap 地址,CPU 可以普通解引用 hA[i]。
+    · &dA / &hA 都是"保存指针变量本身的位置",不是它们指向的数据地址。
+
+================================================================================
+二、CPU 栈/堆/静态存储区的地址：64 位进程中通常都是 64-bit 虚拟地址
+================================================================================
+
+  在常见 64 位进程 / x86-64 Linux 下,CPU 侧普通对象一旦有真实内存地址,这个地址
+  通常都是 64-bit 进程虚拟地址。栈、堆、静态存储区的区别主要在生命周期和分配方式,
+  不是地址位宽。
+
+  例子：
+
+    int g = 1;              // 静态存储区,通常 .data
+
+    int main() {
+      int x = 2;            // 自动局部变量,若需要真实地址通常在栈上
+      int* p = new int(3);  // *p 在堆上
+
+      auto pg = &g;
+      auto px = &x;
+      auto pp = p;
+
+      delete p;
+    }
+
+  如果这些对象都有真实内存地址,那么在 64 位进程中通常是：
+
+    &g  -> 64-bit CPU 进程虚拟地址,指向静态存储区对象
+    &x  -> 64-bit CPU 进程虚拟地址,指向栈上对象
+    p   -> 64-bit CPU 进程虚拟地址,指向堆上对象
+
+  可以用 sizeof(void*) 理解当前进程指针大小：
+
+    sizeof(void*) == 8   // 常见 64 位进程
+    sizeof(void*) == 4   // 常见 32 位进程
+
+  注意：
+    · 64-bit 指针不代表硬件/OS 一定使用全部 64 个虚拟地址位。x86-64 常见有效虚拟
+      地址位数可能是 48 位、57 位等,但 C/C++ 指针对象本身仍通常占 8 字节。
+    · 静态存储区对象有地址,但不在堆上;堆只指 malloc/new 动态分配的区域。
+    · 自动局部变量如果只在寄存器里、且不需要真实地址,最终机器码里可能没有可取地址;
+      一旦必须取地址,编译器才需要给它可寻址存储,通常是栈槽。
+
+
+================================================================================
+三、HBM/global 的 64-bit 地址与 SMEM 的 32-bit 地址
+================================================================================
+
+  GPU 上也要区分不同地址空间的地址表示。
+
+  HBM / global memory：
+    · cudaMalloc 分配的是 GPU global memory,物理上通常位于 HBM/GDDR。
+    · CUDA C++ 中的 global memory 指针通常是 64-bit device virtual address。
+    · 这个地址可以作为 kernel 参数传入 GPU,也可以存在 device 端寄存器里。
+
+    例子：
+
+      __global__ void add1(float* out, const float* in) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        const float* p = in + i;
+        float v = *p;
+        out[i] = v + 1.0f;
+      }
+
+    这里:
+      · in/out 是 kernel 参数,它们的值是 GPU global/HBM 地址。
+      · p 是 device 端线程局部指针变量,保存 in + i 这个 global 地址。
+      · 如果 p 不需要真实可寻址存储,编译器通常可以把 p 的地址值只放在 device 端寄存器里。
+      · *p 访问的是 p 这个寄存器中保存的 global 地址所指向的 HBM/global memory。
+      · 也就是说,寄存器里保存的是"地址值";真正的数据仍在 HBM/global memory 中。
+
+  shared memory / SMEM：
+    · __shared__ 或 extern __shared__ 声明的是 block 私有的 shared memory。
+    · SMEM 通常是 SM 片上的 SRAM,不是 HBM/DRAM。
+    · CUDA C++ 中 &smem[0] 可以表现为普通指针/generic pointer。
+    · 但 PTX 的 shared 专用指令常要求 shared 地址空间内部的 32-bit 地址/offset。
+
+  先看普通 CUDA C++ 访问 shared memory 的例子：
+
+    __global__ void smem_basic(int* out) {
+      __shared__ int smem[32];
+
+      int* p = &smem[0];
+      p[threadIdx.x] = threadIdx.x;
+      __syncthreads();
+
+      out[threadIdx.x] = p[threadIdx.x];
+    }
+
+  这里:
+    · smem 是当前 block 的 shared memory,不是 HBM。
+    · p = &smem[0] 在 CUDA C++ 层面是一个指向 shared memory 的指针表达。
+    · 如果 p 需要作为普通指针值存在,现代 CUDA 中它通常可表现为 64-bit generic pointer;
+      但编译器也可能完全优化掉 p,直接生成 ld.shared/st.shared。
+    · p 这个指针值和 HBM/global 地址没有"指向同一片物理内存"的关系。p 指向的是当前
+      block 的 SMEM;global pointer 指向的是 HBM/global memory。
+    · 普通 C++ 语句 p[i] = ... 由编译器负责识别地址空间并生成 shared memory 访问,
+      用户不用手动把 p 转成 32-bit shared 地址。
+
+  那它和 32-bit shared 地址是什么关系:
+    · p 是 CUDA C++ 层面的 shared/generic 指针表达,为了能和普通指针语义兼容,可能是
+      64-bit 表达。
+    · 32-bit shared 地址是 PTX shared 地址空间内部的地址/offset,给 shared 专用 PTX
+      指令使用。
+    · 当你写普通 C++ 的 p[i] 时,编译器可以自己处理地址空间。
+    · 当你手写 cp.async.shared.global 时,需要自己把 p 转成 PTX 要求的 shared 地址:
+
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(p));
+
+    · 因此: p 和 saddr 描述的是同一个 shared memory 位置,但表达形式不同;它们都不是
+      HBM/global 地址。
+
+
+  转换关系：
+
+    CUDA C++ shared 指针 / generic pointer:
+
+      int* p = &smem[0];
+
+    转成 PTX shared 地址:
+
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(p));
+
+  概念上可以理解为：
+
+    p      = 能表达"指向 shared memory"的 CUDA C++ 指针/generic 地址
+    saddr  = shared 地址空间内部的 32-bit 地址/offset
+
+  概念结果：
+
+    &smem[8] 的 shared 内部 offset = 8 * sizeof(int) = 32 bytes
+    __cvta_generic_to_shared(p)      = shared 地址空间里的 32-bit 地址/offset
+
+  cp.async 典型操作数：
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        :
+        : "r"(saddr), "l"(global_ptr));
+
+  这里：
+    · "r"(saddr)      ：32-bit register,保存 shared 地址。
+    · "l"(global_ptr) ：64-bit operand,保存 global/HBM 地址。
+
+  不要自己解析 generic pointer：
+    · 不要假设 saddr = reinterpret_cast<uint64_t>(p) - 某个固定 base。
+    · generic pointer 的 bit layout 不是用户代码应依赖的稳定 ABI。
+    · 正确做法是使用 __cvta_generic_to_shared 这类地址空间转换 intrinsic。
+
+  和普通 CUDA C++ 访问的区别：
+    · smem[0] = gmem[0] 这种 C++ 代码由编译器选择 global load + shared store。
+    · 手写 cp.async PTX 时,你必须显式给出 PTX 要求的地址形式:
+        - global 源地址:通常 64-bit
+        - shared 目标地址:通常 32-bit shared offset
+
+
+
+  例子：把 global/HBM 中一个 int 异步搬到 shared memory。
+
+    __global__ void k(const int* gmem, int* out) {
+      __shared__ int smem[1];
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t smem_addr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&smem[0]));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 4;\n"
+          :
+          : "r"(smem_addr), "l"(&gmem[0]));
+
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+      __syncthreads();
+    #else
+      smem[0] = gmem[0];
+      __syncthreads();
+    #endif
+
+      out[0] = smem[0];
+    }
+
+  这里的两个地址：
+
+    &gmem[0]
+      · 指向 GPU global/HBM。
+      · 作为 cp.async 的 global 源地址使用。
+      · 通常是 64-bit device/global 地址,内联 PTX 里用 "l" 约束传入。
+
+    &smem[0]
+      · 指向当前 block 的 shared memory。
+      · 在 CUDA C++ 层面可写成普通指针表达式。
+      · 但 cp.async.shared.global 的 shared 目标操作数需要 shared 地址空间内部地址,
+        所以要用 __cvta_generic_to_shared 转成 32-bit shared 地址/offset。
+
+
+================================================================================
+四、CPU 堆内存：malloc / new 分配的字节和地址
+================================================================================
+
+  示例：
+
+    float* hA = static_cast<float*>(malloc(sizeof(float) * N));
+
+  分配了什么：
+    · 在 CPU 进程虚拟地址空间中分配 sizeof(float) * N 字节。
+    · hA 变量保存 CPU 虚拟地址，64-bit 进程中通常是 64-bit 指针值。
+    · hA 可以被 CPU 直接解引用：hA[i]。
+
+  是否可以取地址：
+    · 可以。
+    · &hA 取得的是"指针变量 hA 本身"的 CPU 地址。
+    · &hA[i] 取得的是 CPU 堆内存中第 i 个元素的 CPU 地址。
+
+  能否给 GPU kernel 直接当数据地址使用：
+    · 普通 malloc/new 得到的是 host 地址，不能直接当 device global 地址给 kernel 解引用。
+    · 除非使用 unified memory、mapped pinned memory 等特殊机制；普通 host heap 不属于这里。
+
+
+================================================================================
+五、HBM / global memory：cudaMalloc 分配的字节和地址
+================================================================================
+
+  示例：
+
+    float* dA = nullptr;
+    cudaMalloc(reinterpret_cast<void**>(&dA), sizeof(float) * N);
+    kernel<<<grid, block>>>(dA);
+
+  分配了什么：
+    · 在 GPU global memory / HBM 中分配 sizeof(float) * N 字节。
+    · dA 这个 host 变量保存分配结果：一个 device pointer 值。
+    · 该 device pointer 通常是 64-bit GPU 虚拟地址。
+
+  kernel 里：
+
+    __global__ void kernel(float* dA) {
+      float x = dA[threadIdx.x];
+    }
+
+  这里的参数 dA：
+    · 是 device 端每个线程可见的 kernel 参数/局部值。
+    · 保存的是 global/HBM 地址值。
+    · 访问 dA[i] 会生成 global memory load/store。
+
+  是否可以取地址：
+    · 在 host 侧，&dA 是 CPU 上指针变量 dA 的地址。
+    · 在 device 侧，&dA 是 kernel 参数/局部指针变量自己的地址；如果真的需要可寻址位置，
+      编译器可能把它放到 local memory。多数简单场景会被优化掉。
+    · &dA[i] 在 device 侧表示 global memory 中第 i 个元素的地址，通常是 64-bit
+      global/generic pointer。
+
+  注意：
+    · CPU 侧 dA 的值和 device 侧 kernel 参数 dA 的值可以相同，都是同一个 GPU global
+      地址值。
+    · 但保存这个值的变量位置不同：host dA 在 CPU 侧，kernel 参数 dA 在 GPU 执行上下文中。
+
+
+================================================================================
+六、shared memory / SMEM：分配的字节和地址
+================================================================================
+
+  静态 shared memory：
+
+    __global__ void k(float* out) {
+      __shared__ int smem[32];
+    }
+
+  分配了什么：
+    · 每个 block 分配 32 * sizeof(int) 字节 shared memory。
+    · 每个 block 各有一份，block 之间不共享。
+    · 生命周期只覆盖当前 block 执行期间。
+    · 通常驻留在 SM 片上的 SRAM/shared memory 中,不是 HBM/DRAM。
+
+  动态 shared memory：
+
+    __global__ void k(float* out) {
+      extern __shared__ char smem[];
+    }
+
+    k<<<grid, block, smem_bytes>>>(out);
+
+  分配了什么：
+    · 每个 block 分配 smem_bytes 字节动态 shared memory。
+    · smem[] 是这段动态 shared memory 的起点。
+
+  CUDA C++ 普通访问：
+
+    __global__ void smem_basic(int* out) {
+      __shared__ int smem[32];
+      int* p = &smem[0];
+
+      int lane = threadIdx.x;
+      if (lane < 32) {
+        p[lane] = lane;
+      }
+      __syncthreads();
+
+      if (lane < 32) {
+        out[lane] = p[lane];
+      }
+    }
+
+  这里的 p 是什么：
+    · 源码类型是 int*，C++ 类型本身没有写"这是 shared 指针"。
+    · p = &smem[0] 表达的是"指向当前 block 的 shared memory 起点"。
+    · CUDA 编译器知道 p 来源于 __shared__ 对象，普通访问 p[i] 时可以生成 shared
+      address space 的 ld.shared/st.shared 指令。
+    · 如果 p 需要作为普通指针传参或保存，现代 CUDA 设备 ABI 通常用 generic pointer 表示，
+      常见为 64-bit 值。
+    · 如果 p 只在当前作用域简单使用,编译器也可能优化掉 p 这个变量,直接用 shared 空间
+      内部地址生成 ld.shared/st.shared。
+
+  p 一定是 64-bit 吗：
+    · 源码语义上不能假设 p 是 32-bit shared 地址。
+    · 编译器可能完全优化掉 p，不生成普通指针变量，而是直接生成 ld.shared/st.shared；
+      这类指令使用的是 shared 空间内部地址，通常是 32-bit offset。
+    · 如果确实需要一个普通 CUDA C++ 指针值，通常会用 64-bit generic pointer 表示。
+    · 但这不是"SMEM 的 64-bit 物理绝对地址"；它只是能表达"指向 shared memory"的
+      CUDA generic pointer。
+    · 这个 generic pointer 与 HBM/global pointer 不指向同一类物理存储;前者描述 SMEM,
+      后者描述 GPU global/HBM。
+
+  为什么 cp.async 还要转换：
+
+    uint32_t saddr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&smem[0]));
+
+  原因：
+    · cp.async.ca.shared.global 的目标操作数要求 shared 地址空间里的地址。
+    · 这个 shared 地址通常是 32-bit shared 内部地址/offset。
+    · CUDA C++ 的 int* p 是 generic pointer 语义，不能直接当 32-bit shared 地址用。
+    · __cvta_generic_to_shared(&smem[0]) 做的是"CUDA C++ shared/generic 指针表达"
+      到 "PTX shared 地址空间内部 offset" 的转换,不是把 HBM 地址转成 SMEM 地址。
+
+  示例：
+
+    __global__ void copy_one_int_async(const int* gmem, int* out) {
+      __shared__ int smem[1];
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t smem_addr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&smem[0]));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 4;\n"
+          :
+          : "r"(smem_addr), "l"(&gmem[0]));
+
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+      __syncthreads();
+
+      out[0] = smem[0];
+    #else
+      smem[0] = gmem[0];
+      __syncthreads();
+      out[0] = smem[0];
+    #endif
+    }
+
+  可以把 generic shared pointer 理解成：
+
+    generic pointer  ~=  "能标识这是 shared 地址空间的信息" + shared 内部 offset
+
+  但这只是心智模型：
+    · CUDA/PTX 不承诺 generic pointer 的 bit layout。
+    · 不能手写 generic_ptr - some_base 来提取 shared offset。
+    · 正确做法是 __cvta_generic_to_shared。
+
+
+================================================================================
+七、寄存器：分配的字节、是否可以取地址、编译器如何处理
+================================================================================
+
+  示例：
+
+    __global__ void k(int* out) {
+      int x = threadIdx.x;
+      out[threadIdx.x] = x;
+    }
+
+  x 可能在哪里：
+    · 如果只在当前线程内部使用，编译器通常把 x 放到寄存器。
+    · 寄存器是线程私有的执行资源，不是普通内存数组。
+    · PTX 里类似 .reg .u32 %r1; 不能对 %r1 取 C++ 指针地址。
+
+  寄存器是否可以取地址：
+    · 真正位于寄存器里的变量没有可取的内存地址。
+    · 不存在"寄存器变量的 64-bit 地址"。
+
+  如果源码写了 &x：
+
+    __device__ void foo(int*);
+
+    __global__ void k() {
+      int x = threadIdx.x;
+      foo(&x);
+    }
+
+  编译器怎么处理：
+    1) 如果能看穿用途，可能优化掉取址。
+
+       int x = threadIdx.x;
+       int* p = &x;
+       out[threadIdx.x] = *p;
+
+       可能直接优化为：
+
+       out[threadIdx.x] = threadIdx.x;
+
+       此时没有真实指针，也没有真实地址。
+
+    2) 如果必须提供真实地址，编译器会让 x 不再只是寄存器对象。
+
+       · 常见做法是把 x materialize 到 local memory。
+       · local memory 是每线程私有地址空间，物理上通常在 HBM/global memory，并经过缓存。
+       · 此时 &x 得到的是 local/generic pointer，通常可以按 64-bit 指针传递。
+
+  一句话：
+    · 能保持在寄存器里的变量，没有地址。
+    · 必须有真实地址的变量，通常就不能只待在寄存器里，会被放到 local memory 或被优化掉。
+
+
+================================================================================
+八、寄存器对象上的 reinterpret_cast<T*>(&x) 是什么含义
+================================================================================
+
+  代码：
+
+    auto vecTran {
+      reinterpret_cast<T_tran*>(&qkv[offsetElementPerThread])[0]
+    };
+
+    auto vecCompute {
+      *(reinterpret_cast<T_in2*>(&vecTran) + i)
+    };
+
+  第一行：
+    · &qkv[offsetElementPerThread] 是 global/HBM 地址。
+    · reinterpret_cast<T_tran*> 后做一次向量化 global load。
+    · load 出来的 vecTran 是当前线程局部变量，理想情况下放在寄存器中。
+
+  第二行：
+    · 源码上看像是对 vecTran 取地址，再按 T_in2* 重解释。
+    · 本质是在表达："把 vecTran 这段字节按 T_in2 分块读取"。
+    · 如果 i 是展开后的常量，且指针不逃逸，编译器通常可以直接在寄存器上做位段抽取/
+      register move，不需要真实内存地址。
+
+  上面这句话的意思是：
+
+    假设 T_tran 是 16 字节的向量化载入类型，T_in2 是 4 字节的小块类型。
+
+      auto vecTran = reinterpret_cast<T_tran*>(&qkv[offset])[0];
+
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        auto part = *(reinterpret_cast<T_in2*>(&vecTran) + i);
+        // use part
+      }
+
+    如果循环被展开，编译器看到的更像是：
+
+      auto part0 = 第 0 个 4 字节;
+      auto part1 = 第 1 个 4 字节;
+      auto part2 = 第 2 个 4 字节;
+      auto part3 = 第 3 个 4 字节;
+
+    此时 i 不再是运行期变量，而是 0/1/2/3 这些编译期已知位置。编译器知道
+    vecTran 的哪几字节要被读出来，所以不一定需要真的生成：
+
+      把 vecTran 写到 local memory
+      取得 &vecTran 的地址
+      再从这个地址 + i * sizeof(T_in2) load
+
+    它可以直接把 vecTran 拆成若干寄存器片段，或者在寄存器之间做 move / shuffle /
+    bit extract。也就是说，源码里的 "&vecTran" 只是 C++ 层面的表达方式，最终机器码
+    里可能没有一个真实的 vecTran 内存地址。
+
+    "指针不逃逸"指的是这个 reinterpret_cast 得到的指针只在当前这几行里被编译器看见，
+    没有被保存到内存、没有传给未知函数、也没有返回给外部。例如下面这种就容易让指针逃逸：
+
+      T_in2* p = reinterpret_cast<T_in2*>(&vecTran);
+      unknown_func(p);
+
+    一旦指针逃逸，编译器无法确认 unknown_func 会怎么使用 p，就可能必须把 vecTran
+    放到 local memory 中，让 p 指向一个真实可寻址的位置。
+
+
+
+    如果 vecTran 真的被放到 local memory，不要理解成"qkv 和 vecTran 都在 HBM，
+    所以没有额外搬运"。更准确地说：
+
+      qkv[offset] 所在位置: global/HBM 中的原始输入
+      vecTran     所在位置: 当前线程私有的 local memory slot
+
+    这两个位置不是同一个地址。即使 local memory 物理上也通常落在 HBM/global memory
+    并经过 L2/L1 cache，它也是另一块线程私有存储。因此可能出现额外的 store/load：
+
+      1) global load:
+         qkv[offset] -> register
+
+      2) local store:
+         register -> local memory slot for vecTran
+
+      3) local load:
+         local memory slot + i * sizeof(T_in2) -> register
+
+    也就是说，local memory 版本不是"只做一次 HBM 到寄存器搬运"。它通常多了
+    register -> local memory 和 local memory -> register 的访问。只有编译器把
+    vecTran 完全保留在寄存器中并直接拆分时，才可以避免这些额外 local memory 访问。
+
+    结合本项目中的例子：
+
+      // src/kernels/3_fuesd_QKNorm_and_ROPE_kernel.cuh
+      auto vecTran { reinterpret_cast<T_tran*>(&qkv[offsetElementPerThread])[0] };
+
+      constexpr uint numPerT_in2PerThread {elementBytesPerThread / sizeof(T_in2)};
+
+      #pragma unroll
+      for (uint i = 0; i < numPerT_in2PerThread; i++) {
+        auto vecCompute { *(reinterpret_cast<T_in2*>(&vecTran) + i) };
+        float2 val {_typeConvert<scalar_t_in>::convert(vecCompute)};
+      }
+
+    这里的关键条件是：
+
+      1) vecTran 来自一次 T_tran 宽向量 global load。
+      2) numPerT_in2PerThread 是 constexpr，循环次数是编译期常量。
+      3) #pragma unroll 后，i 会变成 0/1/2/... 这些固定下标。
+      4) reinterpret_cast<T_in2*>(&vecTran) 得到的指针没有传给未知函数，也没有保存出去。
+
+    因此编译器通常可以把逻辑理解成：
+
+      vecTran = 从 qkv global/HBM 合并加载到寄存器的一段字节
+      vecCompute_i = 取 vecTran 中第 i 个 T_in2 小块
+
+    也就是：
+
+      qkv[offsetElementPerThread] -> register vecTran
+      register vecTran 的第 i 个片段 -> register vecCompute
+
+    通常不需要生成：
+
+      register vecTran -> local memory
+      local memory -> register vecCompute
+
+    所以在这个 kernel 的这段代码里，"对 vecTran 取地址再重解释"更多是 C++ 源码层面的
+    写法；优化后很可能只是寄存器中的拆分/搬移。严格验证仍要看编译结果中是否出现
+    ld.local/st.local，或者 SASS 中是否出现 LDL/STL。
+
+  对比：
+
+    &qkv[i]      -> 指向 global/HBM 的真实设备地址。
+    &smem[i]     -> 指向 shared memory 的 CUDA C++ 指针；给 PTX shared 指令要 cvta。
+    &vecTran     -> 对线程局部对象取址的源码表达；若对象在寄存器中，实际代码里没有
+                    "寄存器地址"，需要真实地址时会被优化或落到 local memory。
+
+
+================================================================================
+九、汇总表
+================================================================================
+
+  ┌────────────────────┬──────────────────────┬──────────────────────────────┬──────────────────────────────┐
+  │ 对象/存储           │ 分配的字节             │ 能否取地址                     │ 取到/表达的是什么              │
+  ├────────────────────┼──────────────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ CPU heap            │ malloc/new 指定字节    │ 可以                          │ CPU 虚拟地址，通常 64-bit       │
+  │ cudaMalloc HBM      │ cudaMalloc 指定字节    │ host 变量保存设备地址；device │ GPU global/HBM 虚拟地址，通常   │
+  │                    │                      │ 侧可对元素取地址               │ 64-bit device pointer          │
+  │ kernel 参数指针      │ 参数槽/寄存器/local    │ 对指向元素可取；对参数变量取址  │ 指针值常是 64-bit；参数变量若   │
+  │                    │                      │ 可能导致 local materialize     │ 需真实地址可能在 local memory   │
+  │ shared memory       │ 每 block 静态/动态字节 │ 可以                          │ CUDA C++ 指针可为 generic；PTX  │
+  │                    │                      │                              │ shared 地址通常是 32-bit offset │
+  │ register 变量        │ 编译器分配寄存器        │ 真寄存器不能取真实地址          │ 无地址；需地址时优化掉或落 local │
+  │ local memory        │ 编译器按需分配          │ 可以                          │ 每线程私有 local/generic 地址， │
+  │                    │                      │                              │ 物理上通常在 HBM，经缓存         │
+  └────────────────────┴──────────────────────┴──────────────────────────────┴──────────────────────────────┘
+
+
+================================================================================
+十、最容易混的三句话
+================================================================================
+
+  1) "cudaMalloc 得到的是 GPU 地址，但保存它的 dA 变量在 CPU 上。"
+
+     float* dA = nullptr;              // dA 变量在 CPU 侧
+     cudaMalloc((void**)&dA, bytes);   // dA 的值变成 GPU global 地址
+
+  2) "__shared__ 的 &smem[0] 在 C++ 里是指针语义，但 cp.async 要的是 32-bit shared 地址。"
+
+     int* p = &smem[0];                                  // CUDA C++ 指针
+     uint32_t s = __cvta_generic_to_shared(p);           // PTX shared 地址
+
+  3) "寄存器没有地址；能取到真实地址时，它通常已经不是纯寄存器对象。"
+
+     int x = threadIdx.x;  // 可在寄存器
+     foo(&x);              // 若必须真实传址，x 可能被放到 local memory

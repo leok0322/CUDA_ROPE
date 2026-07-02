@@ -1,0 +1,1461 @@
+================================================================================
+CPU 调用栈：压栈、出栈、栈顶、栈指针寄存器、返回地址
+================================================================================
+
+说明：
+  本文主要以 x86-64 架构为例解释 CPU 调用栈。其他架构概念类似，但寄存器名字和调用
+  约定可能不同，例如 AArch64 使用 sp 作为栈指针，返回地址常先放在 lr/link register。
+  本文主体讲 CPU 调用栈；后半部分补充静态存储区、参数传递，以及 CPU 局部存储和
+  GPU 寄存器/local memory 的对比。
+
+
+================================================================================
+导航
+================================================================================
+
+  一、核心概念
+    先定义调用栈、rsp/rbp/rax/rbx、return_address 和 ret 指令。
+
+  二、x86-64 栈为什么"向低地址增长"
+    用 push rax 和 push rbx 的地址变化说明栈增长方向。
+
+  三、压栈 push 和出栈 pop
+    说明 push/pop 的等价语义、rsp 变化和旧栈槽字节是否仍在内存中。
+
+  四、call 和 ret 如何使用栈
+    说明 call 如何压入返回地址、ret 如何取出返回地址,以及嵌套调用 g(local) 的栈变化。
+
+  五、函数栈帧：一次函数调用在栈上的区域
+    说明 prologue/epilogue、rbp frame pointer、局部变量槽和完整压栈/恢复过程。
+
+  六、返回地址的值 vs 保存返回地址的栈槽地址
+    区分"代码地址"和"保存这个代码地址的栈内存地址"。
+
+  七、栈顶和"return_address"的关系
+    说明刚进入函数时 return_address 常在 [rsp],但 push/sub rsp 后会变成 [rsp+offset]。
+
+  八、局部变量一定在栈上吗
+    对比寄存器变量、栈槽、取地址变量、局部数组和寄存器 spill。
+
+  九、全局变量和静态存储区：有地址,但不在栈/堆上
+    说明 .data/.bss/.rodata、静态存储期对象、const/constexpr 和 CUDA __device__ 符号。
+
+  十、参数如何传递：寄存器优先，栈作为补充
+    用 System V ABI 的 sum8 例子说明寄存器传参和栈上传参。
+
+  十一、CPU 栈/寄存器与 GPU 寄存器/local memory 对比
+    对比 CPU 栈/堆/静态区和 GPU register/local memory/shared/global memory。
+
+  十二、最重要的几句话
+    汇总调用栈和局部存储的核心结论。
+
+
+================================================================================
+一、核心概念
+================================================================================
+
+  调用栈(call stack)：
+    · 每个 CPU 线程通常有自己的栈。
+    · 栈是该线程虚拟地址空间中的一段内存。
+    · 用来保存函数调用过程中的状态，例如返回地址、保存的寄存器、局部变量、spill 槽、
+      栈上传递的参数、对齐填充等。
+    · 寄存器不在栈内存中。rax/rbx/rsp/rbp 等寄存器是 CPU core 内部的硬件存储槽;
+      栈是内存区域。所谓"保存寄存器"指的是把某个寄存器当时的值复制到栈上的某个
+      内存槽里,不是把寄存器本身放进栈。
+
+  栈顶(stack top)：
+    · 栈顶不是"最高地址"。
+    · 在 x86-64 上，栈向低地址增长，栈顶是 rsp 当前指向的位置。
+    · 更具体说，rsp 指向当前已经使用的栈区域中的最低地址位置；它不是整个线程栈
+      可用范围的最低地址，只是当前这一刻的运行时栈顶。
+
+  rsp：
+    · rsp 是 x86-64 的栈指针寄存器(stack pointer register)。
+    · rsp 里面保存当前栈顶的内存地址。
+    · rsp 本身是寄存器，不是内存。
+    · [rsp] 表示 rsp 指向的栈顶内存内容。
+
+     具体例子：
+
+       int add1(int a) {
+          return a + 1;
+       }
+
+       int caller() {
+          int y = add1(41);
+          return y;
+       }
+
+     caller 调用 add1 时：
+        · CPU 当前正在执行 caller 的代码。
+        · call add1 会把"add1 返回后继续执行 caller 中下一条机器指令"这个代码地址压入栈。
+        · rsp 指向当前栈顶；刚进入 add1 且 add1 尚未调整栈指针时，[rsp] 通常就是返回地址。
+        · add1 执行 ret 时，从栈中取出这个返回地址，跳回 caller 继续执行。
+
+  rax：
+    · rax 是 x86-64 的通用寄存器之一。
+    · 它经常用来保存整数运算的临时结果，也常用来保存函数返回值。
+    · 在常见 x86-64 ABI 中，rax 通常是 caller-saved 寄存器：被调用函数可以改写它；
+      如果调用者希望跨函数调用保留 rax 的旧值，调用者自己负责保存。
+
+    具体例子：
+
+      int add1(int a) {
+        return a + 1;
+      }
+
+    可能生成的概念汇编：
+
+      add1:
+        lea eax, [rdi + 1]    ; eax/rax 保存返回值
+        ret
+
+    这里 eax 是 rax 的低 32 位。函数返回 int 时，返回值通常放在 eax 中；返回 long/pointer
+    时，返回值通常放在 rax 中。
+
+  rbx：
+    · rbx 也是 x86-64 的通用寄存器之一。
+    · 在常见 x86-64 ABI 中，rbx 通常是 callee-saved 寄存器：如果被调用函数要使用/改写
+      rbx，它必须先保存调用者原来的 rbx，返回前再恢复。
+    · 因此编译器可能在函数开头生成 push rbx，在函数返回前生成 pop rbx。
+
+    具体例子：
+
+      extern void g();
+
+      long f(long a, long b) {
+        long keep = a + b;
+        g();
+        return keep + 1;
+      }
+
+    keep 在调用 g() 前算出，调用 g() 后还要继续使用。编译器可能把 keep 放到 rbx，
+    因为 rbx 按 ABI 需要由当前函数 f 负责保存和恢复。
+
+    可能生成的概念汇编：
+
+      f:
+        push rbx              ; 保存调用者原来的 rbx
+        lea rbx, [rdi + rsi]  ; keep = a + b
+        call g
+        lea rax, [rbx + 1]    ; 返回值放到 rax
+        pop rbx               ; 恢复调用者原来的 rbx
+        ret
+
+    注意：这只是帮助理解的可能形态。不同编译器、优化级别、ABI、是否内联 g，都可能让
+    实际汇编不同，所以文档只说"可能生成 push rbx/pop rbx"。
+
+  rbp：
+    · rbp 是 x86-64 常见的 frame pointer/base pointer 寄存器。
+    · 在不省略 frame pointer 的代码中，rbp 常用来稳定定位当前函数栈帧中的变量。
+    · 典型序言 push rbp; mov rbp, rsp; sub rsp, N 中,mov rbp, rsp 的目的就是把
+      当前栈帧的基准点固定下来。之后 rsp 可能继续因为开局部空间、push、call、对齐调整
+      而变化,但 rbp 可以保持不变。
+    · mov rbp, rsp 的字面含义是把 rsp 寄存器里的地址值复制到 rbp 寄存器里;
+      它不读写 [rsp] 指向的栈内存,只是让 rbp 和 rsp 暂时保存同一个栈地址。
+    · 优化编译时，编译器常省略 rbp，把它当普通寄存器使用；此时栈帧通过 rsp + offset
+      或调试展开信息描述。
+
+    具体例子：
+
+      void use(int*);
+
+      void f(int a) {
+        int x = a + 1;
+        int y = x * 2;
+        use(&y);
+      }
+
+    如果保留 frame pointer,概念汇编可能是：
+
+      f:
+        push rbp             ; 保存调用者原来的 rbp
+        mov rbp, rsp         ; 把 rsp 的地址值复制到 rbp,不访问 [rsp],建立当前栈帧基准
+        sub rsp, 16          ; 给 x/y/对齐或临时值开 16 字节栈空间
+        lea eax, [rdi + 1]    ; x = a + 1
+        mov [rbp - 4], eax    ; x 在当前栈帧的固定位置
+        add eax, eax          ; y = x * 2
+        mov [rbp - 8], eax    ; y 在当前栈帧的固定位置
+        lea rdi, [rbp - 8]    ; rdi = &y
+        call use
+        mov rsp, rbp          ; 丢弃当前函数的局部栈空间,让 rsp 回到保存 old rbp 的位置
+        pop rbp               ; 恢复调用者原来的 rbp,同时 rsp 前进到 return_address
+        ret                   ; 从 [rsp] 读 return_address,返回到调用者
+
+    这段的压栈/出栈过程：
+
+      1) call f 后刚进入 f：
+
+        高地址
+        0x1000  call f 前旧 rsp 指向位置的原内容
+        0x0ff8  return_address  ← rsp
+        低地址
+
+      2) push rbp：保存调用者旧 rbp。
+
+        等价于：
+
+        rsp = rsp - 8
+        [rsp] = rbp
+
+        结果：
+
+        高地址
+        0x1000  call f 前旧 rsp 指向位置的原内容
+        0x0ff8  return_address
+        0x0ff0  old rbp         ← rsp
+        低地址
+
+      3) mov rbp, rsp：把 rsp 的地址值复制给 rbp,建立当前栈帧基准。
+
+        结果：
+
+        高地址
+        0x1000  call f 前旧 rsp 指向位置的原内容
+        0x0ff8  return_address
+        0x0ff0  old rbp         ← rsp, rbp
+        低地址
+
+      4) sub rsp, 16：给 x/y/对齐或临时值开 16 字节空间。
+
+        高地址
+        0x1000  call f 前旧 rsp 指向位置的原内容
+        0x0ff8  return_address  ← [rbp + 8]
+        0x0ff0  old rbp         ← [rbp]
+        0x0fec  x               ← [rbp - 4]
+        0x0fe8  y               ← [rbp - 8]
+        0x0fe0  对齐/临时空间    ← rsp
+        低地址
+
+      5) mov rsp, rbp：撤销当前函数的局部栈空间。
+
+        执行前:
+
+        rbp = 0x0ff0
+        rsp = 0x0fe0
+
+        高地址
+        0x1000  call f 前旧 rsp 指向位置的原内容
+        0x0ff8  return_address        ← [rbp + 8]
+        0x0ff0  old rbp               ← rbp
+        0x0fec  x
+        0x0fe8  y
+        0x0fe0  对齐/临时空间          ← rsp
+        低地址
+
+        mov rsp, rbp 的含义只是 rsp = rbp,也就是把栈顶从 0x0fe0 移回 0x0ff0。
+        它不会清空 0x0fec/0x0fe8/0x0fe0 这些内存里的旧字节;只是新的 rsp 已经
+        越过它们,所以这些低于新 rsp 的位置被逻辑释放,不再属于当前函数的局部栈空间。
+
+        执行后:
+
+        rbp = 0x0ff0
+        rsp = 0x0ff0
+
+        高地址
+        0x1000  call f 前旧 rsp 指向位置的原内容
+        0x0ff8  return_address
+        0x0ff0  old rbp         ← rsp, rbp
+        0x0fec  x 的旧字节,逻辑上不再属于当前局部空间
+        0x0fe8  y 的旧字节,逻辑上不再属于当前局部空间
+        0x0fe0  对齐/临时空间旧字节,逻辑上不再属于当前局部空间
+        低地址
+
+      6) pop rbp：恢复调用者旧 rbp。
+
+        等价于：
+
+        rbp = [rsp]
+        rsp = rsp + 8
+
+        结果：
+
+        高地址
+        0x1000  call f 前旧 rsp 指向位置的原内容
+        0x0ff8  return_address  ← rsp
+        0x0ff0  old rbp 的旧字节,逻辑上已出栈
+        低地址
+
+      7) ret：此时 [rsp] 是 return_address,可以返回调用者。
+
+        等价于：
+
+        return_address = [rsp]
+        rsp = rsp + 8
+        jump return_address
+
+
+    重点：rsp 是动态栈顶,函数内部可能变化;rbp 是固定锚点,所以 x/y/返回地址可以用
+    [rbp + 固定偏移] 稳定访问。
+
+  返回地址(return address)：
+    · 返回地址的值是代码地址/指令地址。
+    · 它指向调用者函数中 call 指令之后的下一条机器指令。
+    · 保存返回地址的位置是栈内存中的某个栈槽地址。
+
+  ret 指令：
+    · ret 是 x86-64 的函数返回指令。
+    · 它从当前栈顶 [rsp] 读出返回地址，让 rsp 前进到弹出返回地址之后的位置，
+      然后跳转到这个返回地址继续执行。
+    · 如果函数内部调整过 rsp，函数尾声必须先恢复 rsp，让 ret 执行时 [rsp] 正好
+      指向返回地址。
+
+    例子：函数内部开了 32 字节栈空间。
+
+      刚进入函数：
+
+        高地址
+        0x1000  旧内容
+        0x0ff8  return_address  ← rsp
+        低地址
+
+      执行 sub rsp, 32 后：
+
+        高地址
+        0x1000  旧内容
+        0x0ff8  return_address
+        0x0ff0  local/temp
+        0x0fe8  local/temp
+        0x0fe0  local/temp
+        0x0fd8  local/temp      ← rsp
+        低地址
+
+      此时 [rsp] 是局部变量/临时空间,不是返回地址。如果直接 ret,CPU 会把 [rsp]
+      的内容误当成代码地址跳转。正确尾声应先恢复 rsp:
+
+        add rsp, 32
+        ret
+
+      add rsp, 32 后 rsp 又指向 0x0ff8,此时 [rsp] 才是 return_address。
+
+
+
+================================================================================
+二、x86-64 栈为什么"向低地址增长"
+================================================================================
+
+  具体例子：假设 rax 中保存值 A，当前 rsp = 0x1000。
+
+  假设调用前：
+
+    高地址
+    0x1018  ...
+    0x1010  ...
+    0x1008  ...
+    0x1000  ← rsp
+    低地址
+
+  执行一次 push：
+
+    push rax
+
+  大致等价于：
+
+    rsp = rsp - 8
+    [rsp] = rax
+
+  这里的符号含义：
+    · rax 是 x86-64 的通用寄存器。假设此刻 rax = A。
+    · rsp 也是寄存器，但用途特殊：它保存当前栈顶地址。假设 push 前 rsp = 0x1000。
+    · [rsp] 表示访问 rsp 这个地址值指向的内存内容。
+    · 所以 push 后 rsp = 0x0ff8，[rsp] = rax 就等价于 [0x0ff8] = A：
+      地址 0x0ff8 这个栈内存槽里保存了 A。
+
+  结果：
+
+    高地址
+    0x1018  ...
+    0x1010  ...
+    0x1008  ...
+    0x1000  push 前旧 rsp 指向位置的原内容
+    0x0ff8  push 时 rax 中的值  ← rsp
+    低地址
+
+  所以：
+    · x86-64 的栈向低地址增长。
+    · 越晚压入的内容，地址越低。
+    · 当前 rsp 指向最新压入的栈顶槽。
+
+  对应到代码：
+
+    extern void g();
+
+    long f(long a, long b) {
+      long keep = a + b;
+      g();
+      return keep + 1;
+    }
+
+  keep 在调用 g() 前已经算出，调用 g() 后还要继续使用。编译器可能选择用 rbx
+  保存 keep。由于 rbx 通常是 callee-saved，f 如果要改写 rbx，就需要先保存调用者
+  原来的 rbx：
+
+    push rbx              ; 保存调用者原来的 rbx
+    lea rbx, [rdi + rsi]  ; keep = a + b
+    call g
+    lea rax, [rbx + 1]    ; return keep + 1
+    pop rbx               ; 恢复调用者原来的 rbx
+    ret
+
+  如果执行 push rbx 前 rsp = 0x0ff8，且 [0x0ff8] 保存的是 call f 压入的
+  return_address：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容
+    0x0ff8  return_address   ← rsp
+    低地址
+
+  执行 push rbx 后，CPU 先让 rsp -= 8，再把 rbx 写入新的 [rsp]：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容
+    0x0ff8  return_address
+    0x0ff0  saved rbx(push rbx 写入的旧 rbx 值)  ← rsp
+    低地址
+
+  具体执行含义：
+
+    push rbx
+
+  等价于：
+
+    rsp = rsp - 8
+    [rsp] = rbx
+
+  如果 push 前：
+
+    rsp = 0x0ff8
+    rbx = 调用者原来的 rbx 值
+
+  那么 push 后：
+
+    rsp = 0x0ff0
+    [0x0ff0] = 调用者原来的 rbx 值
+
+  此时 saved rbx 是"rbx 当时的值"被保存到了栈顶地址 0x0ff0,不是保存 rbx
+  这个寄存器本身,也不是保存 push rbx 这条指令。
+
+  再执行下一步：
+
+    lea rbx, [rdi + rsi]  ; keep = a + b
+
+  这一步会改写 rbx 寄存器,把 keep 放进 rbx,但不会改动刚才保存在栈上的旧 rbx：
+    · lea rbx, [rdi + rsi] 不会入栈,也不会访问 [rsp]。
+    · 它只是把 rdi + rsi 的计算结果写入 rbx 寄存器。
+    · 此时 keep 在 rbx 寄存器里;栈上的 0x0ff0 保存的是调用者原来的旧 rbx 值。
+
+    寄存器:
+      rsp = 0x0ff0
+      rbx = keep(a + b)
+
+    栈内存:
+
+      高地址
+      0x1000  call 前旧 rsp 指向位置的原内容
+      0x0ff8  return_address
+      0x0ff0  调用者原来的 rbx 值  ← rsp
+      低地址
+
+  所以 push rbx 的目的就是:在 rbx 被当前函数改写前,先把调用者的旧 rbx 值放到栈上。
+  函数返回前执行 pop rbx,再把 [0x0ff0] 里的旧值读回 rbx。
+
+  这就体现了三点：
+    · 栈向低地址增长：0x0ff0 比 0x0ff8 更低。
+    · 越晚压入的内容地址越低：saved rbx 晚于 return_address 入栈，所以在 0x0ff0。
+    · 当前 rsp 指向最新压入的栈顶槽：push rbx 后 rsp 指向 saved rbx。
+
+
+================================================================================
+三、压栈 push 和出栈 pop
+================================================================================
+
+  具体例子：先把 rax 的值压栈，再弹到 rcx。
+
+  push 的语义：
+
+    push rax
+
+  概念上等价于：
+
+    rsp = rsp - 8
+    [rsp] = rax
+
+  pop 的语义：
+
+    pop rax
+
+  概念上等价于：
+
+    rax = [rsp]
+    rsp = rsp + 8
+
+  图示：
+
+    初始：
+
+      高地址
+      0x1000  ← rsp
+      低地址
+
+    push A：
+
+      高地址
+      0x1000  旧内容
+      0x0ff8  A             ← rsp
+      低地址
+
+    push B：
+
+      高地址
+      0x1000  旧内容
+      0x0ff8  A
+      0x0ff0  B             ← rsp
+      低地址
+
+    pop 到寄存器：
+
+      读出 [rsp] = B
+      rsp = rsp + 8
+
+      高地址
+      0x1000  旧内容
+      0x0ff8  A             ← rsp
+      0x0ff0  B             ; 逻辑上已出栈，旧字节可能还在，但低于当前 rsp
+      低地址
+
+  注意：
+    · pop 通常只是移动 rsp，并不会把原栈槽清零。
+    · "出栈"是逻辑上的：rsp 变了，被弹出的旧位置低于新的 rsp，不再属于当前有效栈内容。
+
+  对应汇编片段：
+
+    mov rax, 123
+    push rax        ; [rsp] = 123
+    mov rax, 0
+    pop rcx         ; rcx = 123, rsp 回到 push 前的位置
+
+  这里 pop 后旧栈槽里的字节可能仍是 123，但 rsp 已经越过它，程序不应再把它当成
+  当前栈上的有效数据。
+
+
+================================================================================
+四、call 和 ret 如何使用栈
+================================================================================
+
+  源码：
+
+    void f();
+
+    void caller() {
+      f();
+      x = 1;
+    }
+
+  对 call f 来说，CPU 必须知道 f 执行完后回到哪里继续。这个位置就是 call 指令之后
+  的下一条机器指令，通常对应 x = 1 的第一条机器指令。
+
+  call 的概念语义：
+
+    call f
+
+  大致等价于：
+
+    rsp = rsp - 8
+    [rsp] = return_address
+    jump f
+
+  刚进入 f 时：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容
+    0x0ff8  return_address   ← rsp
+    低地址
+
+  所以刚进入 f 且 f 尚未调整 rsp 时：
+
+    rsp   = 保存返回地址的栈槽地址
+    [rsp] = 返回地址的值
+
+
+
+  ret 的概念语义：
+
+    ret
+
+  大致等价于：
+
+    return_address = [rsp]
+    rsp = rsp + 8
+    jump return_address
+
+  ret 执行后，CPU 已跳回 return_address，同时 rsp 回到 call 前的位置：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容  ← rsp
+    0x0ff8  return_address 的旧字节,逻辑上已出栈
+    低地址
+
+
+  但函数体内部可能继续 push 或 sub rsp 开栈空间，所以返回地址不一定始终在当前 [rsp]。
+  例如 f 内部先保存 rbx：
+
+    push rbx
+
+  执行后：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容
+    0x0ff8  return_address
+    0x0ff0  saved rbx        ← rsp
+    低地址
+
+  这时当前 [rsp] 是 saved rbx,返回地址变成 [rsp + 8]。
+
+  如果 f 又为局部变量开 32 字节栈空间：
+
+    sub rsp, 32
+
+  执行后：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容
+    0x0ff8  return_address
+    0x0ff0  saved rbx
+    0x0fe8  local/temp
+    0x0fe0  local/temp
+    0x0fd8  local/temp
+    0x0fd0  local/temp       ← rsp
+    低地址
+
+  这时当前 [rsp] 是 local/temp,返回地址变成 [rsp + 40]。因此 ret 前必须先恢复
+  rsp,让 [rsp] 重新指向 return_address,否则 ret 会把局部变量或 saved rbx 误当成
+  代码地址跳转。
+
+  对应的恢复过程可以是：
+
+    add rsp, 32   ; 丢弃 32 字节 local/temp 栈空间
+    pop rbx       ; 恢复调用者原来的 rbx,同时 rsp += 8
+    ret           ; 此时 [rsp] 才重新是 return_address
+
+  先执行 add rsp, 32：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容
+    0x0ff8  return_address
+    0x0ff0  saved rbx        ← rsp
+    低地址
+
+  再执行 pop rbx：
+
+    rbx = [rsp]   ; rbx = saved rbx
+    rsp = rsp + 8
+
+  结果：
+
+    高地址
+    0x1000  call 前旧 rsp 指向位置的原内容
+    0x0ff8  return_address   ← rsp
+    0x0ff0  saved rbx 的旧字节,逻辑上已出栈
+    低地址
+
+  现在 [rsp] 又是 return_address,ret 才能正确执行：
+
+    return_address = [rsp]
+    rsp = rsp + 8
+    jump return_address
+
+  下面用一段固定的 C++ 代码,按"代码意图 → 入栈过程 → 出栈恢复过程"整理整个流程。
+
+  C++ 代码：
+
+    extern void g(long*);
+
+    long f(long a, long b) {
+      long keep = a + b;   // 需要跨过 g(local) 之后继续使用
+      long local[4];       // 4 * sizeof(long) = 32 字节,适合对应 sub rsp, 32
+
+      local[0] = keep;
+      local[1] = a;
+      local[2] = b;
+      local[3] = 7;
+
+      g(local);            // local 需要真实地址,因此通常必须在栈上
+      return keep + local[0];
+    }
+
+  这段代码为什么适合说明栈：
+    · local[4] 需要 32 字节连续可寻址空间,所以可以对应 sub rsp, 32。
+    · keep 在调用 g(local) 后还要使用,编译器可能把 keep 放进 rbx 这类 callee-saved
+      寄存器,所以可能对应 push rbx / pop rbx。
+    · g(local) 会把 local 的地址传出去,所以 local 不能只是寄存器里的值。
+
+  对应的概念汇编可能是：
+
+    f:
+      push rbx              ; 保存调用者原来的 rbx
+      sub rsp, 32           ; 给 local[4] 开 32 字节栈空间
+      lea rbx, [rdi + rsi]  ; keep = a + b,keep 放在 rbx 寄存器中
+      mov [rsp],     rbx    ; local[0] = keep
+      mov [rsp + 8], rdi    ; local[1] = a
+      mov [rsp + 16], rsi   ; local[2] = b
+      mov [rsp + 24], 7     ; local[3] = 7
+      mov rdi, rsp          ; 第一个参数 = &local[0]
+      call g
+      mov rax, [rsp]        ; g 返回后,local[0] 仍要用,所以先读取 local[0]
+      add rax, rbx          ; keep 也仍要用,所以此时还不能 pop rbx
+      add rsp, 32           ; local[4] 最后一次使用结束,撤销 local 栈空间
+      pop rbx               ; keep 最后一次使用结束,恢复调用者原来的 rbx
+      ret                   ; 此时 [rsp] 是 return_address
+
+  入栈过程:
+
+    1) caller 执行 call f 后,刚进入 f。
+
+       call f 已经把 f 的 return_address 压到栈上。这个 return_address 指向
+       caller 中 call f 后面的下一条机器指令,不是 f 内部的下一条指令。
+
+       高地址
+       0x1000  call f 前旧 rsp 指向位置的原内容
+       0x0ff8  f 的 return_address  ← rsp
+       低地址
+
+    2) f 执行 push rbx。
+
+       push rbx 会先 rsp -= 8,再把 rbx 当时的值写入 [rsp]。这一步保存的是
+       调用者原来的 rbx 值,因为 f 后面要把 keep 放进 rbx。
+
+       高地址
+       0x1000  call f 前旧 rsp 指向位置的原内容
+       0x0ff8  f 的 return_address
+       0x0ff0  saved rbx        ← rsp
+       低地址
+
+    3) f 执行 sub rsp, 32,给 local[4] 开栈空间。
+
+       高地址
+       0x1000  call f 前旧 rsp 指向位置的原内容
+       0x0ff8  f 的 return_address
+       0x0ff0  saved rbx
+       0x0fe8  local[3]
+       0x0fe0  local[2]
+       0x0fd8  local[1]
+       0x0fd0  local[0]        ← rsp
+       低地址
+
+       此时 local[0] 的地址就是 rsp,所以 mov rdi, rsp 可以把 &local[0] 作为
+       第一个参数传给 g(local)。
+
+    4) f 执行 call g。
+
+       call g 会再次压入一个新的返回地址。这个返回地址是 "g 返回后 f 中下一条
+       指令" 的地址,也就是 call g 后面的 mov rax, [rsp]。
+
+       高地址
+       0x1000  call f 前旧 rsp 指向位置的原内容
+       0x0ff8  f 的 return_address
+       0x0ff0  saved rbx
+       0x0fe8  local[3]
+       0x0fe0  local[2]
+       0x0fd8  local[1]
+       0x0fd0  local[0]
+       0x0fc8  g 的 return_address  ← rsp
+       低地址
+
+       如果 g 自己还要保存寄存器或开局部栈空间,g 会在 0x0fc8 下面继续使用更低地址。
+
+  g 返回到 f:
+
+    g 返回前必须先恢复它自己的 rsp,让 [rsp] 重新指向 g 的 return_address,然后
+    执行 ret：
+
+      g 的 ret:
+        return_address = [rsp]   ; 读出 g 的 return_address
+        rsp = rsp + 8            ; rsp 回到 0x0fd0
+        jump return_address      ; 跳回 f 的 mov rax, [rsp]
+
+    所以 g 返回到 f 后,f 的 rsp 又恢复为 0x0fd0：
+
+    高地址
+    0x1000  call f 前旧 rsp 指向位置的原内容
+    0x0ff8  f 的 return_address
+    0x0ff0  saved rbx
+    0x0fe8  local[3]
+    0x0fe0  local[2]
+    0x0fd8  local[1]
+    0x0fd0  local[0]        ← rsp,也是传给 g 的参数地址
+    0x0fc8  g 的 return_address 的旧字节,逻辑上已出栈
+    低地址
+
+  出栈恢复过程:
+
+    g 返回后,不能立刻恢复 f 的 rsp/rbx,因为 f 还要执行 return keep + local[0]。
+    此时 local[0] 在 [rsp],keep 在 rbx。
+
+    1) f 先完成剩余计算:
+
+      mov rax, [rsp]  ; 读取 local[0]
+      add rax, rbx    ; 使用 keep
+
+    2) local[4] 最后一次使用结束,撤销 local 栈空间:
+
+      add rsp, 32
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address
+      0x0ff0  saved rbx        ← rsp
+      低地址
+
+    3) keep 最后一次使用结束,恢复调用者原来的 rbx:
+
+      pop rbx
+
+      等价于:
+
+      rbx = [rsp]   ; rbx = saved rbx
+      rsp = rsp + 8
+
+      结果:
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address  ← rsp
+      0x0ff0  saved rbx 的旧字节,逻辑上已出栈
+      低地址
+
+    4) 现在 [rsp] 是 f 的 return_address,可以执行 ret:
+
+      ret
+
+      等价于:
+
+      return_address = [rsp]
+      rsp = rsp + 8
+      jump return_address
+
+    ret 之后,f 返回到 caller 中 call f 后面的下一条机器指令。
+
+  恢复时机：
+    · 不是 g(local) 一返回就一定恢复 rsp/rbx。
+    · 如果 g 返回后当前函数 f 还要使用 local[0] 或 keep,就不能立刻 add rsp, 32
+      或 pop rbx。
+    · add rsp, 32 应该发生在 local[4] 最后一次使用之后。
+    · pop rbx 应该发生在 keep 最后一次使用之后,否则 rbx 会被恢复成调用者旧值,keep
+      就丢了。
+    · 常见情况是把这些恢复动作放在函数尾声,也就是 ret 前。
+
+  注意：真实编译结果受编译器、优化级别、ABI、栈对齐、g 是否可内联等因素影响。
+  这里的汇编是为了对应上面的栈图和恢复顺序,不是保证所有编译器都逐字生成。
+
+
+
+
+================================================================================
+五、函数栈帧：一次函数调用在栈上的区域
+================================================================================
+
+  栈帧(stack frame)：
+    · 一次函数调用在栈上使用的一段区域。
+    · 里面可能保存返回地址、保存的寄存器、局部变量、spill 槽、对齐填充等。
+    · 如果保留 frame pointer,rbp 会作为当前函数栈帧的稳定基准点。
+
+  为什么需要 rbp：
+    · rsp 是动态栈顶,函数内部可能因为 sub rsp,N、push、call、栈对齐而变化。
+    · rbp 可以在函数序言中固定下来,之后用 [rbp + 固定偏移] / [rbp - 固定偏移]
+      稳定访问返回地址、调用者旧 rbp、局部变量。
+    · mov rbp, rsp 的字面含义是把 rsp 寄存器里的地址值复制到 rbp 寄存器里;
+      它不读写 [rsp] 指向的栈内存,只是让 rbp 和 rsp 暂时保存同一个栈地址。
+    · 优化编译时,编译器常省略 rbp,把它当普通寄存器使用;此时栈帧通过 rsp + offset
+      或调试展开信息描述。
+
+  本节用这个 C++ 例子说明：
+
+    void use(int*);
+
+    void f(int a) {
+      int x = a + 1;
+      int y = x * 2;
+      use(&y);
+    }
+
+  因为 use(&y) 需要 y 有真实地址,编译器可能建立栈帧。若保留 frame pointer,概念汇编
+  可能是：
+
+    f:
+      push rbp             ; 保存调用者原来的 rbp
+      mov rbp, rsp         ; 把 rsp 的地址值复制到 rbp,不访问 [rsp],建立当前栈帧基准
+      sub rsp, 16          ; 给 x/y/对齐或临时值开 16 字节栈空间
+      lea eax, [rdi + 1]   ; x = a + 1,rdi 保存参数 a,eax 保存计算结果
+      mov [rbp - 4], eax   ; x 在当前栈帧的固定位置
+      add eax, eax         ; y = x * 2
+      mov [rbp - 8], eax   ; y 在当前栈帧的固定位置
+      lea rdi, [rbp - 8]   ; rdi = &y,准备第一个参数
+      call use             ; 调用 use(&y),call 会压入 use 返回到 f 的 return_address
+      mov rsp, rbp         ; 丢弃当前函数的局部栈空间,让 rsp 回到保存 old rbp 的位置
+      pop rbp              ; 恢复调用者原来的 rbp,同时 rsp 前进到 f 的 return_address
+      ret                  ; 从 [rsp] 读 f 的 return_address,返回到调用者
+
+  压栈过程：
+
+    1) call f 后刚进入 f。
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address  ← rsp
+      低地址
+
+    2) push rbp：保存调用者旧 rbp。
+
+      等价于：
+
+      rsp = rsp - 8
+      [rsp] = rbp
+
+      结果：
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address
+      0x0ff0  old rbp              ← rsp
+      低地址
+
+    3) mov rbp, rsp：把 rsp 的地址值复制给 rbp,建立当前栈帧基准。
+
+      结果：
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address
+      0x0ff0  old rbp              ← rsp, rbp
+      低地址
+
+    4) sub rsp, 16：给 x/y/对齐或临时值开 16 字节空间。
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address  ← [rbp + 8]
+      0x0ff0  old rbp              ← [rbp]
+      0x0fec  x                    ← [rbp - 4]
+      0x0fe8  y                    ← [rbp - 8]
+      0x0fe0  对齐/临时空间          ← rsp
+      低地址
+
+  此时可以稳定理解为：
+
+    [rsp]      = 当前栈顶内容,可能是对齐/临时空间
+    [rbp]      = old rbp
+    [rbp + 8]  = f 的 return_address
+    [rbp - 4]  = x
+    [rbp - 8]  = y
+
+  这就是 rbp 的价值：即使 rsp 是 0x0fe0,并且后续 call use 还会继续临时压入新的
+  return_address,当前函数 f 的 x/y/返回地址仍可用 [rbp + 固定偏移] 稳定描述。
+
+  出栈恢复过程：
+
+    1) mov rsp, rbp：撤销当前函数的局部栈空间。
+
+      执行前：
+
+      rbp = 0x0ff0
+      rsp = 0x0fe0
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address  ← [rbp + 8]
+      0x0ff0  old rbp              ← rbp
+      0x0fec  x
+      0x0fe8  y
+      0x0fe0  对齐/临时空间          ← rsp
+      低地址
+
+      mov rsp, rbp 只是 rsp = rbp,把栈顶从 0x0fe0 移回 0x0ff0。它不会清空
+      0x0fec/0x0fe8/0x0fe0 的旧字节;这些低于新 rsp 的位置只是逻辑释放。
+
+      执行后：
+
+      rbp = 0x0ff0
+      rsp = 0x0ff0
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address
+      0x0ff0  old rbp              ← rsp, rbp
+      0x0fec  x 的旧字节,逻辑上不再属于当前局部空间
+      0x0fe8  y 的旧字节,逻辑上不再属于当前局部空间
+      0x0fe0  对齐/临时空间旧字节,逻辑上不再属于当前局部空间
+      低地址
+
+    2) pop rbp：恢复调用者旧 rbp。
+
+      等价于：
+
+      rbp = [rsp]
+      rsp = rsp + 8
+
+      结果：
+
+      高地址
+      0x1000  call f 前旧 rsp 指向位置的原内容
+      0x0ff8  f 的 return_address  ← rsp
+      0x0ff0  old rbp 的旧字节,逻辑上已出栈
+      低地址
+
+    3) ret：此时 [rsp] 是 f 的 return_address,可以返回调用者。
+
+      等价于：
+
+      return_address = [rsp]
+      rsp = rsp + 8
+      jump return_address
+
+      ret 跳回 caller 中 call f 后面的下一条机器指令。
+
+  所以函数返回并不是"清空栈内存"：
+    · 它主要是恢复 rsp/rbp 等寄存器。
+    · 旧栈字节可能仍在内存中，但 rsp 已经移动，逻辑上这些字节不再属于当前活跃栈帧。
+
+
+================================================================================
+六、返回地址的值 vs 保存返回地址的栈槽地址
+================================================================================
+
+  这两个概念必须分开：
+
+    返回地址的值：
+      · 代码地址。
+      · 例如 0x401015。
+      · 表示函数返回后跳到哪条机器指令。
+
+    保存返回地址的栈槽地址：
+      · 栈地址。
+      · 例如 0x7fffffffe0a8。
+      · 表示哪个栈槽里存着 0x401015。
+
+  图示：
+
+    caller 的代码段(text segment):
+
+      0x401000: ...
+      0x401010: call f
+      0x401015: mov ...      ; call f 后的下一条机器指令
+
+    当前线程的栈内存(stack):
+
+      0x7fffffffe0a8: 0x401015
+
+  解释：
+
+    0x401015 是返回地址的值，属于代码地址。
+    0x7fffffffe0a8 是保存返回地址的栈槽地址，属于栈内存地址。
+    ret 从栈槽读出 0x401015，然后跳到 0x401015。
+
+  具体例子：
+
+    void f();
+
+    void caller() {
+      f();
+      x = 1;
+    }
+
+  如果 call f 位于 0x401010，call 后下一条指令位于 0x401015，那么：
+
+    · 0x401015 是"返回地址的值"。
+    · call f 执行时，CPU 可能把 0x401015 写到当前栈顶 0x7fffffffe0a8。
+    · 0x7fffffffe0a8 是"保存返回地址的位置"。
+
+  用 C 指针类比：
+
+    int value = 42;
+    int* slot = &value;
+
+  类比关系只是帮助理解：
+    · value 的内容 42 类似"返回地址的值"。
+    · slot 保存的位置 &value 类似"保存返回地址的栈槽地址"。
+    · 实际返回地址是代码地址，不是普通 int。
+
+
+================================================================================
+七、栈顶和"return_address"的关系
+================================================================================
+
+  栈是 LIFO：last in, first out。
+
+  在 x86-64 中：
+    · push 会先让 rsp 变小，再写入 [rsp]。
+    · 最新 push 的内容地址最低，也最靠近当前 rsp。
+    · 所以最新入栈的内容就是当前栈顶。
+
+  返回地址是不是"最先进"：
+    · 对被调用函数 f 来说，return_address 是 call f 刚刚压入的内容。
+    · 因此刚进入 f 时，return_address 是最新入栈的内容，在 [rsp]。
+    · 如果 f 内部继续 push rbx 或 sub rsp, 32，那么更新的内容会压到更低地址，
+      return_address 就会位于当前 rsp 上方的某个 offset。
+
+  push rbx
+  sub rsp, 32
+
+  图示：
+
+    刚进入 f：
+
+      高地址
+      0x1000  旧内容
+      0x0ff8  return_address   ← rsp
+      低地址
+
+    f 内部 push rbx：
+
+      高地址
+      0x1000  旧内容
+      0x0ff8  return_address
+      0x0ff0  saved rbx        ← rsp
+      低地址
+
+    f 内部再 sub rsp, 32：
+
+      高地址
+      0x1000  旧内容
+      0x0ff8  return_address
+      0x0ff0  saved rbx
+      0x0fe8  local/temp
+      0x0fe0  local/temp
+      0x0fd8  local/temp
+      0x0fd0  local/temp       ← rsp
+      低地址
+
+    此时 return_address 位于 [rsp + 40]。
+
+
+  刚 call 进入 f 时，return_address 是最新入栈内容，在 [rsp]。
+  但执行 push rbx 后，saved rbx 更新，成为最新入栈内容，在新的 [rsp]。
+  再执行 sub rsp, 32 后，当前 [rsp] 指向局部变量空间，return_address 被留在更高地址的
+  [rsp + 40]。
+
+
+================================================================================
+八、局部变量一定在栈上吗
+================================================================================
+
+  不一定。
+
+  源码：
+
+    int f(int a) {
+      int x = a + 1;
+      return x;
+    }
+
+  优化后可能只有寄存器计算：
+
+    lea eax, [rdi + 1]
+    ret
+
+  此时：
+    · x 没有栈地址。
+    · x 甚至没有独立实体，只是寄存器里的一个中间值。
+
+  什么时候局部变量更可能在栈上：
+
+    1) 需要真实地址：
+
+      void use(int*);
+
+      void f(int a) {
+        int x = a + 1;
+        use(&x);
+      }
+
+      因为 &x 必须指向可寻址位置，x 通常放到栈上。
+
+    2) 局部数组或较大对象：
+
+      void f() {
+        float buf[128];
+        use(buf);
+      }
+
+      buf 需要连续可寻址字节，通常在栈上。
+
+    3) 寄存器压力过大：
+
+      同时活跃的值太多，编译器可能把一部分值 spill 到栈。
+
+    4) 调试/低优化级别：
+
+      为了让调试器更容易观察变量，编译器可能减少寄存器优化，把更多变量放在栈上。
+
+  对比两个具体例子：
+
+    例子 A：不需要地址，容易只用寄存器。
+
+      int f(int a) {
+        int x = a + 1;
+        return x * 2;
+      }
+
+    可能优化成：
+
+      lea eax, [rdi + 1]
+      add eax, eax
+      ret
+
+    x 没有栈槽。
+
+    例子 B：需要地址，通常放到栈。
+
+      void use(int*);
+
+      void f(int a) {
+        int x = a + 1;
+        use(&x);
+      }
+
+    可能生成：
+
+      sub rsp, 16          ; 在当前栈帧中开 16 字节空间,同时保持 ABI 要求的栈对齐
+      lea eax, [rdi + 1]   ; 计算 x = a + 1。rdi 保存参数 a,eax 保存计算结果
+      mov [rsp + 12], eax  ; 把 x 写入栈槽 [rsp + 12],让 x 拥有真实内存地址
+      lea rdi, [rsp + 12]  ; 计算 &x,并把这个地址放入第一个参数寄存器 rdi
+      call use             ; 调用 use(&x)。call 会再压入 use 返回到 f 的 return_address
+      add rsp, 16          ; use 返回后,撤销前面 sub rsp, 16 开出的栈空间
+      ret                  ; 从 [rsp] 取出 f 的 return_address,返回到 f 的调用者
+
+    这里 [rsp + 12] 是 x 的栈槽，因为 &x 需要真实地址。
+
+
+================================================================================
+九、全局变量和静态存储区：有地址,但不在栈/堆上
+================================================================================
+
+  C++ 全局变量和 static 变量通常具有静态存储期(static storage duration)。
+  它们有地址,生命周期通常贯穿整个程序运行期,但它们不是栈变量,也不是 malloc/new
+  分配的堆变量。
+
+  具体例子：
+
+    int g_init = 42;          // 已初始化的可写全局变量,通常在 .data
+    int g_zero;               // 零初始化/未显式初始化的全局变量,通常在 .bss
+    static int file_s = 7;    // 文件作用域 static,通常也在 .data,但只有内部链接
+    const int g_const = 3;    // 可能在 .rodata,若需要真实存储则有地址但通常只读
+
+    int main() {
+      int* p = &g_init;
+      return *p;
+    }
+
+  这段代码里：
+    · &g_init 是进程虚拟地址空间中的一个地址。
+    · g_init 的存储不是当前函数栈帧的一部分,不会随着 main 返回前的 rsp 移动而移动。
+    · g_init 也不是 new/malloc 分配的堆对象,不需要 delete/free。
+
+  常见段(section)：
+
+    .data    已初始化的可写全局/静态对象
+    .bss     零初始化或未显式初始化的全局/静态对象
+    .rodata  只读常量数据
+
+  和栈/堆对比：
+
+    int g = 1;              // 静态存储区:有地址,整个程序运行期存在
+
+    void f() {
+      int x = 2;            // 自动局部变量:可能在寄存器,需要地址时通常在栈上
+      int* p = new int(3);  // *p 在堆上,由 new/malloc 动态分配
+      delete p;
+    }
+
+  地址和生命周期：
+    · 静态存储区对象:有地址,生命周期贯穿程序运行期。
+    · 栈对象:有地址时位于当前线程栈帧,生命周期随作用域/调用结束。
+    · 堆对象:有地址,生命周期由 malloc/free 或 new/delete 控制。
+    · 寄存器中的值:没有普通内存地址;若必须取地址,编译器需要把对象放到可寻址内存。
+
+  const/constexpr 的细节：
+    · 如果 const/constexpr 值完全被编译器内联替换,且从未需要真实地址,最终二进制里
+      可能没有为它分配独立存储。
+    · 一旦发生需要真实对象的使用,例如取地址或 ODR-use,编译器/链接器通常必须为它
+      分配可寻址存储。
+
+  CUDA 设备端也有类似但不同的概念：
+
+    __device__ int d_g;
+
+  d_g 是设备端全局符号,位于 GPU device global memory 地址空间中,不是 host 堆;
+  host 端通常通过 cudaMemcpyToSymbol 等符号 API 或取到设备符号地址后访问。
+
+
+================================================================================
+十、参数如何传递：寄存器优先，栈作为补充
+================================================================================
+
+  x86-64 上函数参数通常优先通过寄存器传递。具体寄存器取决于 ABI：
+
+    Linux/macOS System V ABI：
+      整数/指针参数常用 rdi, rsi, rdx, rcx, r8, r9。
+
+    Windows x64 ABI：
+      整数/指针参数常用 rcx, rdx, r8, r9。
+
+  当参数太多、参数太大、可变参数函数、或 ABI 要求时，部分参数会放到栈上。
+
+  示例：
+
+    h(a0, a1, a2, a3, a4, a5, a6, a7, a8);
+
+  如果寄存器参数槽不够，后面的参数可能通过栈传递。
+
+  注意：
+    · "通过栈传参"指的是参数值被放在栈内存某个位置。
+    · "通过寄存器传参"指的是参数值直接放在寄存器中。
+    · 无论哪种方式，函数内部仍可能为自己的局部状态建立栈帧。
+
+  具体例子：Linux/macOS System V ABI 下的整数参数。
+
+    long sum8(long a0, long a1, long a2, long a3,
+              long a4, long a5, long a6, long a7);
+
+    long caller() {
+      return sum8(0, 1, 2, 3, 4, 5, 6, 7);
+    }
+
+  前 6 个整数/指针参数通常走寄存器：
+
+    a0 -> rdi
+    a1 -> rsi
+    a2 -> rdx
+    a3 -> rcx
+    a4 -> r8
+    a5 -> r9
+
+  后面的 a6、a7 没有寄存器参数槽，通常通过栈传递。概念上：
+
+    mov rdi, 0     ; 第 1 个参数 a0 = 0,放入 rdi
+    mov rsi, 1     ; 第 2 个参数 a1 = 1,放入 rsi
+    mov rdx, 2     ; 第 3 个参数 a2 = 2,放入 rdx
+    mov rcx, 3     ; 第 4 个参数 a3 = 3,放入 rcx
+    mov r8,  4     ; 第 5 个参数 a4 = 4,放入 r8
+    mov r9,  5     ; 第 6 个参数 a5 = 5,放入 r9
+    push 7         ; 第 8 个参数 a7 = 7,没有寄存器参数槽,压到栈上
+    push 6         ; 第 7 个参数 a6 = 6,压到栈上;执行后 a6 位于更低地址的当前栈顶
+    call sum8      ; 压入返回地址,然后跳到 sum8;sum8 从寄存器和栈中读取参数
+
+  实际编译器还会处理栈对齐，可能不是逐条 push，但语义上 a6/a7 会放在调用栈上。
+  这里先 push 7 再 push 6,是为了让调用发生时较靠前的栈上传参 a6 位于当前 rsp 附近,
+  被调函数能按 ABI 约定从固定偏移读到 a6、a7。
+
+
+================================================================================
+十一、CPU 栈/寄存器与 GPU 寄存器/local memory 对比
+================================================================================
+
+  CPU：
+    · 普通局部变量优先放寄存器。
+    · 需要真实地址、寄存器不够、较大局部对象等情况会放到栈。
+    · 栈位于 CPU 线程的虚拟内存中，物理上通常在系统 DRAM。
+
+  GPU：
+    · 每个 CUDA thread 也优先把局部标量放寄存器。
+    · 寄存器不够会 spill 到 local memory。
+    · 需要真实地址的线程局部变量也可能放到 local memory。
+    · CUDA local memory 名字叫 local，但物理上通常在 GPU global memory/HBM 中，并经过缓存。
+
+  共同点：
+    · 寄存器没有普通 C/C++ 指针地址。
+    · 如果变量必须有真实地址，就需要放到可寻址内存中。
+
+  区别：
+    · CPU 的普通函数调用栈是显式 ABI 机制，围绕 rsp/rbp/call/ret 工作。
+    · GPU kernel 的线程局部 local memory 是 CUDA 设备端每线程私有地址空间，不等同于
+      CPU 函数调用栈；但"寄存器放不下或必须取地址时落到可寻址内存"这个思想类似。
+
+  具体例子：
+
+    CPU：
+
+      void use(int*);
+
+      void f() {
+        int x = 1;
+        use(&x);
+      }
+
+    x 需要真实地址，CPU 编译器通常把 x 放到栈上。
+
+    GPU：
+
+      __device__ void use(int*);
+
+      __global__ void k() {
+        int x = threadIdx.x;
+        use(&x);
+      }
+
+    如果 use(&x) 不能被内联/优化掉，x 需要真实设备端地址，CUDA 编译器可能把 x 放到
+    local memory。local memory 是每线程私有地址空间，物理上通常在 HBM/global memory 中。
+
+    GPU 中另一个例子：
+
+      __global__ void k(float* out) {
+        float tmp[128];
+        tmp[threadIdx.x & 127] = 1.0f;
+        out[threadIdx.x] = tmp[0];
+      }
+
+    这里:
+      · tmp 是 kernel 内的线程局部数组,每个 CUDA thread 都有自己的一份 tmp。
+      · threadIdx.x & 127 取 threadIdx.x 的低 7 位,结果范围是 0..127;对非负整数可
+        理解为 threadIdx.x % 128。
+      · tmp[threadIdx.x & 127] = 1.0f 表示当前线程把自己私有 tmp 数组中的某个元素
+        写成 1.0f。
+
+    tmp 放在哪里取决于编译器:
+      · 如果编译器能完全分析并标量化 tmp,可能把相关值放到寄存器。
+      · 如果 tmp 较大、使用动态下标、无法标量化,通常会使用 CUDA local memory。
+      · CUDA local memory 是每线程私有地址空间,但物理上通常由 GPU global memory/HBM
+        承载,访问路径通常经过 L1/L2 cache。
+
+    和 CPU 数组对比:
+      · CPU 普通局部自动数组 float a[128] 通常在当前线程栈上,但也可能被优化掉或标量化。
+      · CPU new/malloc 得到的数组在堆上。
+      · CPU static/global 数组在静态存储区,不是栈也不是堆。
+      · GPU 线程局部数组若落到 local memory,语义上线程私有;物理上通常仍是 HBM/global
+        memory,不是 SM 片上的 shared memory。
+
+
+================================================================================
+十二、最重要的几句话
+================================================================================
+
+  · rsp 是寄存器，保存当前栈顶地址。
+  · rsp 指向当前已用栈区域中的最低地址位置，不是整个线程栈范围的最低地址。
+  · [rsp] 是当前栈顶内存内容。
+  · x86-64 栈向低地址增长，push 会让 rsp 变小。
+  · call 会把返回地址压栈，然后跳到被调函数。
+  · ret 会从栈中取出返回地址，然后跳回调用者。
+  · 返回地址的值是代码地址；保存它的位置是栈地址。
+  · 局部变量不一定在栈上，可能在寄存器中，也可能被优化到没有独立实体。
+
+  用一个完整例子串起来：
+
+    int callee(int a) {
+      return a + 1;
+    }
+
+    int caller() {
+      int y = callee(41);
+      return y * 2;
+    }
+
+  概念执行过程：
+    1. caller 把参数 41 放到参数寄存器 rdi。
+    2. caller 执行 call callee。
+    3. call 把返回地址压到 [rsp - 8]，然后 rsp 变成 rsp - 8，并跳到 callee。
+    4. callee 用寄存器算出 42。
+    5. callee 执行 ret。
+    6. ret 从 [rsp] 读出返回地址，让 rsp 加 8，然后跳回 caller 中 call 后的下一条指令。
+    7. caller 继续执行 y * 2。
+
+  如果 callee 内部需要局部变量地址或寄存器不够，它才会使用自己的栈帧；否则简单函数
+  可能全程只用寄存器和返回地址，不为局部变量额外开栈空间。
