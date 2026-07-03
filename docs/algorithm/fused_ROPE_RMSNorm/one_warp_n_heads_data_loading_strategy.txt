@@ -1,0 +1,930 @@
+================================================================================
+一个 warp 处理 N 个 heads 的 Fused QKNorm + RoPE 数据加载策略：寄存器、SMEM 与 cp.async 流水
+================================================================================
+
+章节导航：
+  一、数据的复用粒度
+  二、为什么 dynamic SMEM 大小按 block 的最坏情况确定
+  三、QKV + cos/sin 加载与计算流水策略
+  四、q_weight/k_weight 的加载策略
+  五、推荐的执行流水
+  六、一个 block 处理一个 token 的替代流水
+  七、常见错误
+  八、速查表
+
+
+核心一句话：
+  · 本文讨论的是一个 warp 连续处理同一个 token 的 N 个 Q/K heads 时，QKV、cos/sin、
+    q_weight/k_weight 应该如何加载、复用和流水化。
+  · QKV 是每个 token/head 的主数据，默认优先直接加载到寄存器；只有验证 QKV cp.async
+    或做双缓冲流水时，才考虑搬到每个 warp 自己的 SMEM tile。
+  · cos/sin 和 token 绑定，同一个 token 的多个 head 共用，适合每个 warp 搬一份到 SMEM 后复用。
+  · q_weight/k_weight 和 token/head 无关，通常每个 warp 预加载到寄存器复用；放 block 级 SMEM
+    可以做 benchmark 优化，但不是默认最优。
+
+
+================================================================================
+一、数据的复用粒度
+================================================================================
+
+  fused QKNorm + RoPE 里主要有三类输入：
+
+    1. qkv
+       · 形状通常可理解为 [num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_dim]。
+       · Q/K head 会被就地归一化并做 RoPE。
+       · 每个 warp 负责同一个 token 的若干个 Q/K head。
+       · 每个 head 的 QKV 数据不同，不能跨 head 复用。
+
+    2. cos/sin
+       · 形状通常可理解为 [num_tokens, rotary_dim / 2]，或 cos/sin 合并缓存
+         [num_tokens, rotary_dim]。
+       · 同一个 token 的所有 head 使用同一份 cos/sin。
+       · 如果一个 warp 处理同一个 token 的多个 head，那么 cos/sin 可以在这些 head 间复用。
+
+    3. q_weight/k_weight
+       · 形状通常是 [head_dim]。
+       · 它们是 Q/K RMSNorm 的权重。
+       · 不随 token 变化，也不随 head 变化。
+       · 一个 warp 处理多个 head 时，q_weight/k_weight 可以在这些 head 间复用。
+
+
+================================================================================
+二、为什么 dynamic SMEM 大小按 block 的最坏情况确定
+================================================================================
+
+  dynamic shared memory 的大小由 kernel launch 第三个参数指定：
+
+    kernel<<<gridDim, blockDim, dynamic_smem_bytes>>>(...);
+
+  这个大小对所有 block 相同，不能在 kernel 内根据“当前 block 实际处理几个 token”
+  动态改变。
+
+  因此 dynamic_smem_bytes 应该按每个 block 实际使用到的 SMEM 缓冲计算：
+
+    warpsPerBlock = blockDim.x / 32
+
+    dynamic_smem_bytes =
+        必需/启用的 cos/sin 空间
+      + 可选的 QKV tile / 双缓冲空间
+      + 可选的 q/k weight 缓存空间
+      + 必要的对齐 padding
+
+  当前多 head/warp 映射下，一个 block 里的不同 warp 可能处理不同 token：
+
+    globalWarpIdx  = blockIdx.x * warpsPerBlock + warpIdxPerBlock
+    tokenIdx       = globalWarpIdx / warpNumPerToken
+    warpIdxInToken = globalWarpIdx % warpNumPerToken
+
+  所以不能假设一个 block 只对应一个 token。
+
+
+================================================================================
+三、QKV + cos/sin 加载与计算流水策略
+================================================================================
+
+  QKV 和 cos/sin 不应该分成两个孤立问题看。它们进入同一个 per-warp head 循环：
+
+    · QKV：每个 head 独有，通常只被当前 lane 使用一次，天然复用弱。
+    · cos/sin：和 token 绑定，同一个 warp 处理多个 head 时可以复用。
+    · QK Norm：只依赖 QKV 和 q_weight/k_weight，不依赖 cos/sin。
+    · RoPE：依赖 QK Norm 结果和 cos/sin。
+
+  因此不能简单按“数据是否放进 SMEM”来决定加载方式。真正要决定的是一条执行路径：
+  哪些数据直接进寄存器，哪些数据先进入 SMEM，哪些加载可以和后续计算重叠，以及在什么
+  位置 wait。
+
+  下面四种策略和后文 A/B/C/D 一一对应：
+
+    A. 基线：
+       QKV 直接进寄存器，cos/sin 直接从 global/read-only cache 读。
+
+    B. 推荐优化：
+       QKV 直接进寄存器；cos/sin 用 per-warp SMEM，并和第一个 head 的 QK Norm 重叠。
+
+    C. 不推荐作为最终形态：
+       QKV 先进 SMEM，随后立刻 wait，再从 SMEM 读回寄存器计算。这个路径功能正确，
+       但没有隐藏 global load 延迟，也没有 QKV 复用，通常只是多了一次 SMEM 中转。
+
+    D. 进阶三路流水：
+       把三件事排成流水：cos/sin 先异步进 per-warp SMEM；current head 从当前 QKV
+       buffer 计算；next head 的 QKV 同时异步进入另一个 QKV buffer。
+
+
+--------------------------------------------------------------------------------
+  共同地址约定
+--------------------------------------------------------------------------------
+
+  如果 cos/sin 分开存储：
+
+    cos: [num_tokens, rotary_dim / 2]
+    sin: [num_tokens, rotary_dim / 2]
+
+  可以把它们连续放进当前 warp 的 cos/sin SMEM：
+
+    [0, rotary_dim / 2 * sizeof(T_cache))
+        cos
+
+    [rotary_dim / 2 * sizeof(T_cache), rotary_dim * sizeof(T_cache))
+        sin
+
+  访问指针：
+
+    T_cache* warp_cache =
+        reinterpret_cast<T_cache*>(this_warp_cos_sin);
+
+    T_cache* cos_smem = warp_cache;
+    T_cache* sin_smem = warp_cache + rotary_dim / 2;
+
+  如果用 cp.async 16B 版本搬 cos/sin，最好保证拷贝总字节数是 16 的倍数，或者显式处理
+  尾部边界，避免最后一笔 16B 拷贝越界写 SMEM。
+
+
+--------------------------------------------------------------------------------
+  策略 A：基线，QKV 和 cos/sin 都直接读到寄存器
+--------------------------------------------------------------------------------
+
+  这是最直接、最容易先做正确的版本：
+
+    for (uint k = 0; k < headNumInWarp; ++k) {
+      uint localHeadIdx = firstHeadIdx + k;
+      bool isQ = localHeadIdx < qHeadsPerToken;
+      uint headIdx = isQ ? localHeadIdx : localHeadIdx - qHeadsPerToken;
+
+      uint head_offset =
+          tokenIdx * totalHeadsPerToken * head_dim
+        + (isQ ? headIdx : qHeadsPerToken + headIdx) * head_dim;
+
+      uint thread_offset =
+          head_offset + laneIdx * elementNumPerHeadPerThread;
+
+      vec_T qkv_vec =
+          *reinterpret_cast<const vec_T*>(&qkv[thread_offset]);
+
+      compute_qknorm(qkv_vec, elements);
+
+      for (uint i = 0; i < elementNumPerHeadPerThread / 2; ++i) {
+        uint half_dim = (laneIdx * elementNumPerHeadPerThread + 2 * i) / 2;
+        float c = convert(cos[tokenIdx * half + half_dim]);
+        float s = convert(sin[tokenIdx * half + half_dim]);
+        apply_rope(elements, c, s, i);
+      }
+
+      store_back_qkv(k, elements);
+    }
+
+  特点：
+
+    · QKV 没有 SMEM 中转，访存路径最短。
+    · 没有 cp.async commit/wait。
+    · 没有 dynamic SMEM 的 QKV tile 空间。
+    · 同一个 warp 处理多个 head 时，cos/sin 会重复从 global/read-only cache 读取。
+
+
+--------------------------------------------------------------------------------
+  策略 B：推荐优化，QKV 同步进寄存器，cos/sin 异步进 per-warp SMEM
+--------------------------------------------------------------------------------
+
+  这条路径最符合当前多 head/warp 的复用关系：
+
+    · QKV 不进 SMEM，避免 global -> smem -> register 的额外中转。
+    · cos/sin 只加载一次到当前 warp 的 SMEM。
+    · 第一个 head 做 QK Norm 时，cos/sin 的 cp.async 可以继续在后台进行。
+    · 第一个 head 进入 RoPE 前等待 cos/sin 完成。
+    · 后续 head 直接复用 cos_smem/sin_smem。
+
+  伪代码：
+
+    // 1. 每个 warp 先异步加载自己 token 的 cos/sin。
+    for (uint copyId = laneIdx; copyId < cos_sin_copy_count; copyId += 32) {
+      char* smem_dst =
+          this_warp_cos_sin + copyId * 16;
+      const char* global_src =
+          reinterpret_cast<const char*>(cos_sin_global_for_token) + copyId * 16;
+
+      cp_async_shared_global_ca(smem_dst, global_src, 16);
+    }
+
+    cp_async_commit_group();
+
+    // 2. head 循环里，QKV 仍然直接同步读到寄存器。
+    for (uint k = 0; k < headNumInWarp; ++k) {
+      vec_T qkv_vec = load_qkv_to_register(k);
+
+      // 这段 QK Norm 不依赖 cos/sin，可以覆盖 cos/sin 的部分加载延迟。
+      compute_qknorm(qkv_vec, elements);
+
+      if (k == 0) {
+        cp_async_wait_group<0>();
+        __syncwarp();
+      }
+
+      apply_rope_from_smem_cos_sin(elements, cos_smem, sin_smem);
+      store_back_qkv(k, elements);
+    }
+
+  这条路径的收益来源：
+
+    · cos/sin 被同一个 warp 的多个 head 复用。
+    · 第一个 head 的 QK Norm 可以覆盖一部分 cos/sin 加载延迟。
+    · QKV 没有 SMEM 中转，避免了 QKV smem -> register 的额外成本。
+
+  这是当前实现最值得优先尝试的优化版。
+
+
+--------------------------------------------------------------------------------
+  策略 C：不推荐作为最终形态，QKV 进 SMEM 但不做流水
+--------------------------------------------------------------------------------
+
+  策略 C 的数据路径是：
+
+    QKV global -> QKV SMEM -> register -> compute
+
+  也就是先用 cp.async 把 QKV 搬到当前 warp 的 SMEM 区域，然后立刻等待所有 QKV 到位，
+  最后再从 SMEM 读到寄存器做 QK Norm / RoPE。
+
+  下面这种写法功能上可以工作：
+
+    for (uint k = 0; k < headNumInWarp; ++k) {
+      cp_async_qkv_head(k, this_warp_qkv + k * qkv_tile_bytes_per_head);
+    }
+
+    cp_async_commit_group();
+    cp_async_wait_group<0>();
+    __syncwarp();
+
+    for (uint k = 0; k < headNumInWarp; ++k) {
+      vec_T qkv_vec = load_qkv_from_smem(k);
+      compute_qknorm_and_rope(qkv_vec);
+    }
+
+  问题是：
+
+    · 发起 QKV cp.async 后立刻 wait，等待期间没有做其他有用计算。
+    · 没有形成“加载 next，计算 current”的流水，所以没有隐藏 QKV global load 延迟。
+    · QKV 没有跨 head 复用，每个 head 的 QKV 仍然只用一次。
+    · 相比直接 global -> register，多了一次 smem -> register 的读取。
+    · 还会额外占用 dynamic SMEM，并引入 commit/wait/__syncwarp 控制成本。
+
+  因此它更像一个“过渡形态”：证明 QKV cp.async 到 SMEM 的地址切分和同步是正确的，
+  但不适合作为最终性能版本。QKV 先进 SMEM 的强理由不是“复用”，而是为下一种
+  双缓冲流水做准备。
+
+
+--------------------------------------------------------------------------------
+  策略 D：进阶三路流水，cos/sin 加载、QKV 加载、计算三者重叠
+--------------------------------------------------------------------------------
+
+  策略 D 的目标是把三件事尽量重叠起来：
+
+    1. cos/sin 加载：
+       当前 warp 的 cos/sin 只加载一次到 per-warp SMEM，供多个 head 复用。
+
+    2. current head 计算：
+       当前 head 从已经就绪的 QKV buffer 读数据，执行 QK Norm 和 RoPE。
+
+    3. next head QKV 预取：
+       在 current head 计算期间，用 cp.async 把 next head 的 QKV 搬到另一个 QKV buffer。
+
+  这需要两个 QKV SMEM buffer：
+
+    qkv_buf0：当前轮可能正在被读取计算
+    qkv_buf1：下一轮可能正在被 cp.async 写入
+
+  两个 buffer 轮换使用，避免 next head 的异步写入覆盖 current head 正在计算的数据。
+
+  注意 cp.async group 的先后顺序。wait_group<N> 会保留最新的 N 个 group 可能未完成，
+  等待更老的 group。因此如果想“等 QKV head0，但允许 cos/sin 继续在途”，应该先提交
+  QKV head0，再提交 cos/sin：
+
+    1. group0：预取 head0 的 QKV -> qkv_buf0。
+    2. group1：发起 cos/sin -> smem。
+    3. wait_group<1>：
+       · 保证更老的 group0(QKV head0) 完成。
+       · 允许最新 group1(cos/sin) 仍在途。
+    4. 循环中：
+       · 预取 head k+1 的 QKV -> 另一个 qkv buffer。
+       · 计算 head k 的 QK Norm。
+       · 第一次进入 RoPE 前，用 wait_group<1> 等较老的 cos/sin，尽量保留最新的
+         next QKV 继续在途。
+       · 做 head k 的 RoPE。
+       · 下一轮读取 next QKV 前，再等待 next QKV 到位。
+
+  伪代码：
+
+    char* qkv_buf0 = this_warp_qkv;
+    char* qkv_buf1 = this_warp_qkv + qkv_tile_bytes_per_head;
+
+    cp_async_qkv_head(0, qkv_buf0);
+    cp_async_commit_group();
+
+    cp_async_cos_sin_to_smem(this_warp_cos_sin, tokenIdx);
+    cp_async_commit_group();
+
+    cp_async_wait_group<1>();  // 保证 head0 QKV 完成，允许 cos/sin 仍在途。
+    __syncwarp();
+
+    for (uint k = 0; k < headNumInWarp; ++k) {
+      uint next = k + 1;
+
+      if (next < headNumInWarp) {
+        char* next_qkv_buf = (next & 1) ? qkv_buf1 : qkv_buf0;
+        cp_async_qkv_head(next, next_qkv_buf);
+        cp_async_commit_group();
+      }
+
+      char* cur_qkv_buf = (k & 1) ? qkv_buf1 : qkv_buf0;
+      vec_T qkv_vec =
+          *reinterpret_cast<const vec_T*>(
+              cur_qkv_buf + laneIdx * elementBytesPerHeadPerThread);
+
+      // QK Norm 可以同时覆盖：
+      //   · cos/sin 的剩余加载延迟。
+      //   · next head QKV 的加载延迟。
+      compute_qknorm(qkv_vec, elements);
+
+      if (k == 0) {
+        if (next < headNumInWarp) {
+          cp_async_wait_group<1>();  // 等 cos/sin，尽量保留 next QKV 在途。
+        } else {
+          cp_async_wait_group<0>();  // 没有 next QKV，只需等 cos/sin。
+        }
+        __syncwarp();
+      }
+
+      apply_rope_from_smem_cos_sin(elements, cos_smem, sin_smem);
+      store_back_qkv(k, elements);
+
+      if (next < headNumInWarp) {
+        cp_async_wait_group<0>();  // 下一轮读取 next QKV 前，保证 next QKV 到位。
+        __syncwarp();
+      }
+    }
+
+  这条路径可能带来最高的延迟隐藏，但也最复杂：
+
+    · 需要 per-warp cos/sin SMEM。
+    · 需要两个 per-warp QKV SMEM buffer。
+    · 需要更仔细安排 cp.async group 和 wait_group。
+    · 如果 headNumInWarp 很小，或者 QK Norm/RoPE 计算量不足，收益可能覆盖不了复杂度。
+    · cp.async.wait_group 是线程局部等待；如果 warp 内多个 lane 协作填同一个 tile，
+      读取前仍然需要 __syncwarp()。
+
+  实现顺序建议：
+
+    1. 先做“QKV 同步加载 + cos/sin 直接 global 读取”的正确版本。
+    2. 再做“QKV 同步加载 + cos/sin per-warp SMEM + 与第一个 head RMSNorm 重叠”。
+    3. 最后再 benchmark 是否值得上“QKV 双缓冲 + cos/sin 重叠”的三路流水。
+
+
+================================================================================
+四、q_weight/k_weight 的加载策略
+================================================================================
+
+  q_weight/k_weight 是 RMSNorm 的缩放权重，形状通常是：
+
+    q_weight: [head_dim]
+    k_weight: [head_dim]
+
+  它们和 QKV、cos/sin 的复用关系不同：
+
+    · QKV：和 token/head 都有关，每个 head 不同。
+    · cos/sin：和 token 有关，同一个 token 的多个 head 共用。
+    · q_weight/k_weight：只和 dim 有关，不随 token 变化，也不随 head 变化。
+
+  因此 q_weight/k_weight 不应该按“每个 head”加入流水线反复加载。更合理的做法是：
+
+    1. 在 head 循环之前，每个 lane 加载自己负责的维度权重。
+    2. 放到寄存器数组 q_w/k_w。
+    3. 后续这个 warp 处理多个 head 时，直接复用寄存器里的 q_w/k_w。
+
+
+--------------------------------------------------------------------------------
+  推荐：head 循环前一次性加载到寄存器
+--------------------------------------------------------------------------------
+
+  示例：
+
+    float q_w[elementNumPerHeadPerThread];
+    float k_w[elementNumPerHeadPerThread];
+
+    #pragma unroll
+    for (uint i = 0; i < elementNumPerHeadPerThread; ++i) {
+      uint dim = laneIdx * elementNumPerHeadPerThread + i;
+      q_w[i] = convert(q_weight[dim]);
+      k_w[i] = convert(k_weight[dim]);
+    }
+
+    for (uint head_i = 0; head_i < headNumInWarp; ++head_i) {
+      bool isQ = ...;
+
+      vec_T qkv_vec = load_qkv_to_register_or_smem_buffer(head_i);
+      compute_sum_of_squares(qkv_vec, elements, sumOfSquares);
+
+      float rmsRcp =
+          rsqrtf(warpReduceSum(sumOfSquares) / static_cast<float>(head_dim) + eps);
+
+      #pragma unroll
+      for (uint i = 0; i < elementNumPerHeadPerThread; ++i) {
+        elements[i] *= rmsRcp * (isQ ? q_w[i] : k_w[i]);
+      }
+
+      apply_rope_and_store(head_i, elements);
+    }
+
+  这里 q_w/k_w 的生命周期覆盖整个 head 循环。它们不会参与每个 head 的 cp.async wait，
+  也不需要每个 head 从 SMEM 重读。
+
+
+--------------------------------------------------------------------------------
+  不推荐：每个 head 从 SMEM 重新加载 q_weight/k_weight
+--------------------------------------------------------------------------------
+
+  不建议把 q_weight/k_weight 设计成下面这种流水：
+
+    head0: 加载 q_weight/k_weight
+    head0: 计算 RMSNorm
+    head1: 再从 SMEM 加载 q_weight/k_weight
+    head1: 计算 RMSNorm
+    ...
+
+  原因：
+
+    · q_weight/k_weight 对所有 head 都相同，每个 head 重复加载没有必要。
+    · 即使先放进 SMEM，最终仍然要读到寄存器参与乘法。
+    · 每个 head 从 SMEM 重读会增加 shared memory 访问。
+    · 如果为了 SMEM 权重加载加入 __syncthreads()，还会增加 block 级同步成本。
+    · 如果部分 warp 因 tokenIdx 越界提前 return，block 级 __syncthreads() 还可能导致
+      barrier 不匹配。
+
+  更清晰的原则是：
+
+    q_weight/k_weight: head 循环外加载一次 -> register -> 多个 head 复用
+    cos/sin:           per-warp SMEM 加载一次 -> 多个 head 复用
+    QKV:               每个 head 不同 -> 直接寄存器加载，或用双缓冲 cp.async 预取 next head
+
+
+--------------------------------------------------------------------------------
+  可选 benchmark：block 级 static SMEM 缓存权重
+--------------------------------------------------------------------------------
+
+  如果 head_dim 较大，或者 profiling 显示 q_weight/k_weight 的 global load 成本明显，可以尝试
+  block 级 static SMEM 缓存。但它应该只在 block 开头加载一次，然后每个 lane 再读到寄存器，
+  仍然不是每个 head 重复从 SMEM 加载。
+
+  示例：
+
+    __shared__ float q_w_smem[MAX_HEAD_DIM];
+    __shared__ float k_w_smem[MAX_HEAD_DIM];
+
+    for (uint dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+      q_w_smem[dim] = convert(q_weight[dim]);
+      k_w_smem[dim] = convert(k_weight[dim]);
+    }
+
+    __syncthreads();
+
+    float q_w[elementNumPerHeadPerThread];
+    float k_w[elementNumPerHeadPerThread];
+
+    #pragma unroll
+    for (uint i = 0; i < elementNumPerHeadPerThread; ++i) {
+      uint dim = laneIdx * elementNumPerHeadPerThread + i;
+      q_w[i] = q_w_smem[dim];
+      k_w[i] = k_w_smem[dim];
+    }
+
+  这个版本的代价：
+
+    · 额外占用 shared memory：2 * head_dim * sizeof(float)。
+    · 需要一次 block 级 __syncthreads()。
+    · 如果有部分 warp 因 tokenIdx 越界提前 return，而其他线程进入 __syncthreads()，
+      会导致 barrier 不匹配。
+    · q_weight/k_weight 是小的只读数据，通常能被 L1/L2/read-only cache 缓住。
+    · 从 SMEM 读出来后仍然要进入寄存器参与乘法。
+
+  但如果加 block 级同步，要确保 block 内所有线程都会执行到同一个 __syncthreads()。
+  不要在同步前让一部分线程提前 return。
+
+
+--------------------------------------------------------------------------------
+  默认优先级：寄存器预加载通常优于 block 级 static SMEM
+--------------------------------------------------------------------------------
+
+  对本 kernel 来说，默认应优先使用“每个 lane 自己从 global/read-only cache 加载
+  q_weight/k_weight 到寄存器”的方案：
+
+    q_weight/k_weight global -> register
+
+  block 级 static SMEM 方案的路径是：
+
+    q_weight/k_weight global -> static SMEM -> register
+
+  如果 static SMEM 不能显著减少 global load 成本，它就只是多了一层中转。
+
+  寄存器预加载通常更优的原因：
+
+    · q_weight/k_weight 是只读小数组，通常能被 L1/L2/read-only cache 缓住。
+    · 每个 lane 只加载自己负责的 dim，加载后跨多个 head 直接复用寄存器。
+    · 不占用 shared memory，不降低 occupancy。
+    · 不需要 block 级 __syncthreads()。
+    · 没有“部分 warp 提前 return，其他线程进入 barrier”的风险。
+
+  block 级 static SMEM 只有在下面条件同时满足时才值得 benchmark：
+
+    · head_dim 较大，或者 warpsPerBlock 很多，导致 block 内重复读取权重较多。
+    · profiling 显示 q_weight/k_weight 的 global load 是明显瓶颈。
+    · 额外 shared memory 占用不会明显降低 occupancy。
+    · 能把 __syncthreads() 放在所有线程都会执行到的位置。
+
+  实践建议：
+
+    1. 默认使用寄存器预加载。
+    2. 功能正确后先优化 cos/sin 的 per-warp SMEM 复用。
+    3. 只有 profiling 证明 q_weight/k_weight 读取成为瓶颈时，再 benchmark static SMEM。
+
+
+================================================================================
+五、推荐的执行流水
+================================================================================
+
+  本节只按上面的策略 A/B/C/D 组织 one-warp-N-heads 的执行流水。
+
+  推荐实现顺序：
+
+    A. 先做正确性 baseline。
+    B. 再做推荐优化：QKV 寄存器加载，cos/sin 异步进入 per-warp SMEM，并和第一个
+       head 的 QK RMSNorm 形成加载/计算重叠。
+    C. 只作为 QKV cp.async 地址/同步验证，不作为最终性能版本。
+    D. 最后按 benchmark 决定是否做 QKV 双缓冲三路流水。
+
+
+--------------------------------------------------------------------------------
+  策略 A：正确性 baseline
+--------------------------------------------------------------------------------
+
+  数据路径：
+
+    q_weight/k_weight global -> register
+    QKV global -> register
+    cos/sin global/read-only cache -> register
+
+  执行顺序：
+
+    1. 计算 tokenIdx、firstHeadIdx、headNumInWarp。
+    2. 在 head 循环前，把 q_weight/k_weight 加载到寄存器 q_w/k_w。
+    3. 对每个 head：
+       · QKV 同步加载到寄存器。
+       · QK RMSNorm，使用 q_w/k_w。
+       · RoPE 时直接从 global/read-only cache 读取 cos/sin。
+       · 写回 qkv。
+
+  用途：先验证索引、Q/K 判断、RMSNorm、RoPE 和写回逻辑。
+
+
+--------------------------------------------------------------------------------
+  策略 B：推荐的第一版优化
+--------------------------------------------------------------------------------
+
+  数据路径：
+
+    q_weight/k_weight global -> register
+    cos/sin global -> per-warp SMEM
+    QKV global -> register
+
+  执行顺序：
+
+    1. 计算 tokenIdx、firstHeadIdx、headNumInWarp。
+    2. 在 head 循环前，把 q_weight/k_weight 加载到寄存器 q_w/k_w。
+    3. 发起 cos/sin 的 cp.async，目标是 this_warp_cos_sin。
+    4. commit cos/sin group，但不要立刻 wait。
+    5. 对每个 head：
+       · QKV 同步加载到寄存器。
+       · QK RMSNorm，使用 q_w/k_w。
+       · 第一个 head 进入 RoPE 前执行 cp_async_wait_group<0>() 和 __syncwarp()。
+       · RoPE 从 this_warp_cos_sin 读取 cos/sin。
+       · 写回 qkv。
+
+  收益：
+
+    · cos/sin 被同一个 warp 的多个 head 复用。
+    · 第一个 head 的 QK RMSNorm 可以覆盖一部分 cos/sin 加载延迟。
+    · QKV 不进 SMEM，避免 global -> smem -> register 的额外中转。
+
+  这是当前最推荐优先实现的优化版本。
+
+
+--------------------------------------------------------------------------------
+  策略 C：QKV 进 SMEM 但不做流水，只用于过渡验证
+--------------------------------------------------------------------------------
+
+  数据路径：
+
+    QKV global -> per-warp QKV SMEM -> register
+
+  执行顺序：
+
+    1. 对当前 warp 负责的所有 head 发起 QKV cp.async。
+    2. commit QKV group。
+    3. 立刻 cp_async_wait_group<0>()，再 __syncwarp()。
+    4. 从 QKV SMEM 读到寄存器。
+    5. 计算 QK RMSNorm / RoPE / 写回。
+
+  问题：
+
+    · wait 太早，没有把 QKV global load 延迟藏到计算背后。
+    · QKV 没有跨 head 复用，每个 head 的 QKV 仍然只用一次。
+    · 相比 QKV global -> register，多了一次 SMEM -> register 读取。
+
+  因此策略 C 只适合验证 QKV cp.async 地址切分和同步是否正确。
+
+
+--------------------------------------------------------------------------------
+  策略 D：进阶三路流水
+--------------------------------------------------------------------------------
+
+  数据路径：
+
+    q_weight/k_weight global -> register
+    cos/sin global -> per-warp SMEM
+    QKV global -> qkv_buf0/qkv_buf1 -> register
+
+  执行顺序：
+
+    1. 在 head 循环前，把 q_weight/k_weight 加载到寄存器 q_w/k_w。
+    2. warmup：
+       · cp_async_qkv_head(0, qkv_buf0)，commit。
+       · cp_async_cos_sin_to_smem(this_warp_cos_sin, tokenIdx)，commit。
+       · cp_async_wait_group<1>()：等待较老的 head0 QKV，允许较新的 cos/sin 继续在途。
+       · __syncwarp()。
+    3. 对每个 head k：
+       · 如果存在 head k+1，预取 next QKV 到另一个 qkv buffer，并 commit。
+       · 从 current qkv buffer 读 QKV 到寄存器。
+       · 计算 QK RMSNorm，覆盖 cos/sin 剩余加载延迟和 next QKV 加载延迟。
+       · 第一个 head 进入 RoPE 前等待 cos/sin。
+       · RoPE 从 this_warp_cos_sin 读取 cos/sin。
+       · 写回 qkv。
+       · 下一轮读取 next QKV 前等待 next QKV 到位。
+
+  适用条件：
+
+    · QKV global load 是明显瓶颈。
+    · QK RMSNorm/RoPE 有足够计算量覆盖 next QKV 的加载延迟。
+    · 额外 QKV SMEM buffer 不会明显降低 occupancy。
+
+
+--------------------------------------------------------------------------------
+  补充：软件流水线与硬件 warp 调度的关系
+--------------------------------------------------------------------------------
+
+  上面策略 B/D 里的“流水线并行”，和 GPU 硬件的 warp 调度隐藏延迟是同一个大思路：
+
+    在等待内存时，不让执行资源闲着。
+
+  但它们属于两个层级：
+
+    1. 硬件 warp 调度
+
+       当某个 warp 因 global memory load 等待时，SM 可以切换去执行其他 ready warp。
+       这是 GPU 硬件自动完成的延迟隐藏方式。
+
+       形态：
+
+         warp A 等内存
+         SM 调度 warp B 执行
+         SM 调度 warp C 执行
+
+    2. 软件流水线 / cp.async 流水
+
+       这是 kernel 代码显式组织出来的。当前 warp 在计算 current head 时，提前发起
+       next 数据的异步拷贝，让数据搬运和计算在时间上重叠。
+
+       形态：
+
+         cp.async next -> smem
+         compute current
+         wait next
+
+  在本文策略里：
+
+    · 策略 B：
+      cos/sin async load 和第一个 head 的 QK RMSNorm 重叠。
+
+    · 策略 D：
+      next head 的 QKV async load 和 current head 的 QK RMSNorm/RoPE 重叠。
+
+  两者可以同时存在：
+
+    · active warps 足够多时，硬件 warp 调度可以在 warp 间隐藏延迟。
+    · 同一个 warp 内又可以通过 cp.async 软件流水隐藏当前 warp 自己的数据加载延迟。
+
+  因此 cp.async 流水不是替代 occupancy，而是和 occupancy 一起工作。SMEM 占用过高导致
+  active warps 下降时，硬件 warp 调度隐藏延迟的能力会变弱；这时软件流水能帮忙，但不一定
+  能完全弥补 occupancy 下降。
+
+
+================================================================================
+六、一个 block 处理一个 token 的替代流水
+================================================================================
+
+  除了“一个 warp 处理同一个 token 的 N 个 heads”之外，还可以设计成：
+
+    一个 block 负责一个 token
+    block 内多个 warp 共同处理这个 token 的所有 Q/K heads
+
+  这种映射下，block 内所有 warp 都属于同一个 token，因此 cos/sin 可以放成 block 级
+  共享的一份，而不是每个 warp 各放一份：
+
+    cos/sin global -> block-level SMEM -> block 内所有 warp 复用
+
+  q_weight/k_weight 也可以放到 block 级 static/dynamic SMEM 中：
+
+    q_weight/k_weight global -> block-level SMEM -> register
+
+  然后每个线程或每个 warp 仍然加载自己负责的 QKV 到寄存器计算：
+
+    QKV global -> register -> QK RMSNorm -> RoPE -> store
+
+  伪代码形态：
+
+    extern __shared__ char smem[];
+
+    T_cache* cos_smem = reinterpret_cast<T_cache*>(smem);
+    T_cache* sin_smem = cos_smem + rotary_dim / 2;
+    float* q_w_smem = reinterpret_cast<float*>(sin_smem + rotary_dim / 2);
+    float* k_w_smem = q_w_smem + head_dim;
+
+    // block 内线程合作加载当前 token 的 cos/sin。
+    for (uint dim = threadIdx.x; dim < rotary_dim / 2; dim += blockDim.x) {
+      cos_smem[dim] = cos[tokenIdx * (rotary_dim / 2) + dim];
+      sin_smem[dim] = sin[tokenIdx * (rotary_dim / 2) + dim];
+    }
+
+    // 可选：block 内线程合作加载 q/k weight。
+    for (uint dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+      q_w_smem[dim] = convert(q_weight[dim]);
+      k_w_smem[dim] = convert(k_weight[dim]);
+    }
+
+    __syncthreads();
+
+    // block 内每个 warp 处理一个或多个 head。
+    for (uint localHead = warpIdxPerBlock; localHead < qkHeadsPerToken;
+         localHead += warpsPerBlock) {
+      vec_T qkv_vec = load_qkv_to_register(tokenIdx, localHead, laneIdx);
+      compute_qknorm(qkv_vec, q_w_smem, k_w_smem, elements);
+      apply_rope_from_block_smem(elements, cos_smem, sin_smem);
+      store_back_qkv(tokenIdx, localHead, elements);
+    }
+
+  这种方案的优势：
+
+    · 同一个 token 的 cos/sin 在 block 内只加载一份，所有 warp 复用。
+    · q_weight/k_weight 如果放入 SMEM，也可以 block 内所有 warp 复用。
+    · 同步逻辑更直观：block 开头加载共享数据，__syncthreads() 后统一使用。
+
+  这种方案的代价：
+
+    · block 粒度变成 token 时，grid 里的 block 数通常约等于 num_tokens。CUDA 调度的基本
+      常驻单位是 block；同一个 block 内的多个 warp 会驻留在同一个 SM 上，不能把这个
+      token 的不同 head chunks 分散到多个 SM。
+    · one-warp-N-heads 的工作粒度更细：
+        totalWarps = num_tokens * ceil(qkHeadsPerToken / headsPerWarp)
+      这些 global warps 会再打包成多个 block，因此即使 num_tokens 较小，只要每个 token
+      的 Q/K heads 足够多，也仍然可能产生更多 block，分发到更多 SM。
+    · 如果 num_tokens 和 Q/K heads 都很少，两种方案都会缺少足够并行工作；但如果
+      num_tokens 小、heads 多，one-block-one-token 更容易把同一 token 的 head 并行度限制
+      在单个 block/单个 SM 内。
+    · block 级 SMEM 放 cos/sin + q/k weight 会增加 shared memory 占用，可能降低 occupancy。
+    · 需要 block 级 __syncthreads()，必须保证 block 内所有线程都走到同一个 barrier。
+    · q_weight/k_weight 本身是只读小数组，放 SMEM 未必比寄存器预加载更快。
+
+  SMEM 占用影响 occupancy 的含义：
+
+    GPU 每个 SM 的 shared memory 容量是有限的。一个 block 使用的 SMEM 越多，同一个 SM
+    上能同时驻留的 block 数可能越少；常驻 block 少了，常驻 warp 也可能减少，隐藏访存
+    延迟的能力就可能下降。
+
+  例如假设一个 SM 可用 100 KB shared memory：
+
+    每个 block 使用 10 KB SMEM -> 理论上最多 10 个 block/SM
+    每个 block 使用 40 KB SMEM -> 理论上最多  2 个 block/SM
+
+  实际 occupancy 还会同时受寄存器数量、最大 block 数、最大 warp 数、线程数等限制，但
+  SMEM 是其中一个硬约束。
+
+  one-block-one-token 里如果把 cos/sin 和 q/k weight 都放进 block 级 SMEM，大致占用是：
+
+    cos/sin bytes =
+        rotary_dim * sizeof(T_cache)
+
+    q/k weight bytes =
+        2 * head_dim * sizeof(float)
+
+    total block-level cache bytes =
+        cos/sin bytes + q/k weight bytes
+
+  例子：
+
+    rotary_dim = 128, T_cache = half
+    cos/sin bytes = 128 * 2 = 256 B
+
+    head_dim = 128
+    q/k weight bytes = 2 * 128 * 4 = 1024 B
+
+  在这里讨论的 one-block-one-token 基础方案中，QKV 仍然是直接加载到寄存器，不默认占用
+  SMEM。因此默认 block-level SMEM 成本主要就是 cos/sin 和可选的 q/k weight。
+
+  单看这个例子，cos/sin + q/k weight 的 SMEM 并不大，未必会影响 occupancy。只有在后续
+  又额外加入其他 SMEM 缓冲，例如某种 QKV tile、双缓冲或更多临时空间时，per-block SMEM
+  才可能继续增加并限制每个 SM 的常驻 block 数。
+
+  所以这里不是说 block 级 SMEM 一定更慢，而是：
+
+    shared memory 用量增加
+      -> 每个 SM 可同时驻留的 block/warp 可能减少
+      -> 隐藏访存延迟的能力可能下降
+      -> occupancy 可能下降
+
+  这也是 q/k weight 默认更推荐寄存器预加载的原因：它们小、只读、可缓存，优先占用 SMEM
+  未必能换来收益。
+
+  和 one-warp-N-heads 的取舍：
+
+    · one-warp-N-heads：
+      调度粒度更细，可以把同一 token 的不同 head chunks 分发到多个 block/SM；代价是
+      cos/sin 可能被同一 token 的多个 warp 重复加载，q/k weight 也会被多个 warp 重复
+      加载到寄存器。不过 q/k weight 通常是较小的只读 [head_dim] 数组，更容易被
+      L1/L2/read-only cache 缓住，所以这个代价通常小于 cos/sin 重复加载。
+
+    · one-block-one-token：
+      cos/sin 复用更充分；但同一 token 的 head 工作被限制在一个 block 内，block 粒度更粗，
+      可能牺牲跨 SM 并行度和 occupancy。
+
+  因此 one-block-one-token 是一个可行算法分支，不是绝对更优。是否更快取决于
+  num_tokens、num_heads_q/k、head_dim、rotary_dim、dtype、blockSize、SMEM 占用和实际
+  GPU 架构。最终需要 benchmark 对比。
+
+  总体判断：
+
+    · one-block-one-token 是粗粒度映射。
+      数据复用更充分，但对输入形状更敏感：num_tokens、num_heads_q/k、blockSize、
+      head_dim、rotary_dim、SMEM 占用都会明显影响并行度和 occupancy。
+
+    · one-warp-N-heads 是细粒度映射。
+      数据复用差一些，会有 cos/sin 和 q/k weight 的重复加载；但工作拆得更细，对不同
+      batch/token/head 组合更鲁棒，也更容易把并行度铺到多个 SM 上。
+
+  所以 one-block-one-token 更像针对特定形状做深度优化的版本；one-warp-N-heads 更适合
+  作为通用 baseline 或更稳妥的默认实现。
+
+
+
+================================================================================
+七、常见错误
+================================================================================
+
+  错误 1：所有 warp 都写 dynamicSmem[0]
+
+    char* smem_dst = &dynamicSmem[0];
+
+  这样不同 warp、不同数据区域会互相覆盖。必须先按数据类型切段，再按 warpIdxPerBlock
+  切出每个 warp 的私有区域；如果启用 QKV SMEM，还要继续按 head 或双缓冲 buffer 切分。
+
+
+  错误 2：把 cos/sin 做成 block 级唯一一份
+
+  当前映射下，一个 block 内不同 warp 可能处理不同 token。不同 token 的 cos/sin 不同。
+  因此至少应该每个 warp 一份，或者重新设计 grid/block 映射，让一个 block 只处理一个 token。
+
+
+  错误 3：在部分线程 return 后使用 __syncthreads()
+
+    if (tokenIdx >= num_tokens) return;
+    __syncthreads();  // 危险
+
+  如果同一个 block 里只有部分 warp 越界 return，其余线程进入 barrier，会造成 barrier
+  不匹配。需要把 block 级同步放到所有线程一致执行的路径上。
+
+
+  错误 4：把 cp.async.wait_group 当成线程间同步
+
+  cp.async.wait_group 等的是当前线程发起的 async copy group，不是等待 block 内其他线程。
+  如果后续跨线程共享 SMEM，需要额外使用 __syncwarp() 或 __syncthreads()，取决于共享范围。
+
+
+
+
+
+================================================================================
+八、速查表
+================================================================================
+
+  ┌────────────────────┬────────────────────────────┬────────────────────────────┐
+  │ 数据               │ 推荐位置                   │ 复用粒度                   │
+  ├────────────────────┼────────────────────────────┼────────────────────────────┤
+  │ QKV                │ register，推荐基线          │ 当前 lane 当前 head         │
+  │ QKV tile           │ per-warp dynamic SMEM，可选 │ 双缓冲流水/当前 warp head   │
+  │ cos/sin            │ per-warp dynamic SMEM       │ 当前 warp 的多个 head       │
+  │ q_weight/k_weight  │ per-warp registers          │ 当前 warp 的多个 head       │
+  │ q_weight/k_weight  │ static SMEM，可选优化       │ block 内所有 warp           │
+  └────────────────────┴────────────────────────────┴────────────────────────────┘
