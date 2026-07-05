@@ -1,0 +1,1526 @@
+================================================================================
+C++ 与 CUDA 对齐：语法、底层实现、HBM/SMEM 访问地址要求
+================================================================================
+
+核心一句话：
+  · 对齐语法本质上是"编译期布局约束"，不是运行时代码。
+  · 标准 C++ 推荐使用 alignas(n)。
+  · GCC/Clang 扩展使用 __attribute__((aligned(n)))。
+  · MSVC 扩展使用 __declspec(align(n))。
+  · CUDA 常用 __align__(n)，在 Linux/GCC/Clang 下通常展开为
+    __attribute__((aligned(n)))，在 Windows/MSVC 下通常展开为
+    __declspec(align(n))。
+  · 访问指令真正关心的是实际地址 base + offset 是否满足当前访问大小的自然对齐。
+  · cp.async.shared.global 同时涉及 HBM/global 源地址和 SMEM 目标地址，两边都要对齐。
+
+章节导航：
+  一、什么是对齐
+  二、标准 C++：alignas(n)
+  三、GNU / Clang 扩展：__attribute__((aligned(n)))
+  四、MSVC 扩展：__declspec(align(n))
+  五、CUDA：__align__(n)
+  六、底层实现：C++ host 路径与 CUDA device 路径
+  七、不同变量类型的对齐方式详解
+  八、访存指令的实际地址对齐要求：HBM/global、SMEM 与 cp.async
+  九、完整跨平台封装示例
+  十、常见误区
+  十一、速查表
+
+相关文档：
+  · 向量指令与字节对齐：
+    docs/cuda/vector_instruction_alignment.txt
+  · cp.async 用法：
+    docs/cuda/cp_async_usage_and_thread_sync.txt
+  · __cvta_generic_to_shared：
+    docs/cuda/cvta_generic_to_shared.txt
+  · inline PTX：
+    docs/cuda/asm_volatile_inline_ptx.txt
+
+
+================================================================================
+一、什么是对齐
+================================================================================
+
+  一个对象按 N 字节对齐，意思是它的起始地址是 N 的整数倍：
+
+    address % N == 0
+
+  例如：
+
+    4B aligned   -> address % 4  == 0
+    8B aligned   -> address % 8  == 0
+    16B aligned  -> address % 16 == 0
+
+  对齐有两个常见目的：
+
+    1) 满足类型/指令的自然对齐要求
+       例如 float4、uint4、cp.async ..., 16 通常要求实际访问地址 16B 对齐。
+
+    2) 改善访存效率
+       例如让一行数据的起始地址满足 128B 对齐，帮助 warp 连续访问时减少跨
+       cache line / sector 的额外事务。
+
+  本文同时讨论两层问题：
+
+    · 怎么声明对齐，以及编译器/链接器/CUDA device 工具链如何实现这种布局约束。
+    · 具体访存指令真正要求的实际地址对齐，也就是 base + offset 后的地址是否对齐。
+
+
+================================================================================
+二、标准 C++：alignas(n)
+================================================================================
+
+1. 变量对齐
+
+  标准 C++ 写法：
+
+    alignas(16) float table[1024];
+
+  含义：
+
+    table 的起始地址 % 16 == 0
+
+2. 类型对齐
+
+  可以修饰 struct / class：
+
+    struct alignas(16) Vec4 {
+      float x;
+      float y;
+      float z;
+      float w;
+    };
+
+  此时：
+
+    alignof(Vec4) >= 16
+    Vec4 arr[2] 中 arr[0] 和 arr[1] 的起始地址都满足 Vec4 的对齐要求
+
+  alignof(Vec4) 表示 Vec4 这个类型的对齐要求。
+  alignas(16) 的含义是"至少 16B 对齐"，所以编译器放置 Vec4 对象时，要保证：
+
+    reinterpret_cast<uintptr_t>(&v) % 16 == 0
+
+  如果是数组：
+
+    Vec4 arr[2];
+
+  编译器不仅要保证 arr[0] 对齐，也要保证 arr[1] 对齐：
+
+    reinterpret_cast<uintptr_t>(&arr[0]) % 16 == 0
+    reinterpret_cast<uintptr_t>(&arr[1]) % 16 == 0
+
+  因此结构体大小通常也会被 padding 到对齐要求的整数倍。
+  这里写 >= 16，而不是 == 16，是因为编译器/ABI 可以给出更大的对齐要求；
+  alignas(16) 表示下限，不表示一定只能是 16。
+
+3. 成员对齐
+
+  可以修饰结构体成员：
+
+    struct Packet {
+      int tag;
+      alignas(16) float payload[4];
+    };
+
+  编译器会在 tag 和 payload 之间插入 padding，让 payload 的起始 offset 满足 16B
+  对齐。结构体总大小也可能被继续 padding，以保证 Packet 数组中每个元素都满足对齐。
+
+4. 不能降低自然对齐
+
+  alignas(n) 不能把一个类型的自然对齐要求降低。
+
+  例如 double 通常天然需要 8B 对齐，下面这种意图是不成立的：
+
+    alignas(4) double x;  // 试图降低 double 对齐，不应该这么写
+
+  如果想节省结构体空间，应重新设计布局；不要用较小 alignas 去削弱类型的自然对齐。
+
+
+================================================================================
+三、GNU / Clang 扩展：__attribute__((aligned(n)))
+================================================================================
+
+1. 这不是标准 C++
+
+  __attribute__((aligned(n))) 是 GCC/Clang 扩展语法。
+  g++、clang++、Linux 下的 nvcc 通常支持；MSVC 原生编译器不使用这种写法。
+
+2. 变量写法
+
+  常见写法：
+
+    __attribute__((aligned(16))) float table[1024];
+
+  或者写在声明后面：
+
+    float table[1024] __attribute__((aligned(16)));
+
+  含义相同：
+
+    table 的起始地址 % 16 == 0
+
+3. 类型写法
+
+    struct __attribute__((aligned(16))) Vec4 {
+      float x;
+      float y;
+      float z;
+      float w;
+    };
+
+4. aligned(n) 的位置要看修饰对象
+
+  在真实工程中，更推荐使用标准 C++ 的 alignas(n)，因为可读性更好，也更容易跨编译器。
+
+  GNU attribute 适合：
+    · 需要兼容旧代码。
+    · CUDA/NVIDIA 头文件已经使用这种扩展。
+    · 需要和已有宏体系保持一致。
+
+
+================================================================================
+四、MSVC 扩展：__declspec(align(n))
+================================================================================
+
+  Windows/MSVC 常见写法：
+
+    __declspec(align(16)) float table[1024];
+
+  结构体：
+
+    __declspec(align(16)) struct Vec4 {
+      float x;
+      float y;
+      float z;
+      float w;
+    };
+
+  它的语义和 GNU 的 __attribute__((aligned(16))) 类似：
+
+    要求被修饰对象/类型的起始地址至少 16B 对齐。
+
+  但语法不是 GNU attribute，不能直接混用。
+
+
+================================================================================
+五、CUDA：__align__(n)
+================================================================================
+
+1. __align__(n) 是 CUDA 头文件提供的宏
+
+  CUDA 里经常看到：
+
+    __device__ __align__(16) float table[1024];
+    __shared__ __align__(16) unsigned char smem_raw[4096];
+    extern __shared__ __align__(16) unsigned char smem[];
+
+  __align__(n) 本身不是标准 C++ 关键字。
+  它是 CUDA 头文件提供的跨编译器宏。
+
+2. Linux/GCC/Clang 下的典型展开
+
+  在 CUDA 的 crt/host_defines.h 中，GCC/Clang 路径下可以理解为：
+
+    #define __align__(n) \
+            __attribute__((aligned(n)))
+
+  所以：
+
+    __device__ __align__(16) float table[1024];
+
+  预处理后可以理解为：
+
+    __device__ __attribute__((aligned(16))) float table[1024];
+
+3. Windows/MSVC 下的典型展开
+
+  MSVC 路径下可以理解为：
+
+    #define __align__(n) \
+            __declspec(align(n))
+
+  所以同一份 CUDA 代码在不同 host compiler 下可以映射到不同的编译器属性。
+
+4. CUDA vector type 中大量使用 __align__
+
+  CUDA 内置向量类型通常会带对齐属性，例如概念上：
+
+    struct __device_builtin__ __align__(16) uint4 {
+      unsigned int x;
+      unsigned int y;
+      unsigned int z;
+      unsigned int w;
+    };
+
+  因此 uint4 / float4 这类类型天然带有 16B 对齐要求。
+
+
+================================================================================
+六、底层实现：C++ host 路径与 CUDA device 路径
+================================================================================
+
+  本章只讲"对齐语法在工具链里如何实现"。
+  需要特别区分：
+
+    · C++ host 代码不会生成 PTX。
+    · CUDA device 代码可能生成 PTX / cubin，并在 PTX 中出现 .align。
+
+  两边共同点是：
+
+    对齐属性都是编译期/布局期约束，不是运行时对齐指令。
+
+  不同变量类型如何具体布局，放到下一章单独说明。
+
+1. 共同抽象：对齐属性描述的是布局约束
+
+  源码里可以用不同语法表达同一类约束：
+
+    alignas(16) float host_table[1024];
+    __attribute__((aligned(16))) float gnu_table[1024];
+    __declspec(align(16)) float msvc_table[1024];
+    __device__ __align__(16) float device_table[1024];
+
+  它们都在表达同一件事：
+
+    被声明对象的起始地址至少满足 16B 对齐。
+
+  工具链处理时，抽象流程都是：
+
+    源码对齐语法
+      -> 编译器记录 alignment
+      -> 布局阶段选择满足对齐的 offset
+      -> 必要时插入 padding
+      -> 最终对象地址满足 required_alignment
+
+  其中：
+
+    required_alignment = max(类型默认对齐, 显式 alignas / __align__ 对齐)
+
+  但 C++ host 和 CUDA device 的"输出物"不同：
+
+    C++ host
+      -> object file / executable / shared library
+
+    CUDA device
+      -> PTX / cubin / fatbin / CUDA module
+
+2. C++ host 侧实现路径
+
+  C++ host 侧常见语法：
+
+    alignas(16) float table[1024];
+    __attribute__((aligned(16))) float gnu_table[1024];
+    __declspec(align(16)) float msvc_table[1024];
+
+  它们在 host 编译器中大致走这条路径：
+
+    源码
+      -> 编译器前端解析 alignas / __attribute__ / __declspec
+      -> AST / IR 记录 alignment
+      -> 数据段、栈帧、结构体布局、全局符号布局使用 alignment
+      -> object file 中保留 section / symbol 的对齐信息
+      -> linker 安排最终段内 offset 或符号地址
+
+  例如：
+
+    alignas(16) float table[1024];
+
+  编译器会记录：
+
+    symbol    = table
+    size      = 4096
+    alignment = 16
+
+  对 host 全局变量 / static 变量：
+
+    · 编译器把符号放进数据段。
+    · object file 记录符号或 section 的对齐要求。
+    · linker 安排最终地址或段内 offset。
+
+  对 host 栈上局部变量：
+
+    · 编译器在函数 stack frame 中选择 local_offset。
+    · 目标是让 stack_frame_base + local_offset 满足对齐要求。
+
+  对结构体成员：
+
+    · 编译器在结构体内部插入 padding。
+    · 目标是让成员 offset 满足该成员的对齐要求。
+    · 结构体总大小也可能 padding 到 alignof(struct) 的整数倍。
+
+  关键点：
+
+    C++ host 侧不会生成 PTX .align。
+    它生成的是 host object file / 可执行文件中的对齐元数据和布局结果。
+
+3. CUDA device 侧实现路径
+
+  CUDA device 侧常见语法：
+
+    __device__ __align__(16) float table[1024];
+    __shared__ __align__(16) float smem_table[128];
+    extern __shared__ __align__(16) unsigned char smem[];
+
+  __align__(n) 是 CUDA 头文件里的跨编译器宏。
+  Linux/GCC/Clang 路径下可以理解为：
+
+    __align__(16)
+      -> __attribute__((aligned(16)))
+
+  这一步发生在预处理阶段。
+  预处理完成后，编译器看到的是自己的 attribute 语法，而不是 CUDA 的 __align__ 宏。
+
+  Windows/MSVC 路径下可以理解为：
+
+    __align__(16)
+      -> __declspec(align(16))
+
+  如果源码直接使用标准 C++：
+
+    alignas(16)
+
+  那么它不是宏展开，而是编译器直接识别的标准 C++ 对齐说明符。
+
+  CUDA device 编译路径大致是：
+
+    CUDA device 源码
+      -> nvcc / device front-end 记录 alignment
+      -> 生成 PTX 或直接生成更底层 device object
+      -> ptxas 生成 cubin / fatbin
+      -> CUDA module loader 加载 device module
+      -> device global / constant symbol 按 alignment 放置
+
+  如果是 CUDA device global symbol：
+
+    __device__ __align__(16) float table[1024];
+
+  概念上可能生成类似 PTX：
+
+    .visible .global .align 16 .b8 table[4096];
+
+  其中：
+
+    .global   表示 global memory 符号
+    .align 16 表示符号起始地址至少 16B 对齐
+    .b8 table[4096] 表示对象总大小 4096 bytes
+
+  真实 PTX 可能因编译选项、可见性、类型信息而不同，但核心是会把 alignment 信息编码进
+  device 端生成结果。
+
+  对 static shared memory：
+
+    __shared__ int a;
+    __shared__ __align__(16) float table[128];
+    __shared__ double b;
+
+  编译器 / ptxas 会在 kernel 的 static shared memory 布局中安排 offset：
+
+    a        shared offset 0
+    padding  12 bytes
+    table    shared offset 16
+    b        shared offset ...
+
+  对 dynamic shared memory：
+
+    extern __shared__ __align__(16) unsigned char smem[];
+
+  这只约束 dynamic SMEM 的基地址：
+
+    smem + 0 是 16B 对齐
+
+  内部手动切片仍要自己处理 offset：
+
+    off = align_up(off, 16);
+
+4. 编译器如何记录 alignment
+
+  编译器解析：
+
+    __attribute__((aligned(16))) float table[1024];
+
+  然后在内部 AST / IR 中给 table 记录：
+
+    alignment = 16
+    size = 1024 * sizeof(float) = 4096
+
+  这一步不会生成运行时代码。
+  它只是给编译器布局变量、结构体、栈帧、全局符号时增加约束。
+
+  对 C++ host：
+
+    alignment 信息进入 host 编译器的 AST / IR，并影响 host object file 和 host 布局。
+
+  对 CUDA device：
+
+    alignment 信息进入 device 编译路径，并影响 PTX / cubin / device symbol / shared
+    memory offset 布局。
+
+5. 布局阶段：根据 alignment 插入 padding 或选择 offset
+
+  当编译器要把对象放进某个存储区域时，会使用 alignment 信息选择合法地址：
+
+    object_addr % alignment == 0
+
+  如果当前 offset 不满足要求，编译器或链接器会插入 padding：
+
+    current_offset = 4
+    alignment      = 16
+    padding        = 12
+    object_offset  = 16
+
+  对齐的底层效果通常就是：
+
+    · 选择满足对齐的 offset。
+    · 必要时插入 padding。
+    · 把 alignment 信息写入 host object 或 device 生成结果。
+
+6. 链接 / 模块加载阶段：host linker 与 CUDA module loader 各管各的
+
+  C++ host 全局符号：
+
+    alignas(16) float table[1024];
+
+  由 host 编译器生成 host object file，再由 host linker 安排最终地址或段内 offset：
+
+    table_addr % 16 == 0
+
+  CUDA device 全局符号：
+
+    __device__ __align__(16) float table[1024];
+
+  由 device 编译路径生成 device symbol / PTX / cubin 信息，再由 ptxas / CUDA module
+  loader 按 alignment 放置：
+
+    table_addr % 16 == 0
+
+  两者思路类似，但不是同一个后端：
+
+    C++ host
+      · host object file
+      · host linker
+      · CPU 虚拟地址空间 / 进程内存布局
+
+    CUDA device
+      · PTX / cubin / fatbin
+      · ptxas / CUDA module loader
+      · GPU device global / constant / shared memory 布局
+
+  例如有多个 device global symbols：
+
+    __device__ int a;                         // 4B 对齐
+    __device__ __align__(16) float table[1024];  // 16B 对齐
+    __device__ double b;                      // 8B 对齐
+
+  布局时不能简单紧挨着放：
+
+    a      offset 0
+    table  offset 4      // 错：4 % 16 != 0
+
+  而是需要插入 padding：
+
+    a        offset 0
+    padding  12 bytes
+    table    offset 16    // 对：16 % 16 == 0
+    b        offset ...   // 再按 double 的对齐要求安排
+
+  因此 table 最终在 GPU global memory 中的实际起始地址满足：
+
+    table_addr % 16 == 0
+
+7. 没有运行时"对齐指令"
+
+  对齐属性一般不会生成一条类似：
+
+    align pointer to 16 bytes
+
+  的运行时指令。
+
+  它更像是给对应工具链的布局约束。
+
+  C++ host 侧：
+
+    源码属性
+      -> host 编译器记录 alignment
+      -> host object file / 栈帧 / 结构体布局使用 alignment
+      -> host linker / 编译器后端按要求放置对象
+
+  CUDA device 侧：
+
+    源码属性
+      -> device front-end 记录 alignment
+      -> PTX / cubin / shared memory layout 使用 alignment
+      -> ptxas / CUDA module loader / device 后端按要求放置对象
+
+  所以对齐属性解决的是"被声明对象的基地址如何放置"。
+  如果代码后续做指针偏移：
+
+    addr = base + offset
+
+  那么 addr 是否仍然满足 16B 对齐，还要看 offset 是否也是 16 的倍数。
+
+
+================================================================================
+七、不同变量类型的对齐方式详解
+================================================================================
+
+  本章讲"对齐属性作用到不同变量/存储位置时，具体约束谁"。
+
+1. 默认对齐总览：没有显式 alignas / __align__ 时按什么对齐
+
+  核心规则：
+
+    没有显式指定更高对齐时，对象默认按它的声明类型 T 的对齐要求放置：
+
+      object_addr % alignof(T) == 0
+
+    如果显式写了 alignas(N) / __align__(N)，对象的实际对齐要求会提升到更严格的那个：
+
+      required_alignment = max(alignof(T), N)
+      object_addr % required_alignment == 0
+
+  典型类型默认对齐：
+
+    char / unsigned char        alignof(T) 通常是 1
+    short / half 存储类型       alignof(T) 通常是 2
+    int / float                 alignof(T) 通常是 4
+    int64_t / double            alignof(T) 通常是 8
+    float2 / int2 / uint2       通常是 8
+    float4 / int4 / uint4       通常是 16
+    struct / class              通常至少是所有成员 alignof 的最大值
+
+  上面说的是常见 ABI / CUDA 内置类型下的默认值；写通用代码时应以：
+
+    alignof(T)
+
+  为准。
+
+  C++ host 常见创建 / 分配语法：
+
+    T global_obj;
+    static T static_obj;
+
+      · 默认按 alignof(T) 对齐。
+      · 对象有静态存储期，编译器/链接器会在数据段布局中满足对齐。
+
+    void f() {
+      T local_obj;
+    }
+
+      · 默认按 alignof(T) 对齐。
+      · 编译器在当前线程的 stack frame 中安排 offset，使最终地址满足对齐。
+      · 栈帧本身的默认对齐来自平台 ABI，现代 64-bit 平台常见 16B。
+
+    T* p = new T;
+    T* a = new T[n];
+
+      · new 返回的地址要满足 T 的对齐要求。
+      · 如果 T 是 alignas(16) 的类型，那么 p / a 也要满足 alignof(T)。
+      · C++17 起，over-aligned 类型可以走 aligned new；旧标准/旧库要更谨慎。
+
+    void* p = malloc(bytes);
+
+      · malloc 返回的地址适合存放"基本对齐"的普通对象，通常满足 max_align_t 对齐。
+      · 不应假设 malloc 一定满足任意更高对齐，例如 32B、64B。
+      · 需要显式高对齐时，使用 aligned_alloc / posix_memalign 或 C++ aligned new。
+
+    std::vector<T> v(n);
+
+      · 默认 allocator 应给 T 元素提供满足 alignof(T) 的存储。
+      · 如果 T 是特别高对齐的 over-aligned 类型，应确认所用 C++ 标准和标准库实现支持。
+
+  CUDA 常见创建 / 分配语法：
+
+    __device__ T global_obj;
+    __constant__ T const_obj;
+
+      · 默认按 alignof(T) 对齐。
+      · 它们是 device module 里的 global/constant symbol。
+      · 需要更高对齐时写 __align__(N) 或 alignas(N)。
+
+    __shared__ T smem_obj;
+    __shared__ T smem_arr[N];
+
+      · static shared memory 默认按 alignof(T) 对齐。
+      · 编译器在 kernel 的 static shared memory 布局中安排 offset。
+
+    extern __shared__ T smem[];
+
+      · dynamic shared memory 的基地址按声明类型 T 的语义使用。
+      · 如果 T 是 float，通常按 4B 对齐使用；如果 T 是 float4，通常按 16B 对齐使用。
+      · 如果写 extern __shared__ unsigned char smem[]，从类型语义上只能保守认为
+        它是 1B 对齐；后续要放 float4 / cp.async 16B 目标时，应写：
+
+          extern __shared__ __align__(16) unsigned char smem[];
+
+        并对内部每一段 offset 做 align_up。
+
+    __device__ void g() {
+      T local_obj;
+    }
+
+      · device 局部变量如果被寄存器化，就没有真实内存地址。
+      · 如果落入 local memory，则按 alignof(T) 或显式 __align__(N) 对齐。
+
+    cudaMalloc(&ptr, bytes);
+
+      · cudaMalloc 返回的 device allocation 基地址通常至少 256B 对齐。
+      · 这足以覆盖常见 4B/8B/16B 标量和向量访问的基地址对齐。
+      · 但实际访问地址是 base + offset；offset 仍必须满足访问指令的对齐要求。
+
+    cudaMallocManaged(&ptr, bytes);
+
+      · managed allocation 的基地址也应满足普通对象和常见 device 访问的对齐需求。
+      · 实际 kernel 中仍然要检查 base + offset 是否满足当前访问大小的自然对齐。
+
+    cudaMallocPitch(&ptr, &pitch, width_bytes, height);
+
+      · 返回的 ptr 是 device allocation 基地址。
+      · pitch 是 CUDA runtime 选择的物理行跨度，通常会为了设备访问做 padding / 对齐。
+      · 行地址必须用返回的 pitch 计算：
+
+          row_addr = base + row * pitch
+
+        不要用 width_bytes 代替 pitch。
+
+    kernel 参数中的 T* ptr
+
+      · 参数类型 T* 不会重新对齐传进来的地址。
+      · ptr 是否满足 alignof(T)，取决于调用方传入的真实地址。
+      · 如果把 char* base + offset 强转成 float4*，必须自己保证地址 16B 对齐。
+
+  总结：
+
+    · 声明对象：默认看 alignof(T)。
+    · 显式 alignas(N) / __align__(N)：提高被声明对象的基地址对齐。
+    · 动态分配：看分配 API 返回的基地址保证。
+    · 手动切片：看 base + offset，offset 必须自己保证对齐。
+
+2. C++ host 全局变量 / static 变量
+
+  例子：
+
+    alignas(16) float table[1024];
+
+    void f() {
+      alignas(16) static float cache[256];
+    }
+
+  这类对象有静态存储期，通常放在可执行文件或动态库的数据段中。
+  编译器在 object file 中记录符号大小和 alignment，链接器安排段内 offset：
+
+    table_addr % 16 == 0
+    cache_addr % 16 == 0
+
+  如果前一个符号结束后当前位置不满足 16B 对齐，链接器会插入 padding。
+
+3. C++ host 局部变量：栈帧中的实际地址对齐
+
+  例如：
+
+    void f() {
+      int a;
+      alignas(16) float local[4];
+      int b;
+    }
+
+  CPU 函数调用时，编译器通常会在当前线程的 stack frame 中为局部变量安排空间。
+  local 的对齐不是指 GPU global memory，也不是 CUDA shared memory，而是指 CPU
+  栈上的实际地址：
+
+    reinterpret_cast<uintptr_t>(&local) % 16 == 0
+
+  可以理解为：
+
+    local_addr = stack_frame_base + local_offset
+
+  编译器需要安排 local_offset，使最终地址满足：
+
+    local_addr % 16 == 0
+
+  stack_frame_base 本身通常也有默认对齐要求，但这个要求来自平台 ABI，而不是 C++
+  语言本身固定规定。现代 64-bit 平台上，函数调用边界常见要求栈指针满足 16B 对齐：
+
+    x86-64 Linux / System V ABI  常见 16B stack alignment
+    x86-64 Windows ABI           常见 16B stack alignment
+    AArch64 / ARM64 ABI          常见 16B stack alignment
+
+  因此很多时候可以粗略理解为：
+
+    stack_frame_base % 16 == 0
+
+  但更准确的判断永远是最终地址。对于显式写了 alignas / __align__ 的局部变量，
+  要把类型默认对齐和显式对齐要求一起考虑：
+
+    required_alignment = max(alignof(声明类型), 显式 alignas / __align__ 值)
+    (stack_frame_base + local_offset) % required_alignment == 0
+
+  如果 stack_frame_base 本身已经 16B 对齐，那么 local_offset 通常也会被安排成
+  16 的倍数。若中间变量破坏了自然排列，编译器会插入 padding：
+
+    stack frame:
+      offset 0   int a           4B
+      offset 4   padding         12B
+      offset 16  float local[4]  // 16B 对齐
+      offset 32  int b
+
+  所以 host 栈上局部变量的对齐，本质是：
+
+    栈帧基地址 + 局部变量 offset 得到的最终地址满足对齐要求。
+
+  如果局部变量要求比 ABI 默认栈对齐更高的对齐，例如：
+
+    void f() {
+      alignas(32) float local[8];
+    }
+
+  编译器可能需要额外调整栈指针或插入更多 padding，使：
+
+    reinterpret_cast<uintptr_t>(&local) % 32 == 0
+
+4. C++ heap 动态分配
+
+  对齐属性只作用于被声明的对象或类型，不会自动改变任意 malloc 返回指针的内部 offset。
+
+  如果类型本身带对齐：
+
+    struct alignas(16) Vec4 {
+      float x, y, z, w;
+    };
+
+    Vec4* p = new Vec4[1024];
+
+  C++ 实现需要让 p 满足 Vec4 的对齐要求：
+
+    reinterpret_cast<uintptr_t>(p) % alignof(Vec4) == 0
+
+  但如果你手动按字节切分一块内存：
+
+    char* base = static_cast<char*>(malloc(bytes));
+    Vec4* v = reinterpret_cast<Vec4*>(base + offset);
+
+  那么必须自己保证：
+
+    reinterpret_cast<uintptr_t>(base + offset) % alignof(Vec4) == 0
+
+  对超过默认 new/malloc 对齐能力的 over-aligned 类型，现代 C++ 有 aligned new；
+  C 风格代码可以使用 aligned_alloc / posix_memalign 等接口。
+
+5. CUDA __device__ / __constant__ 全局符号
+
+  例子：
+
+    __device__ __align__(16) float table[1024];
+    __constant__ __align__(16) float c_table[1024];
+
+  这类符号在 device module 中有明确的 global/constant symbol。
+  编译器生成 alignment 信息，linker / CUDA module loader 最终安排实际地址：
+
+    table_addr % 16 == 0
+    c_table_addr % 16 == 0
+
+  如果有多个 device global symbols：
+
+    __device__ int a;                            // 4B 对齐
+    __device__ __align__(16) float table[1024];  // 16B 对齐
+    __device__ double b;                         // 8B 对齐
+
+  布局时不能简单紧挨着放：
+
+    a      offset 0
+    table  offset 4      // 错：4 % 16 != 0
+
+  而是需要插入 padding：
+
+    a        offset 0
+    padding  12 bytes
+    table    offset 16    // 对：16 % 16 == 0
+    b        offset ...   // 再按 double 的对齐要求安排
+
+  因此 table 最终在 GPU global memory 中的实际起始地址满足：
+
+    table_addr % 16 == 0
+
+6. CUDA static shared memory
+
+  static shared memory 指 kernel 内部有名字、有固定大小的 shared 变量：
+
+    __shared__ int a;
+    __shared__ __align__(16) float table[128];
+    __shared__ double b;
+
+  这些变量都属于同一个 kernel 的静态 shared memory 布局，每个 block 运行时都会有
+  一份对应的 shared memory 实例。编译器会为它们安排 shared memory offset：
+
+    a        shared offset 0
+    padding  12 bytes
+    table    shared offset 16
+    b        shared offset ...
+
+  它和 __device__ global variable 的区别是：
+
+    __device__ global variable
+      · 有模块级 global symbol。
+      · linker / CUDA module loader 最终把符号放进 global memory。
+
+    __shared__ static variable
+      · 没有一个所有 block 共享的 global symbol 实例。
+      · 编译器在 kernel 的 static shared memory 布局里安排 offset。
+      · 每个 block 运行时都会拥有一份这个 shared memory 布局实例。
+
+  但对齐的核心相同：
+
+    __align__(16) 最终变成"布局阶段必须把这个对象放到 16B 对齐的位置"。
+
+7. CUDA dynamic shared memory
+
+  dynamic SMEM 是 kernel launch 时通过第三个参数申请的一整块 shared memory：
+
+    kernel<<<grid, block, dynamic_smem_bytes>>>(...);
+
+  可以声明 dynamic SMEM 基地址对齐：
+
+    extern __shared__ __align__(16) unsigned char smem[];
+
+  这只保证：
+
+    smem + 0 是 16B 对齐
+
+  如果后面手动切分：
+
+    [rms_tmp][async_tile][vec_cache]
+
+  每一段 offset 仍然要手动 align_up：
+
+    __host__ __device__ inline size_t align_up(size_t x, size_t align) {
+      return ((x + align - 1) / align) * align;
+    }
+
+    size_t off = 0;
+
+    float* rms_tmp = reinterpret_cast<float*>(smem + off);
+    off += blockDim.x * sizeof(float);
+
+    off = align_up(off, 16);
+    unsigned char* async_tile = smem + off;
+
+  对齐属性保证的是 dynamic SMEM 基地址；align_up 保证的是内部子区域起始 offset。
+  dynamic_smem_bytes 只是最终申请的总容量，计算时要把 padding 也算进去。
+
+8. CUDA device 局部变量：寄存器化或 local memory
+
+  对 device 局部变量：
+
+    __device__ void g() {
+      __align__(16) float local[4];
+    }
+
+  含义是：如果 local 最终真的有一个内存地址，那么这个实际地址要满足：
+
+    reinterpret_cast<uintptr_t>(local) % 16 == 0
+
+  但 device 局部变量不一定真的落入内存。
+
+  8.1 可能被寄存器化
+
+    在 CUDA device 函数中：
+
+      __device__ void g() {
+        __align__(16) float local[4];
+      }
+
+    编译器可能把 local[4] 完全拆成寄存器：
+
+      float local0;
+      float local1;
+      float local2;
+      float local3;
+
+    如果变量被完全寄存器化，就没有一块真实的 local memory 地址。
+    这种情况下，"local 起始地址 16B 对齐"不会表现为某个 HBM 地址对齐，因为变量根本
+    没有以数组形式落到内存中。
+
+  8.2 可能落入 local memory
+
+    如果局部数组需要真实地址，例如被取地址、索引不是编译期常量、寄存器不够或发生
+    spill：
+
+      __device__ void g(int i, float* out) {
+        __align__(16) float local[4];
+
+        local[i & 3] = 1.0f;  // 动态索引，可能迫使数组保留为内存对象
+        out[threadIdx.x] = local[(i + 1) & 3];
+      }
+
+    那么 local 可能被放入 CUDA local memory。
+    CUDA local memory 是每个线程私有的地址空间；从物理存储看，它通常位于 device
+    global memory / HBM 中，但从 CUDA 语义上它不是普通的 __device__ global symbol。
+
+    此时对齐属性约束的是这个线程私有 local memory 对象的实际起始地址：
+
+      reinterpret_cast<uintptr_t>(local) % 16 == 0
+
+    编译器会在该线程的 local memory 布局中插入必要 padding，使 local 满足 16B 对齐。
+    对齐要求越高，padding 可能越多；如果变量落入 local memory，每线程 local memory
+    用量可能增加，并可能影响 occupancy 或访存性能。
+
+9. 结构体类型 / 成员 / 数组元素
+
+  对类型：
+
+    struct alignas(16) Vec4 {
+      float x;
+      float y;
+      float z;
+      float w;
+    };
+
+  编译器会让：
+
+    alignof(Vec4) >= 16
+
+  如果声明数组：
+
+    Vec4 arr[2];
+
+  编译器要保证 arr[0] 和 arr[1] 都满足 Vec4 的对齐要求。
+  因此 sizeof(Vec4) 通常也会被 padding 到 alignof(Vec4) 的整数倍。
+
+  对成员：
+
+    struct Packet {
+      int tag;
+      __align__(16) float payload[4];
+    };
+
+  编译器会插入 padding：
+
+    offset(tag)     = 0
+    sizeof(tag)     = 4
+    padding         = 12 bytes
+    offset(payload) = 16
+
+  结构体大小也会被 padding 到 Packet 对齐要求的整数倍，保证：
+
+    Packet arr[2];
+
+  中的 arr[0] 和 arr[1] 都满足 Packet 的对齐要求。
+
+  注意：
+    · 对齐结构体类型，会影响这个类型对象的起始地址和数组步长。
+    · 对齐结构体成员，会影响该成员在结构体内部的 offset。
+    · 对齐数组变量，只保证数组基地址；不保证数组里每个 float 元素都是 16B 对齐。
+
+
+================================================================================
+八、访存指令的实际地址对齐要求：HBM/global、SMEM 与 cp.async
+================================================================================
+
+  前面章节讲的是"对象基地址如何声明和布局"。
+  本章讲的是"一条实际访存指令执行时，最终地址必须满足什么要求"。
+
+  核心公式：
+
+    actual_addr = base + offset
+
+  即使 base 已经满足 16B / 256B 对齐，只要 offset 不合适，actual_addr 仍然可能不对齐。
+
+1. 自然对齐与性能对齐
+
+  指令/类型要求的自然对齐：
+
+    4B 访问   -> address % 4  == 0
+    8B 访问   -> address % 8  == 0
+    16B 访问  -> address % 16 == 0
+
+  这影响：
+
+    · 指令是否合法或行为是否可靠。
+    · 编译器能否生成自然的 load/store/vector 指令。
+    · cp.async / float4 / uint4 等访问是否满足指令要求。
+
+  合并访问 / sector / cache line 的性能对齐是另一件事。
+  例如一个 warp 连续读取 32 个 float，共 128B：
+
+    · 每个线程自己的 float 访问只需要 4B 自然对齐。
+    · 但为了让 warp 访问尽量落在更少的 sector / cache line 中，行首最好满足
+      32B 或 128B 等性能相关对齐。
+
+2. 常见访问形式的实际地址要求
+
+  下表里的"实际地址要求"指 base + offset 后的地址，不是 allocation 基地址。
+
+  访问形式 / 指令                         访问大小        实际地址要求
+  ----------------------------------------------------------------------------
+  char / int8 标量 load/store              1B             address % 1  == 0
+  half / short 标量 load/store             2B             address % 2  == 0
+  float / int / uint 标量 load/store       4B             address % 4  == 0
+  double / int64 / uint64 标量 load/store  8B             address % 8  == 0
+  float2 / int2 / uint2                    8B             address % 8  == 0
+  float4 / int4 / uint4                    16B            address % 16 == 0
+  atomicAdd(float*)                        4B             address % 4  == 0
+  atomicAdd(double*)                       8B             address % 8  == 0
+
+  对 global/HBM 和 shared memory 来说，自然对齐的判断方式相同：
+
+    实际访问地址 % 访问大小 == 0
+
+  区别在于：
+
+    · global/HBM 地址通常是 64-bit device pointer。
+    · shared memory 地址在 PTX 指令里常用 shared address / offset，例如 cp.async
+      目标地址通常来自 __cvta_generic_to_shared。
+
+3. cp.async.shared.global 同时检查 HBM 和 SMEM
+
+  cp.async.shared.global 有两个访存地址：
+
+    · global/HBM 源地址
+    · shared memory 目标地址
+
+  两边都要按 cp-size 满足自然对齐：
+
+  指令形式                                      global/HBM 源地址       SMEM 目标地址
+  ------------------------------------------------------------------------------------
+  cp.async.ca.shared.global [s], [g], 4;        g % 4  == 0             s % 4  == 0
+  cp.async.ca.shared.global [s], [g], 8;        g % 8  == 0             s % 8  == 0
+  cp.async.ca.shared.global [s], [g], 16;       g % 16 == 0             s % 16 == 0
+  cp.async.cg.shared.global [s], [g], 16;       g % 16 == 0             s % 16 == 0
+
+  所以：
+
+    · cp.async 的对齐不是只看 HBM。
+    · cp.async 的对齐也不是只看 SMEM。
+    · "4 / 8 / 16" 是本次 cp.async 的 cp-size，global src 和 shared dst 都要满足。
+
+4. HBM/global 侧：base 对齐不等于 base + offset 对齐
+
+  cudaMalloc / driver API 分配得到的 device allocation 基地址通常至少 256B 对齐。
+
+  例如：
+
+    float* x;
+    cudaMalloc(&x, n * sizeof(float));
+
+  x 这个 base pointer 通常满足：
+
+    x % 256 == 0
+    x % 16  == 0
+    x % 8   == 0
+    x % 4   == 0
+
+  但指令访问的是：
+
+    addr = base + byte_offset
+
+  即使 base 是 256B 对齐，offset 也可能破坏 8B / 16B 对齐：
+
+    char* base = reinterpret_cast<char*>(gmem);  // base 256B aligned
+
+    const void* p0 = base + 0;   // 16B aligned
+    const void* p1 = base + 4;   // 4B aligned, but not 8B/16B aligned
+    const void* p2 = base + 12;  // 4B aligned, but not 8B/16B aligned
+
+  因此：
+
+    cp.async ..., 4   可以使用 p1 / p2
+    cp.async ..., 16  不能使用 p1 / p2
+
+  优先使用类型化指针和元素下标：
+
+    const float* q = ...;
+    float x = q[idx];
+
+  如果 q 来自 cudaMalloc，且 idx 是 float 元素下标：
+
+    address = q + idx
+            = base + idx * sizeof(float)
+
+  只要 base 满足 4B 对齐，所有 q[idx] 都满足 4B 对齐。
+
+  做字节偏移时，必须显式保证 offset 对齐：
+
+    const char* base = reinterpret_cast<const char*>(gmem);
+    const void* p = base + byte_offset;
+
+  如果 p 要用于 16B cp.async 或 float4 load：
+
+    byte_offset % 16 == 0
+
+5. 二维/三维张量要检查 stride / pitch
+
+  cudaMalloc 只保证整个 allocation 的 base 对齐。
+  每一行、每个 token、每个 head 的起始地址是否 16B 或 128B 对齐，取决于 stride：
+
+    row_addr = base + row * row_stride_bytes
+
+  row_stride_bytes 表示物理存储中"相邻两行起始地址之间相差多少字节"。
+  它不一定等于逻辑列数乘元素大小；如果为了对齐或访问性能做了 padding，
+  row_stride_bytes 会比逻辑行宽更大。
+
+  例子：逻辑矩阵有 130 列 float：
+
+    logical_cols = 130
+    logical_row_bytes = logical_cols * sizeof(float)
+                      = 130 * 4
+                      = 520
+
+  如果希望每一行起始地址满足 16B 对齐，需要让 row_stride_bytes 是 16 的倍数。
+  520 不是 16 的倍数：
+
+    520 % 16 = 8
+
+  所以至少要补到 528B：
+
+    row_stride_bytes = 528
+    stride_cols = row_stride_bytes / sizeof(float)
+                = 528 / 4
+                = 132
+
+  也就是逻辑上只有 130 个 float，但物理上每行按 132 个 float 存储，最后 2 个
+  float 位置是 padding。
+
+  如果希望每一行起始地址满足 32B 对齐，可以补到 544B：
+
+    row_stride_bytes = 544
+    stride_cols = 136
+
+  如果希望每一行起始地址满足 128B 对齐，则需要补到 640B：
+
+    row_stride_bytes = 640
+    stride_cols = 160
+
+  所以 stride_cols 不是固定选 136，而是由目标对齐要求决定：
+
+    stride_cols = align_up(logical_cols * sizeof(float), alignment) / sizeof(float)
+
+  访问第 row 行第 col 列的实际地址是：
+
+    element_addr = base + row * row_stride_bytes + col * sizeof(float)
+
+  此时访问第 row 行第 col 列，应使用 stride_cols：
+
+    x = a[row * stride_cols + col]
+
+  而不是：
+
+    x = a[row * logical_cols + col]
+
+  如果使用 cudaMallocPitch：
+
+    cudaMallocPitch(&ptr, &pitch, width_bytes, height);
+
+  后续行地址应使用返回的 pitch：
+
+    row_addr = reinterpret_cast<char*>(ptr) + row * pitch
+
+  不要用 width_bytes 代替 pitch。
+
+6. SMEM 侧：static shared 和 dynamic shared 分开看
+
+  static shared memory 默认按声明类型对齐：
+
+    __shared__ float  a[128];   // 至少按 float 的 4B 对齐使用
+    __shared__ double b[128];   // 至少按 double 的 8B 对齐使用
+    __shared__ float4 c[128];   // 至少按 float4 的 16B 对齐使用
+
+  如果原始字节数组后续要作为 float4 / uint4 / cp.async 16B 目标使用，应该显式要求
+  16B 对齐：
+
+    __shared__ __align__(16) unsigned char smem_raw[4096];
+
+  dynamic SMEM 只有一整块：
+
+    extern __shared__ unsigned char smem[];
+
+  第三个 launch 参数只决定总字节数：
+
+    kernel<<<grid, block, dynamic_smem_bytes>>>(...);
+
+  dynamic_smem_bytes 不会自动帮你把内部每一段对齐。
+
+  下面这种声明从 C++ 类型语义上只应保守认为基地址满足 unsigned char 的 1B 对齐：
+
+    extern __shared__ unsigned char smem[];
+
+  如果要安全地放 16B 访问对象，建议显式声明 dynamic SMEM 基地址对齐：
+
+    extern __shared__ __align__(16) unsigned char smem[];
+
+7. dynamic SMEM 切片示例
+
+  例子：先放 float 临时数据，再放需要 16B 对齐的 cp.async tile。
+
+    extern __shared__ __align__(16) unsigned char smem[];
+
+    __host__ __device__ inline size_t align_up(size_t x, size_t align) {
+      return ((x + align - 1) / align) * align;
+    }
+
+    size_t off = 0;
+
+    float* rms_tmp = reinterpret_cast<float*>(smem + off);
+    off += blockDim.x * sizeof(float);
+
+    off = align_up(off, 16);
+    unsigned char* async_tile = smem + off;
+    off += tile_bytes;
+
+    off = align_up(off, 16);
+    float4* vec_cache = reinterpret_cast<float4*>(smem + off);
+    off += vec_count * sizeof(float4);
+
+  host 侧 launch 前也要用同一套 offset 计算规则，算出最终需要申请的总字节数：
+
+    dynamic_smem_bytes = off;
+
+  注意：
+
+    · padding 是为了让下一段起始地址满足访问指令要求。
+    · dynamic_smem_bytes 只是最终申请的总大小，所以需要把 padding 也算进去。
+
+8. cp.async 对齐检查示例
+
+  cp.async 需要把 CUDA C++ shared pointer 转成 PTX shared 地址：
+
+    uint32_t smem_addr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+  inline PTX：
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        :
+        : "r"(smem_addr), "l"(global_ptr));
+
+  如果这里使用 16B cp.async，那么两边都应该满足：
+
+    reinterpret_cast<uintptr_t>(global_ptr) % 16 == 0
+    smem_addr % 16 == 0
+
+  16B cp.async 包装示例：
+
+    __device__ __forceinline__ void cp_async_16B_ca(void* smem_ptr,
+                                                    const void* glob_ptr) {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t smem_addr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 16;\n"
+          :
+          : "r"(smem_addr), "l"(glob_ptr));
+    #else
+      *reinterpret_cast<uint4*>(smem_ptr) =
+          *reinterpret_cast<const uint4*>(glob_ptr);
+    #endif
+    }
+
+  调用前要保证：
+
+    smem_ptr  16B aligned
+    glob_ptr  16B aligned
+
+  HBM/global 侧：
+
+    const char* gbase = reinterpret_cast<const char*>(qkv);
+    size_t g_off = head_offset_bytes + lane_offset_bytes;
+
+    // 如果本次用 16B cp.async，g_off 必须保持 16B 对齐。
+    const void* gptr = gbase + g_off;
+
+  SMEM 侧：
+
+    extern __shared__ __align__(16) unsigned char smem[];
+
+    size_t s_off = align_up(raw_offset, 16);
+    void* sptr = smem + s_off;
+
+  然后：
+
+    cp_async_16B_ca(sptr, gptr);
+
+
+================================================================================
+九、完整跨平台封装示例
+================================================================================
+
+  如果项目想自己封装一个通用对齐宏，可以这样写：
+
+    #if defined(__CUDACC__)
+      #define PROJECT_ALIGN(n) __align__(n)
+    #elif defined(_MSC_VER)
+      #define PROJECT_ALIGN(n) __declspec(align(n))
+    #elif defined(__GNUC__) || defined(__clang__)
+      #define PROJECT_ALIGN(n) __attribute__((aligned(n)))
+    #else
+      #define PROJECT_ALIGN(n) alignas(n)
+    #endif
+
+  使用：
+
+    PROJECT_ALIGN(16) float table[1024];
+
+    struct PROJECT_ALIGN(16) Vec4 {
+      float x;
+      float y;
+      float z;
+      float w;
+    };
+
+  更推荐的现代 C++ 写法：
+
+    alignas(16) float table[1024];
+
+    struct alignas(16) Vec4 {
+      float x;
+      float y;
+      float z;
+      float w;
+    };
+
+  CUDA device 代码里也可以直接写：
+
+    __device__ __align__(16) float table[1024];
+    extern __shared__ __align__(16) unsigned char smem[];
+
+
+================================================================================
+十、常见误区
+================================================================================
+
+1. "__attribute__((aligned(n))) 是普通 C++ 代码"
+
+  不准确。
+  它是 GCC/Clang 扩展语法，不是 ISO C++ 标准。
+  标准 C++ 对应写法是 alignas(n)。
+
+2. "__align__(16) 会生成一条运行时对齐指令"
+
+  错。
+  __align__(16) 是编译期布局属性，不生成一条专门的 GPU 指令。
+
+3. "__align__(16) 保证数组里每个 float 元素都是 16B 对齐"
+
+  错。
+  它保证数组基地址 16B 对齐。
+
+    table + 0  16B 对齐
+    table + 1  偏移 4B，不是 16B 对齐
+    table + 4  偏移 16B，又是 16B 对齐
+
+4. "cudaMalloc 已经 256B 对齐，所以所有内部切片都 16B 对齐"
+
+  错。
+  base 对齐不代表 base + offset 对齐。
+  offset 也必须是 16 的倍数。
+
+5. "extern __shared__ __align__(16) unsigned char smem[] 后，所有子区域都自动 16B 对齐"
+
+  错。
+  它只保证 smem[0] 的地址。
+  子区域仍然要：
+
+    off = align_up(off, 16)
+
+6. "cp.async ..., 4 只要求 HBM 地址 4B 对齐"
+
+  错。
+  cp.async.shared.global 有两个访存地址：
+
+    global 源地址
+    shared 目标地址
+
+  两边都要按 cp-size 满足自然对齐。
+
+7. "SMEM 对齐和 bank conflict 是一回事"
+
+  不是。
+  对齐讨论的是一条访问的地址是否满足类型/指令要求。
+  bank conflict 讨论的是同一个 warp 内多个 shared 地址映射到哪些 bank。
+
+8. "float4* cast 之后编译器会自动处理未对齐问题"
+
+  不应该依赖这种写法。
+  如果把一个未 16B 对齐的地址 cast 成 float4*，语义上就是在告诉编译器它可以按
+  float4 的对齐和访问宽度处理；未满足对齐时可能导致错误、额外指令或性能异常。
+
+
+================================================================================
+十一、速查表
+================================================================================
+
+  标准 C++：
+
+    alignas(16) float table[1024];
+
+  GCC / Clang：
+
+    __attribute__((aligned(16))) float table[1024];
+
+  MSVC：
+
+    __declspec(align(16)) float table[1024];
+
+  CUDA 常用：
+
+    __device__ __align__(16) float table[1024];
+    extern __shared__ __align__(16) unsigned char smem[];
+
+  CUDA Linux 典型展开：
+
+    __align__(16)
+      -> __attribute__((aligned(16)))
+
+  CUDA Windows 典型展开：
+
+    __align__(16)
+      -> __declspec(align(16))
+
+  访问地址速查：
+
+    标量 float/int 访问：
+      actual_addr % 4 == 0
+
+    double/int64 访问：
+      actual_addr % 8 == 0
+
+    float4/int4/uint4 访问：
+      actual_addr % 16 == 0
+
+    cp.async ..., 4：
+      HBM 源地址和 SMEM 目标地址都保证 4B 对齐
+
+    cp.async ..., 8：
+      HBM 源地址和 SMEM 目标地址都保证 8B 对齐
+
+    cp.async ..., 16：
+      HBM 源地址和 SMEM 目标地址都保证 16B 对齐
+
+    cudaMalloc:
+      allocation 基地址通常至少 256B 对齐，但 base + offset 仍需检查
+
+    dynamic SMEM:
+      声明只保证基地址；手动分段时每段 offset 都要 align_up
+
+    padding:
+      目的是让下一段 SMEM 起始地址满足后续指令/类型的自然对齐要求
+
+  底层效果：
+
+    C++ host:
+      源码对齐属性
+        -> host 编译器记录 alignment
+        -> host object / 栈帧 / 结构体布局使用 alignment
+        -> host linker / 编译器后端布局时满足该对齐
+
+    CUDA device:
+      源码对齐属性
+        -> device front-end 记录 alignment
+        -> PTX / cubin / shared memory layout 使用 alignment
+        -> ptxas / CUDA module loader / device 后端布局时满足该对齐
+
+  关键限制：
+
+    对齐属性只保证被声明对象的起始地址；
+    指针加 offset 后的实际访问地址是否对齐，需要自己保证。
