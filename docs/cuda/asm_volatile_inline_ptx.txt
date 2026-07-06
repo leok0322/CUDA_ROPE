@@ -1,0 +1,550 @@
+================================================================================
+asm volatile 用法解析：CUDA 内联 PTX 的语法、约束与示例
+================================================================================
+
+核心一句话：
+  · asm volatile(...) 用来在 C++ / CUDA C++ 里嵌入汇编；在 CUDA device 代码里常用来
+    嵌入 PTX 指令。
+  · asm 字符串里写 PTX 模板，%0 / %1 / ... 引用后面的操作数。
+  · 操作数约束("r"、"l"、"f"、"n" 等)告诉编译器应该把 C++ 变量放进什么类型的寄存器
+    或立即数。
+  · volatile 表示这段 asm 有副作用，不能被编译器当成普通无用代码随便删除。
+
+
+================================================================================
+一、基本语法
+================================================================================
+
+  本文讲的是 CUDA device 代码里的 inline PTX 常用写法。host 侧 GNU extended asm 还有
+  clobber 等额外字段；那是另一套主机编译器语境，本文不展开。
+
+  CUDA inline PTX 常见形式：
+
+    asm volatile(
+        "PTX instruction using %0, %1, ...;\n"
+        : output_operands
+        : input_operands);
+
+  三个部分：
+
+    1) "PTX instruction ..."
+       · 汇编模板字符串。
+       · %0、%1、%2 等是占位符，引用后面的输出/输入操作数。
+       · \n 用来让生成的 PTX 更清楚；多条指令通常每条一行。
+
+    2) output_operands
+       · 输出操作数，表示 asm 会写回 C++ 变量。
+       · 例如：: "=r"(out)
+
+    3) input_operands
+       · 输入操作数，表示 asm 读取 C++ 变量。
+       · 例如：: "r"(a), "l"(ptr)
+
+  如果没有输出操作数，但有输入操作数，要保留两个冒号：
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(smem), "l"(glob_ptr));
+
+  如果既没有输出也没有输入，可以写：
+
+    asm volatile("cp.async.commit_group;\n" ::);
+
+  asm 可以不带 volatile 单独使用：
+
+    asm(
+        "add.u32 %0, %1, %2;\n"
+        : "=r"(out)
+        : "r"(a), "r"(b));
+
+  但这只适合很少数“像普通表达式一样计算输出”的场景，而且 C++ 代码后续必须真正使用
+  输出结果。没有 volatile 时，编译器可以把这段 asm 当成普通可优化代码处理：如果输出没用，
+  就可能删除；如果编译器认为移动它不改变 C++ 可观察结果，也可能调整位置。
+
+  所以在 CUDA inline PTX 里，一般建议：
+
+    · 有副作用、没有 C++ 输出、读写特殊寄存器或影响内存/同步状态的指令：
+      用 asm volatile(...)。
+    · 只是做一个纯计算，并且输出变量会被后续 C++ 代码使用：
+      可以用 asm(...)，但实际项目中写 asm volatile(...) 也更常见、更稳妥。
+
+  例如下面这种不推荐：
+
+    asm("cp.async.commit_group;\n" ::);  // 不推荐：没有输出，又缺少 volatile
+
+  因为 commit_group 的意义不体现在 C++ 输出变量上；缺少 volatile 时，编译器不一定能从
+  C++ 数据流里看出它必须保留。
+
+
+================================================================================
+二、%0 / %1 的编号规则
+================================================================================
+
+  编号顺序是：
+
+    先数 output_operands，再数 input_operands。
+
+  例子 A：没有输出，两个输入
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(smem), "l"(glob_ptr));
+
+  对应关系：
+
+    %0 = smem
+    %1 = glob_ptr
+
+
+  例子 B：一个输出，两个输入
+
+    uint32_t out;
+    uint32_t a;
+    uint32_t b;
+
+    asm volatile(
+        "add.u32 %0, %1, %2;\n"
+        : "=r"(out)
+        : "r"(a), "r"(b));
+
+  对应关系：
+
+    %0 = out
+    %1 = a
+    %2 = b
+
+  如果 asm 字符串里需要写 PTX 特殊寄存器，例如 %laneid、%clock，要把百分号写成
+  两个百分号：
+
+    uint32_t lane;
+    asm volatile("mov.u32 %0, %%laneid;\n" : "=r"(lane));
+
+  这里：
+    · %0 是 inline asm 操作数占位符。
+    · %%laneid 生成到 PTX 里后才是 %laneid。
+
+
+================================================================================
+三、常见约束：r / l / f / d / h / n
+================================================================================
+
+  操作数约束告诉 nvcc："这个 C++ 表达式要以什么形式交给 PTX"。
+
+  常见约束：
+
+    "h"  16-bit integer register
+    "r"  32-bit integer register
+    "l"  64-bit integer register / address operand
+    "f"  32-bit floating-point register
+    "d"  64-bit floating-point register
+    "n"  编译期整数立即数
+
+  输出操作数常带 =：
+
+    "=r"(out)     asm 写 out，out 使用 32-bit register
+    "=f"(out_f)   asm 写 out_f，out_f 使用 32-bit float register
+
+  读写同一个 C++ 变量时常用 +：
+
+    "+r"(x)       asm 既读取 x，又写回 x
+
+  输入操作数不带 =：
+
+    "r"(a)        把 a 作为 32-bit integer register 输入
+    "l"(ptr)      把 ptr 作为 64-bit 地址/整数输入
+    "n"(4)        把 4 作为立即数输入
+
+  约束必须和 PTX 指令期望的操作数宽度匹配。比如 cp.async 的 shared 目标地址通常用
+  32-bit shared 地址，所以用 "r"；global 源地址通常是 64-bit 地址，所以用 "l"。
+
+
+================================================================================
+四、volatile 到底保证什么
+================================================================================
+
+  volatile 的核心作用：
+    · 告诉编译器这段 asm 有副作用。
+    · 即使输出没有被 C++ 代码使用，也不要随便删除这段 asm。
+    · 对 cp.async、barrier、读取特殊寄存器、写特殊状态等指令非常重要。
+
+  例子：
+
+    asm volatile("cp.async.commit_group;\n" ::);
+
+  这条指令没有 C++ 输出变量。如果不加 volatile，编译器可能认为这段 asm 对 C++ 可见结果
+  没有贡献，从而有机会删除或移动它。
+
+  但要注意：
+
+    volatile 不是线程同步。
+    volatile 不是 memory fence。
+    volatile 不等于 __syncthreads()。
+    volatile 不会让 cp.async 自动完成。
+
+  如果 PTX 指令涉及 memory ordering / 可见性，还要使用对应的 CUDA/PTX 同步原语。
+  例如 cp.async 后通常还要：
+
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+
+
+================================================================================
+五、例子 1：读取 lane id
+================================================================================
+
+  每个 warp 内线程都有 lane id，范围是 0..31。可以通过特殊寄存器 %laneid 读取：
+
+    __device__ __forceinline__ uint32_t get_lane_id() {
+      uint32_t lane;
+      asm volatile("mov.u32 %0, %%laneid;\n" : "=r"(lane));
+      return lane;
+    }
+
+  解析：
+    · mov.u32 %0, %%laneid; 生成 PTX：把 %laneid 读到目标寄存器。
+    · %0 对应输出变量 lane。
+    · "=r"(lane) 表示 asm 写入 lane，使用 32-bit integer register。
+    · %%laneid 是为了在最终 PTX 中得到特殊寄存器 %laneid。
+
+  对应 CUDA C++ 写法：
+
+    __device__ __forceinline__ uint32_t get_lane_id_cuda() {
+      uint32_t linear_tid =
+          threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+      return linear_tid % warpSize;
+    }
+
+  区别：
+    · PTX 版本直接读取硬件特殊寄存器 %laneid。
+    · CUDA C++ 版本按 CUDA thread linearization 规则计算 lane id。
+    · 对普通 kernel 来说二者结果一致；PTX 版本更直接，CUDA C++ 版本更可读。
+
+
+================================================================================
+六、例子 2：PTX 加法并写回 C++ 变量
+================================================================================
+
+  用 PTX add.u32 做 32-bit 无符号整数加法：
+
+    __device__ __forceinline__ uint32_t add_u32_asm(uint32_t a, uint32_t b) {
+      uint32_t out;
+      asm volatile(
+          "add.u32 %0, %1, %2;\n"
+          : "=r"(out)
+          : "r"(a), "r"(b));
+      return out;
+    }
+
+  对应关系：
+
+    %0 = out
+    %1 = a
+    %2 = b
+
+  为什么 out 用 "=r"：
+    · = 表示只写输出。
+    · r 表示 32-bit integer register。
+
+  为什么 a / b 用 "r"：
+    · add.u32 需要 32-bit integer 操作数。
+
+  对应 CUDA C++ 写法：
+
+    __device__ __forceinline__ uint32_t add_u32_cuda(uint32_t a, uint32_t b) {
+      return a + b;
+    }
+
+  通常应优先写 CUDA C++ 版本，让编译器自己选择 add.u32 或其他等价指令。
+
+
+================================================================================
+七、例子 3：读写同一个变量
+================================================================================
+
+  如果 asm 既读取又修改同一个 C++ 变量，用 "+r"：
+
+    __device__ __forceinline__ uint32_t inc_u32_asm(uint32_t x) {
+      asm volatile(
+          "add.u32 %0, %0, 1;\n"
+          : "+r"(x));
+      return x;
+    }
+
+  这里：
+    · %0 既是输入，也是输出。
+    · "+r"(x) 告诉编译器：x 先被读入 32-bit register，asm 执行后再写回 x。
+
+  不要把这种场景写成 "=r"(x)，因为 "=r" 表示只写，不保证 asm 执行前的 x 值已经作为
+  输入准备好。
+
+  对应 CUDA C++ 写法：
+
+    __device__ __forceinline__ uint32_t inc_u32_cuda(uint32_t x) {
+      return x + 1;
+    }
+
+  这里的 "+r"(x) 只是 inline asm 层面的"同一个寄存器既读又写"约束；CUDA C++ 里直接
+  写 x + 1 即可。
+
+
+================================================================================
+八、例子 4：cp.async 从 global 搬 4 字节到 shared
+================================================================================
+
+  本项目 src/inference/async_util.cuh 里有同类写法：
+
+    uint32_t smem =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(smem), "l"(glob_ptr));
+
+  逐项解释：
+
+    cp.async.ca.shared.global
+      · cp.async：异步拷贝。
+      · .ca：cache all 策略。
+      · .shared.global：从 global memory 搬到 shared memory。
+
+    [%0]
+      · 目标地址。
+      · %0 = smem。
+      · smem 是 __cvta_generic_to_shared 转出来的 32-bit shared 地址/offset。
+      · 用 "r"(smem) 传入。
+
+    [%1]
+      · 源地址。
+      · %1 = glob_ptr。
+      · glob_ptr 是 global/HBM 地址，通常是 64-bit device pointer。
+      · 用 "l"(glob_ptr) 传入。
+
+    4
+      · 拷贝 4 字节。
+
+  这条 asm 只发起异步拷贝。通常还需要：
+
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+
+  含义：
+    · commit_group：提交前面发出的 cp.async。
+    · wait_group 0：等待所有已提交 group 完成。
+    · __syncthreads：让 block 内线程在读 shared memory 前对齐。
+
+  对应 CUDA C++ 功能回退写法：
+
+    __device__ __forceinline__ void copy_global_to_shared_4B_cuda(
+        void* smem_ptr, const void* glob_ptr) {
+      *reinterpret_cast<uint32_t*>(smem_ptr) =
+          *reinterpret_cast<const uint32_t*>(glob_ptr);
+    }
+
+  如果后续由 block 内其他线程读取这块 shared memory，仍然需要同步：
+
+    copy_global_to_shared_4B_cuda(smem_ptr, glob_ptr);
+    __syncthreads();
+    uint32_t x = *reinterpret_cast<uint32_t*>(smem_ptr);
+
+  区别：
+    · CUDA C++ 回退写法是普通 global load + shared store，功能上是"把 4 字节搬过去"。
+    · cp.async 是异步 global -> shared 拷贝，可与后续计算重叠。
+    · 普通 CUDA C++ 回退写法不需要 commit_group / wait_group；因为它不是 cp.async。
+    · 如果想保留高层异步语义，可考虑 CUDA pipeline / cuda::memcpy_async，但接口和使用
+      条件比这个最小例子更复杂。
+
+
+================================================================================
+九、例子 5：立即数约束 n
+================================================================================
+
+  有些 PTX 指令参数必须是编译期立即数。例如 cp.async.wait_group 后面的数字就是立即数。
+
+  可以写成模板：
+
+    template <int N>
+    __device__ __forceinline__ void cp_async_wait_group() {
+      asm volatile("cp.async.wait_group %0;\n" : : "n"(N));
+    }
+
+  这里：
+    · "n"(N) 要求 N 是编译期整数立即数。
+    · 如果传运行时变量，就不能用 "n"。
+
+  本项目 src/inference/async_util.cuh 里也有类似写法：
+
+    template <int n>
+    __device__ __forceinline__ void cp_async_wait_group() {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
+      asm volatile("cp.async.wait_group %0;\n" : : "n"(n));
+    #endif
+    }
+
+  对应 CUDA C++ 说明：
+
+    cp.async.wait_group 没有一个普通 CUDA C++ 语句可以逐字等价替代。
+
+  如果不用 cp.async，而是普通 load/store 回退：
+
+    __device__ __forceinline__ void copy_then_sync_cuda(void* smem_ptr,
+                                                        const void* glob_ptr) {
+      *reinterpret_cast<uint32_t*>(smem_ptr) =
+          *reinterpret_cast<const uint32_t*>(glob_ptr);
+      __syncthreads();
+    }
+
+  这里：
+    · 普通 load/store 是同步执行的，不存在 cp.async group，所以不需要 wait_group。
+    · __syncthreads() 解决的是 block 内线程对齐和 shared memory 可见性，不是等待
+      cp.async group。
+    · 如果使用 CUDA pipeline / cuda::memcpy_async，高层对应概念是 pipeline 的 wait /
+      consumer_wait，而不是裸 __syncthreads()。
+
+
+================================================================================
+十、例子 6：在 asm 模板里声明临时 PTX 寄存器
+================================================================================
+
+  当一段 PTX 需要临时寄存器，可以在 asm 字符串里用大括号创建局部作用域：
+
+    __device__ __forceinline__ uint32_t is_nonzero(uint32_t x) {
+      uint32_t out;
+      asm volatile(
+          "{\n"
+          "  .reg .pred p;\n"
+          "  setp.ne.u32 p, %1, 0;\n"
+          "  selp.u32 %0, 1, 0, p;\n"
+          "}\n"
+          : "=r"(out)
+          : "r"(x));
+      return out;
+    }
+
+  为什么加大括号：
+    · 避免 .reg 声明的临时寄存器名字和同一个函数里其他 inline asm 冲突。
+    · 让这段 PTX 的局部名字只在当前 asm 块里可见。
+
+  对应 CUDA C++ 写法：
+
+    __device__ __forceinline__ uint32_t is_nonzero_cuda(uint32_t x) {
+      return x != 0 ? 1u : 0u;
+    }
+
+  这里 CUDA C++ 的三目表达式通常会被编译器优化成 predicate / select / branch 中合适的
+  形式。只有在你明确想控制 setp + selp 形态时，才需要手写 PTX。
+
+
+================================================================================
+十一、常见错误
+================================================================================
+
+  错误 1：操作数宽度和约束不匹配
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "l"(smem), "l"(glob_ptr));  // smem 不应按 64-bit 地址传
+
+  正确写法：
+
+    uint32_t smem =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(smem), "l"(glob_ptr));
+
+
+  错误 2：忘记第二个冒号
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        : "r"(smem), "l"(glob_ptr));  // 错：这会被当成输出操作数区域
+
+  正确写法：
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(smem), "l"(glob_ptr));
+
+
+  错误 3：把输出变量写成输入约束
+
+    uint32_t out;
+    asm volatile(
+        "mov.u32 %0, %%laneid;\n"
+        :
+        : "r"(out));  // 错：out 被当成输入，不会接收结果
+
+  正确写法：
+
+    uint32_t out;
+    asm volatile(
+        "mov.u32 %0, %%laneid;\n"
+        : "=r"(out));
+
+
+  错误 4：忘记特殊寄存器的双百分号
+
+    asm volatile("mov.u32 %0, %laneid;\n" : "=r"(lane));   // 错
+
+  正确写法：
+
+    asm volatile("mov.u32 %0, %%laneid;\n" : "=r"(lane));  // 对
+
+
+  错误 5：以为 volatile 可以替代同步
+
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                 :
+                 : "r"(smem), "l"(glob_ptr));
+    int x = *smem_ptr;  // 错：这里不能假设 cp.async 已完成
+
+  正确做法：
+
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                 :
+                 : "r"(smem), "l"(glob_ptr));
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+    int x = *smem_ptr;
+
+
+================================================================================
+十二、速查表
+================================================================================
+
+  ┌──────────────────────────────┬──────────────────────────────────────────────┐
+  │ 写法                          │ 含义                                         │
+  ├──────────────────────────────┼──────────────────────────────────────────────┤
+  │ asm volatile("..." ::);       │ 无输出、无输入、有副作用的 asm               │
+  │ asm("..." : ... : ...);       │ 可不带 volatile，但只适合纯计算输出场景       │
+  │ : "=r"(out)                   │ 输出 out，32-bit integer register            │
+  │ : "+r"(x)                     │ x 既是输入又是输出，32-bit integer register  │
+  │ : "r"(x)                      │ 输入 x，32-bit integer register              │
+  │ : "l"(ptr)                    │ 输入 ptr，64-bit integer/address register    │
+  │ : "f"(x)                      │ 输入/输出 32-bit float register              │
+  │ : "d"(x)                      │ 输入/输出 64-bit float register              │
+  │ : "n"(N)                      │ 编译期整数立即数                             │
+  │ %0 / %1                       │ 第 0 / 第 1 个操作数占位符                   │
+  │ %%laneid                      │ 生成 PTX 特殊寄存器 %laneid                  │
+  └──────────────────────────────┴──────────────────────────────────────────────┘
+
+
+================================================================================
+十三、最容易记住的三句话
+================================================================================
+
+  1. asm 字符串里的 %0 / %1 按"输出在前、输入在后"编号。
+  2. 约束决定 C++ 变量用 32-bit register、64-bit address register、float register
+     还是立即数传给 PTX。
+  3. asm 可以不带 volatile，但有副作用或无 C++ 输出的 PTX 通常都应该加 volatile；
+     volatile 仍然不负责同步和内存可见性。

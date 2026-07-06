@@ -1,0 +1,654 @@
+================================================================================
+常见 PTX 指令用法解析：结合 asm volatile 的 inline PTX 示例
+================================================================================
+
+核心一句话：
+  · PTX 是 NVIDIA GPU 的虚拟 ISA；CUDA C++ 编译后常先生成 PTX，再由 ptxas 生成真正的
+    SASS 机器指令。
+  · 日常 CUDA 代码优先写 C++ / CUDA intrinsic；只有需要控制特殊指令、cache 策略、
+    地址空间操作数或编译器暂未暴露的能力时，才手写 inline PTX。
+  · inline PTX 里，PTX 指令负责"做什么"，asm 约束负责"把 C++ 变量以什么寄存器/立即数
+    形式交给 PTX"。
+  · 本文承接 asm_volatile_inline_ptx.txt，重点解析常见 PTX 指令本身的格式和用法。
+
+相关文档：
+  · asm volatile 语法、%0 编号、"r"/"l"/"n" 约束：
+    docs/cuda/asm_volatile_inline_ptx.txt
+  · __cvta_generic_to_shared 与 cp.async 的 shared 地址转换：
+    docs/cuda/cvta_generic_to_shared.txt
+  · shared memory bank / global memory coalescing：
+    docs/cuda/SMEM_Bank_Conflict_and_GMEM_coalesce.txt
+
+
+================================================================================
+一、PTX 指令的基本形态
+================================================================================
+
+  常见 PTX 指令长这样：
+
+    opcode.modifier.type dst, src1, src2, ...;
+
+  例子：
+
+    add.u32        r3, r1, r2;
+    fma.rn.f32     f0, f1, f2, f3;
+    ld.global.u32  r0, [addr];
+    st.shared.u32  [saddr], r0;
+
+  可以拆成：
+
+    opcode
+      · 指令名，例如 mov / add / mul / fma / ld / st / setp / selp / atom / cp.async。
+
+    modifier
+      · 修饰符，控制 rounding、cache、同步范围等。
+      · 例如 fma.rn.f32 的 .rn 是 round-to-nearest-even。
+      · cp.async.ca.shared.global 的 .ca 是 cache all。
+
+    type
+      · 数据类型或操作宽度。
+      · 常见：.u32 / .s32 / .u64 / .f32 / .f64 / .b32 / .pred。
+
+    dst / src
+      · 目标和源操作数。
+      · 在 inline PTX 里常写成 %0 / %1 / %2，占位符由 asm 操作数绑定。
+
+  inline PTX 示例：
+
+    uint32_t out;
+    uint32_t a;
+    uint32_t b;
+
+    asm volatile(
+        "add.u32 %0, %1, %2;\n"
+        : "=r"(out)
+        : "r"(a), "r"(b));
+
+  这里：
+    · add.u32 是 PTX 指令。
+    · %0 / %1 / %2 是 inline asm 占位符。
+    · "=r"(out) 告诉 nvcc：out 是 32-bit integer register 输出。
+    · "r"(a), "r"(b) 告诉 nvcc：a / b 是 32-bit integer register 输入。
+
+
+================================================================================
+二、常见类型后缀：.u32 / .s32 / .b32 / .f32 / .pred
+================================================================================
+
+  PTX 指令通常把"操作类型"写进指令名。
+
+  常见后缀：
+
+    .u16 / .u32 / .u64
+      · unsigned integer。
+      · 例如 add.u32 按 32-bit 无符号整数做加法。
+
+    .s16 / .s32 / .s64
+      · signed integer。
+      · 影响比较、扩展、乘法高位等语义。
+
+    .b16 / .b32 / .b64
+      · raw bits。
+      · 只强调位宽，不强调 signed / unsigned 数值意义。
+      · mov.b32、shfl.sync.bfly.b32 常用。
+
+    .f16 / .f32 / .f64
+      · floating point。
+      · 例如 add.rn.f32 / fma.rn.f32。
+
+    .pred
+      · predicate register，保存 true / false。
+      · setp 生成 predicate，selp 或 @p 谓词执行会使用它。
+
+  约束与后缀要匹配：
+
+    .u32 / .s32 / .b32  常用 "r"
+    .u64 / .s64 / .b64  常用 "l"
+    .f32                常用 "f"
+    .f64                常用 "d"
+    编译期立即数         常用 "n"
+
+
+================================================================================
+三、mov：寄存器搬运与读取特殊寄存器
+================================================================================
+
+  mov 把一个值搬到目标寄存器。它常用于读取 PTX 特殊寄存器。
+
+  例子：读取 warp 内 lane id。
+
+    __device__ __forceinline__ uint32_t get_lane_id() {
+      uint32_t lane;
+      asm volatile("mov.u32 %0, %%laneid;\n" : "=r"(lane));
+      return lane;
+    }
+
+  解析：
+    · mov.u32：搬运 32-bit unsigned integer。
+    · %0：输出寄存器，对应 lane。
+    · %%laneid：生成 PTX 特殊寄存器 %laneid。
+    · "=r"(lane)：lane 是 32-bit integer register 输出。
+
+  为什么是 %%laneid：
+    · inline asm 里 %0 / %1 是占位符。
+    · 如果要在最终 PTX 里保留一个真实的百分号，要写成 %%。
+    · 所以 C++ 字符串里的 %%laneid 生成 PTX 后是 %laneid。
+
+  其他常见特殊寄存器：
+
+    %tid.x / %tid.y / %tid.z       当前 block 内线程坐标
+    %ctaid.x / %ctaid.y / %ctaid.z 当前 grid 内 block 坐标
+    %ntid.x / %ntid.y / %ntid.z    blockDim
+    %nctaid.x / ...                gridDim
+    %laneid                        warp 内 lane id
+    %warpid                        block 内 warp id
+
+  实际代码里，threadIdx / blockIdx / blockDim / gridDim 通常更清楚；只有需要特殊寄存器
+  或做实验时才手写 mov。
+
+
+================================================================================
+四、add / sub / mul / mad：整数算术
+================================================================================
+
+  add / sub 是最直观的整数加减。
+
+    __device__ __forceinline__ uint32_t add_u32_asm(uint32_t a, uint32_t b) {
+      uint32_t out;
+      asm volatile(
+          "add.u32 %0, %1, %2;\n"
+          : "=r"(out)
+          : "r"(a), "r"(b));
+      return out;
+    }
+
+  对应关系：
+
+    %0 = out
+    %1 = a
+    %2 = b
+
+  读写同一个变量时用 "+r"：
+
+    __device__ __forceinline__ uint32_t inc_u32_asm(uint32_t x) {
+      asm volatile(
+          "add.u32 %0, %0, 1;\n"
+          : "+r"(x));
+      return x;
+    }
+
+  这里 %0 既是输入又是输出。
+
+
+  mul / mad 常见形式：
+
+    mul.lo.u32 d, a, b;       // d = low32(a * b)
+    mul.wide.u32 d64, a, b;   // d64 = 64-bit(a * b)
+    mad.lo.u32 d, a, b, c;    // d = low32(a * b + c)
+    mad.wide.u32 d64, a, b, c64;
+
+  mad.wide.u32 常用于地址偏移计算：32-bit index * 32-bit stride + 64-bit base。
+
+    __device__ __forceinline__ uint64_t byte_offset_u32(
+        uint32_t idx, uint32_t stride_bytes, uint64_t base) {
+      uint64_t out;
+      asm volatile(
+          "mad.wide.u32 %0, %1, %2, %3;\n"
+          : "=l"(out)
+          : "r"(idx), "r"(stride_bytes), "l"(base));
+      return out;
+    }
+
+  解析：
+    · mad.wide.u32：把两个 u32 相乘，产生 64-bit 结果，再加 64-bit 第四操作数。
+    · %0 用 "=l"：输出是 64-bit integer register。
+    · %1 / %2 用 "r"：idx / stride_bytes 是 32-bit。
+    · %3 用 "l"：base 是 64-bit。
+
+  注意：普通地址计算让 C++ 写通常更好；手写 mad.wide 主要用于确认/控制特定 PTX 形态。
+
+
+================================================================================
+五、add.rn.f32 / fma.rn.f32：浮点算术
+================================================================================
+
+  浮点 PTX 指令常带 rounding mode。
+
+  常见 rounding modifier：
+
+    .rn  round to nearest even
+    .rz  round toward zero
+    .rm  round toward negative infinity
+    .rp  round toward positive infinity
+
+  例子：f32 加法。
+
+    __device__ __forceinline__ float add_f32_asm(float a, float b) {
+      float out;
+      asm volatile(
+          "add.rn.f32 %0, %1, %2;\n"
+          : "=f"(out)
+          : "f"(a), "f"(b));
+      return out;
+    }
+
+  例子：fused multiply-add。
+
+    __device__ __forceinline__ float fma_f32_asm(float a, float b, float c) {
+      float out;
+      asm volatile(
+          "fma.rn.f32 %0, %1, %2, %3;\n"
+          : "=f"(out)
+          : "f"(a), "f"(b), "f"(c));
+      return out;
+    }
+
+  解析：
+    · fma.rn.f32 表示 out = round_to_nearest(a * b + c)，乘加融合为一次舍入。
+    · float 对应 "f" 约束。
+    · double 对应 .f64 和 "d" 约束。
+
+  注意：
+    · CUDA C++ 里的 fmaf(a, b, c) 通常已经能表达融合乘加。
+    · 手写 PTX 主要用于明确 rounding 或实验编译器输出。
+
+
+================================================================================
+六、setp / selp：谓词比较与无分支选择
+================================================================================
+
+  PTX 有 predicate register，通常用 .pred 表示。setp 生成谓词，selp 根据谓词选择值。
+
+  asm_volatile_inline_ptx.txt 里的例子：
+
+    __device__ __forceinline__ uint32_t is_nonzero(uint32_t x) {
+      uint32_t out;
+      asm volatile(
+          "{\n"
+          "  .reg .pred p;\n"
+          "  setp.ne.u32 p, %1, 0;\n"
+          "  selp.u32 %0, 1, 0, p;\n"
+          "}\n"
+          : "=r"(out)
+          : "r"(x));
+      return out;
+    }
+
+  逐条解析：
+
+    .reg .pred p;
+      · 声明一个 PTX predicate 临时寄存器 p。
+      · 大括号让 p 的名字局限在当前 asm 块，避免和其他 inline asm 冲突。
+
+    setp.ne.u32 p, %1, 0;
+      · set predicate if not equal。
+      · 比较 %1 和 0，按 u32 解释。
+      · 若 %1 != 0，则 p = true，否则 p = false。
+
+    selp.u32 %0, 1, 0, p;
+      · select predicate。
+      · p 为 true 时 %0 = 1，否则 %0 = 0。
+      · 结果是 u32，输出用 "=r"。
+
+  常见 setp 比较条件：
+
+    setp.eq  equal
+    setp.ne  not equal
+    setp.lt  less than
+    setp.le  less or equal
+    setp.gt  greater than
+    setp.ge  greater or equal
+
+  谓词执行也很常见：
+
+    @p   add.u32 r0, r1, r2;   // p 为 true 才执行
+    @!p  add.u32 r0, r1, r2;   // p 为 false 才执行
+
+  对简单 if，CUDA C++ 通常足够；手写 setp/selp 主要用于控制是否生成 predicated 指令。
+
+
+================================================================================
+七、ld / st：global、shared、local 地址空间访问
+================================================================================
+
+  PTX load/store 会显式写地址空间：
+
+    ld.global.u32  dst, [addr];     // 从 global memory 读
+    st.global.u32  [addr], src;     // 写 global memory
+    ld.shared.u32  dst, [saddr];    // 从 shared memory 读
+    st.shared.u32  [saddr], src;    // 写 shared memory
+    ld.local.u32   dst, [addr];     // 从 local memory 读
+    st.local.u32   [addr], src;     // 写 local memory
+
+  例子：从 global memory 读一个 u32。
+
+    __device__ __forceinline__ uint32_t load_global_u32(const uint32_t* ptr) {
+      uint32_t out;
+      asm volatile(
+          "ld.global.u32 %0, [%1];\n"
+          : "=r"(out)
+          : "l"(ptr));
+      return out;
+    }
+
+  解析：
+    · ptr 是 global/device pointer，通常是 64-bit，使用 "l"。
+    · out 是 u32，使用 "=r"。
+
+
+  例子：写 shared memory。
+
+    __device__ __forceinline__ void store_shared_u32(void* smem_ptr,
+                                                     uint32_t value) {
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+      asm volatile(
+          "st.shared.u32 [%0], %1;\n"
+          :
+          : "r"(saddr), "r"(value));
+    }
+
+  关键点：
+    · st.shared.u32 的地址操作数是 shared 地址空间内部地址。
+    · CUDA C++ 的 shared 指针需要用 __cvta_generic_to_shared 转换。
+    · 转成 uint32_t 后用 "r" 传给 PTX。
+
+
+  只读 global load 常见 PTX 形态：
+
+    ld.global.nc.f32 dst, [addr];
+
+  .nc 表示 non-coherent 只读路径。实际 CUDA 代码里常用 __ldg(ptr) 或 const __restrict__
+  指针让编译器选择只读路径，不一定要手写 ld.global.nc。
+
+
+================================================================================
+八、bar.sync / membar：同步与内存顺序
+================================================================================
+
+  block 内同步常见 PTX 指令是：
+
+    bar.sync 0;
+
+  它大致对应 CUDA C++ 的：
+
+    __syncthreads();
+
+  inline PTX 写法：
+
+    asm volatile("bar.sync 0;\n" ::);
+
+  但实际代码里更推荐直接写 __syncthreads()：
+    · 语义更清楚。
+    · 编译器更容易理解控制流。
+    · 不容易误用 barrier id。
+
+  重要限制：
+    · 同一个 block 内必须所有应参与的线程都到达同一个 barrier。
+    · 如果只有部分线程进入 bar.sync，可能死锁。
+
+
+  memory fence 常见 PTX 形态：
+
+    membar.cta;   // block/CTA 范围
+    membar.gl;    // device/global 范围
+    membar.sys;   // system 范围
+
+  CUDA C++ 通常用：
+
+    __threadfence_block();
+    __threadfence();
+    __threadfence_system();
+
+  注意：
+    · volatile asm 不是 fence。
+    · bar.sync 是线程同步点，也包含 block 内 shared memory 可见性的常用同步语义。
+    · membar 只处理内存顺序，不让线程彼此等待。
+
+
+================================================================================
+九、shfl.sync：warp 内寄存器交换
+================================================================================
+
+  CUDA C++ 通常直接用：
+
+    __shfl_xor_sync(mask, value, laneMask, width);
+    __shfl_down_sync(mask, value, delta, width);
+
+  PTX 里常见形态：
+
+    shfl.sync.bfly.b32 dst, src, laneMask, clamp, memberMask;
+    shfl.sync.down.b32 dst, src, delta,    clamp, memberMask;
+    shfl.sync.idx.b32  dst, src, srcLane,  clamp, memberMask;
+
+  例子：近似表达 __shfl_xor_sync(0xffffffff, x, lane_mask, 32)。
+
+    __device__ __forceinline__ uint32_t shfl_xor_u32_asm(uint32_t x,
+                                                         uint32_t lane_mask) {
+      uint32_t out;
+      asm volatile(
+          "shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;\n"
+          : "=r"(out)
+          : "r"(x), "r"(lane_mask));
+      return out;
+    }
+
+  解析：
+    · bfly 对应 xor / butterfly 模式。
+    · lane_mask 决定当前 lane 和 lane ^ lane_mask 交换。
+    · 0x1f 是 clamp，用于表示 32 lane warp 的边界控制。
+    · 0xffffffff 是参与线程 mask。
+
+  实际项目里优先用 __shfl_*_sync intrinsic：
+    · 更可读。
+    · 能让编译器处理类型和 width。
+    · docs/cuda/shfl_xor_sync.txt 已专门解释 __shfl_xor_sync 的语义。
+
+
+================================================================================
+十、cp.async：global -> shared 异步拷贝
+================================================================================
+
+  cp.async 是 Ampere(sm_80) 及之后常用的 global memory 到 shared memory 的异步拷贝。
+  本项目 src/inference/async_util.cuh 里使用了这一类指令。
+
+  典型 inline PTX：
+
+    uint32_t smem =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(smem), "l"(glob_ptr));
+
+  指令拆解：
+
+    cp.async
+      · 异步拷贝，不经过显式寄存器中转。
+
+    .ca / .cg
+      · cache 策略。
+      · .ca = cache all。
+      · .cg = cache global，通常强调 L2/global 路径。
+
+    .shared.global
+      · 目标地址空间是 shared。
+      · 源地址空间是 global。
+
+    [%0]
+      · shared 目标地址。
+      · 要用 __cvta_generic_to_shared 转成 shared 地址空间内部地址。
+      · 常转成 uint32_t，再用 "r" 传入。
+
+    [%1]
+      · global 源地址。
+      · 通常是 64-bit device/global pointer，用 "l" 传入。
+
+    4 / 8 / 16
+      · 拷贝字节数。
+
+  cp.async 只发起异步拷贝；后面通常还要：
+
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+
+  含义：
+    · commit_group：提交当前已经发出的 cp.async。
+    · wait_group 0：等待所有已提交 group 完成。
+    · __syncthreads：让 block 内线程在读 shared memory 前对齐。
+
+  常见错误：
+    · 把 CUDA C++ shared 指针直接用 "l" 传给 [%0]。
+    · 忘记 __cvta_generic_to_shared。
+    · 以为 volatile 等于等待 cp.async 完成。
+    · 16 字节拷贝时没有保证地址对齐或边界安全。
+
+
+================================================================================
+十一、atom：global/shared 原子操作
+================================================================================
+
+  PTX atomic 指令常见形态：
+
+    atom.global.add.u32 dst, [addr], value;
+    atom.shared.add.u32 dst, [saddr], value;
+
+  atom 会返回旧值；如果你不需要旧值，CUDA C++ 里通常直接用 atomicAdd，更清楚。
+
+  例子：global u32 atomic add，并返回旧值。
+
+    __device__ __forceinline__ uint32_t atomic_add_global_u32(
+        uint32_t* ptr, uint32_t value) {
+      uint32_t old;
+      asm volatile(
+          "atom.global.add.u32 %0, [%1], %2;\n"
+          : "=r"(old)
+          : "l"(ptr), "r"(value));
+      return old;
+    }
+
+  解析：
+    · %0 = old，原子加之前的旧值，u32 输出，用 "=r"。
+    · %1 = ptr，global 地址，用 "l"。
+    · %2 = value，u32 输入，用 "r"。
+
+  shared atomic 的地址是 shared 地址空间内部地址：
+
+    __device__ __forceinline__ uint32_t atomic_add_shared_u32(
+        uint32_t* smem_ptr, uint32_t value) {
+      uint32_t old;
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+      asm volatile(
+          "atom.shared.add.u32 %0, [%1], %2;\n"
+          : "=r"(old)
+          : "r"(saddr), "r"(value));
+      return old;
+    }
+
+  注意：
+    · 原子操作解决的是同一地址并发读改写的竞争。
+    · 原子不自动替代 block/grid 级同步。
+    · memory ordering 语义要按 CUDA/PTX 版本和指令修饰符理解；普通代码优先用 CUDA
+      atomic API。
+
+
+================================================================================
+十二、cvt：类型转换
+================================================================================
+
+  cvt 用于显式类型转换。浮点转整数时常带 rounding modifier。
+
+  例子：float 转 int，round toward zero。
+
+    __device__ __forceinline__ int f32_to_s32_rz(float x) {
+      int out;
+      asm volatile(
+          "cvt.rz.s32.f32 %0, %1;\n"
+          : "=r"(out)
+          : "f"(x));
+      return out;
+    }
+
+  指令拆解：
+
+    cvt.rz.s32.f32
+      · cvt：类型转换。
+      · .rz：round toward zero。
+      · .s32：目标类型是 signed 32-bit integer。
+      · .f32：源类型是 32-bit float。
+
+  常见形式：
+
+    cvt.rn.f32.f64  double -> float，round nearest
+    cvt.rz.s32.f32  float -> int，round toward zero
+    cvt.u32.u64     64-bit unsigned -> 32-bit unsigned
+
+  普通 C++ cast 通常足够；手写 cvt 主要用于明确 rounding 或观察编译器行为。
+
+
+================================================================================
+十三、指令选择速查
+================================================================================
+
+  ┌──────────────────────────────┬──────────────────────────────────────────────┐
+  │ 需求                          │ 常见 PTX 指令                               │
+  ├──────────────────────────────┼──────────────────────────────────────────────┤
+  │ 读取 lane id                  │ mov.u32 dst, %laneid                        │
+  │ 32-bit 整数加法               │ add.u32 dst, a, b                            │
+  │ 读写同一个整数寄存器           │ add.u32 %0, %0, 1 + "+r"(x)                  │
+  │ 32-bit 乘加取低位              │ mad.lo.u32 dst, a, b, c                      │
+  │ 32-bit 乘法产生 64-bit         │ mul.wide.u32 dst64, a, b                     │
+  │ 32-bit 乘加产生 64-bit         │ mad.wide.u32 dst64, a, b, c64                │
+  │ float 加法                    │ add.rn.f32 dst, a, b                         │
+  │ float 融合乘加                │ fma.rn.f32 dst, a, b, c                      │
+  │ 比较生成 predicate            │ setp.ne.u32 p, a, b                          │
+  │ 无分支选择                    │ selp.u32 dst, x, y, p                        │
+  │ global load                   │ ld.global.u32 dst, [addr]                    │
+  │ shared store                  │ st.shared.u32 [saddr], value                 │
+  │ block barrier                 │ bar.sync 0                                   │
+  │ memory fence                  │ membar.cta / membar.gl / membar.sys          │
+  │ warp xor shuffle              │ shfl.sync.bfly.b32                           │
+  │ global -> shared 异步拷贝      │ cp.async.ca.shared.global                    │
+  │ 提交 cp.async group           │ cp.async.commit_group                        │
+  │ 等待 cp.async group           │ cp.async.wait_group N                        │
+  │ global atomic add             │ atom.global.add.u32                          │
+  │ 类型转换                      │ cvt.rz.s32.f32 / cvt.rn.f32.f64              │
+  └──────────────────────────────┴──────────────────────────────────────────────┘
+
+
+================================================================================
+十四、什么时候不该手写 PTX
+================================================================================
+
+  不要为了"看起来更底层"手写 PTX。多数情况 CUDA C++ / intrinsic 更好：
+
+    · 普通算术：直接写 a + b、a * b + c，或用 fmaf。
+    · 普通 global/shared load/store：直接写 ptr[i] / smem[i]。
+    · block 同步：用 __syncthreads()。
+    · warp shuffle：用 __shfl_*_sync。
+    · atomic：用 atomicAdd / atomicCAS 等 CUDA API。
+    · memory fence：用 __threadfence_block / __threadfence / __threadfence_system。
+
+  适合手写 inline PTX 的场景：
+
+    · 需要 cp.async 这类特定 PTX 指令形态。
+    · 需要控制 cache modifier，例如某些 ld.global.nc / cp.async.ca / cp.async.cg。
+    · 需要读取特殊寄存器或验证编译器生成结果。
+    · 需要使用 CUDA C++ 尚未直接暴露的 PTX 功能。
+    · 做性能实验，且能用编译输出和 benchmark 验证收益。
+
+
+================================================================================
+十五、最容易记住的五句话
+================================================================================
+
+  1. PTX 指令名里的后缀不是装饰，它决定类型、地址空间、rounding 或 cache 策略。
+  2. inline asm 的 "r"/"l"/"f"/"d"/"n" 要和 PTX 操作数宽度匹配。
+  3. global 地址通常用 64-bit "l"，shared PTX 地址常用 32-bit "r"。
+  4. setp 产生 predicate，selp 或 @p 使用 predicate。
+  5. cp.async 只发起异步拷贝；完成和可见性仍要靠 commit/wait/sync。
