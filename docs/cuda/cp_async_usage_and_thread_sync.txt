@@ -1,0 +1,881 @@
+================================================================================
+cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间同步
+================================================================================
+
+核心一句话：
+  · cp.async 用来把 global memory 的数据异步搬到 shared memory，常用于把"加载下一块
+    tile"和"计算当前 tile"重叠。
+  · cp.async 只发起拷贝；要用 cp.async.commit_group / cp.async.wait_group 或 mbarrier
+    等待它完成。
+  · cp.async.wait_group 等的是"当前执行线程自己提交的 cp.async group"，不是 block 级
+    barrier。
+  · 如果 shared memory 后续会被 block 内多个线程交叉读取，通常还需要 __syncthreads()。
+  · __syncthreads() 不能替代 cp.async.wait_group；它不会保证 cp.async 已完成。
+
+相关文档：
+  · inline PTX 语法与约束：
+    docs/cuda/asm_volatile_inline_ptx.txt
+  · __cvta_generic_to_shared 和 shared 地址转换：
+    docs/cuda/cvta_generic_to_shared.txt
+  · 常见 PTX 指令速查：
+    docs/cuda/common_ptx_instructions_inline_asm.txt
+  · 架构门控：
+    docs/cuda/nvidia_cli_arch_sm_and_features.txt
+
+
+================================================================================
+一、cp.async 解决什么问题
+================================================================================
+
+  普通写法：
+
+    __shared__ int smem[256];
+
+    int x = gmem[threadIdx.x];   // global load -> register
+    smem[threadIdx.x] = x;       // register -> shared store
+    __syncthreads();
+
+  这条路径有两个特点：
+    · global 数据先进入寄存器，再写入 shared。
+    · load/store 对当前线程来说是普通指令序列，不是 cp.async group 异步流水。
+
+  cp.async 的目标：
+
+    global memory  ----异步拷贝---->  shared memory
+
+  它适合这种场景：
+    · 计算前需要先把 global memory 中的一块 tile 搬进 shared。
+    · 当前 tile 正在计算时，提前发起下一块 tile 的 global -> shared 拷贝。
+    · 等真正要用下一块 tile 时，再 wait 对应的 cp.async group。
+
+  常见收益：
+    · 减少显式寄存器中转。
+    · 让 global memory 访问延迟与计算重叠。
+    · 在 tiled GEMM、attention、批量加载 cos/sin table 等场景中常见。
+
+
+================================================================================
+二、基本指令形态
+================================================================================
+
+  常见 PTX：
+
+    cp.async.ca.shared.global [dst_smem], [src_gmem], 4;
+    cp.async.ca.shared.global [dst_smem], [src_gmem], 8;
+    cp.async.ca.shared.global [dst_smem], [src_gmem], 16;
+    cp.async.cg.shared.global [dst_smem], [src_gmem], 16;
+
+  拆解：
+
+    cp.async
+      · 异步 copy。
+      · 发起后，控制流会回到当前线程；拷贝不一定已经完成。
+
+    .ca / .cg
+      · cache hint。
+      · .ca = cache all，允许走所有层级 cache。
+      · .cg = cache global，通常强调 L2/global 路径；非 bulk cp.async 里常见 16B 形式。
+      · cache hint 是性能提示，不改变程序正确性语义。
+
+    .shared.global
+      · 目标是 shared memory。
+      · 源是 global memory。
+
+    [dst_smem]
+      · PTX shared 地址空间内部地址。
+      · 通常是 32-bit shared address / offset。
+
+    [src_gmem]
+      · global memory 地址。
+      · 通常是 64-bit device/global pointer。
+
+    4 / 8 / 16
+      · 拷贝字节数。
+      · 非 bulk cp.async 常用 cp-size 只有 4、8、16。
+
+
+================================================================================
+三、inline PTX 写法：shared 地址用 "r"，global 地址用 "l"
+================================================================================
+
+  CUDA C++ 里的 shared 指针不能直接当成 cp.async 的 shared 目标操作数。要先用
+  __cvta_generic_to_shared 转成 PTX shared 地址空间内部地址。
+
+  4 字节示例：
+
+    __device__ __forceinline__ void cp_async_4B_ca(void* smem_ptr,
+                                                   const void* glob_ptr) {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t smem =
+          static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 4;\n"
+          :
+          : "r"(smem), "l"(glob_ptr));
+    #else
+      *reinterpret_cast<uint32_t*>(smem_ptr) =
+          *reinterpret_cast<const uint32_t*>(glob_ptr);
+    #endif
+    }
+
+  操作数解释：
+
+    "r"(smem)
+      · smem 是 32-bit shared 地址/offset。
+      · "r" 表示传入 32-bit integer register。
+
+    "l"(glob_ptr)
+      · glob_ptr 是 global/HBM 地址。
+      · "l" 表示传入 64-bit integer/address register。
+
+  常见错误：
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "l"(smem_ptr), "l"(glob_ptr));  // 错：shared dst 不是普通 64-bit 指针
+
+  正确思路：
+
+    CUDA C++ shared pointer
+      -> __cvta_generic_to_shared
+      -> uint32_t shared address
+      -> "r" 传给 cp.async 的 [dst]
+
+
+================================================================================
+四、commit_group：把当前线程已经发出的 cp.async 收成一组
+================================================================================
+
+  cp.async 发出后，通常要 commit：
+
+    asm volatile("cp.async.commit_group;\n" ::);
+
+  含义：
+    · 当前执行线程把此前已经发起、但还没 commit 的 cp.async 指令收成一个 cp.async group。
+    · group 是 per-thread 的，不是整个 block 共享的 group。
+    · 如果当前线程没有未提交的 cp.async，commit_group 也可能形成一个空 group。
+
+  完整示例：每个线程连续发起两条 16B cp.async，然后用一次 commit_group 把它们
+  收成同一个 group。随后 wait_group 0 等这个线程自己的 group 完成，再读取 shared。
+
+    __device__ __forceinline__ void cp_async_16B_ca(void* smem_ptr,
+                                                    const void* glob_ptr) {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t smem =
+          static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 16;\n"
+          :
+          : "r"(smem), "l"(glob_ptr));
+    #else
+      *reinterpret_cast<float4*>(smem_ptr) =
+          *reinterpret_cast<const float4*>(glob_ptr);
+    #endif
+    }
+
+    __global__ void commit_group_example(const float4* __restrict__ gmem,
+                                         float4* __restrict__ out) {
+      extern __shared__ __align__(16) unsigned char smem_bytes[];
+
+      float4* tile0 = reinterpret_cast<float4*>(smem_bytes);
+      float4* tile1 = tile0 + blockDim.x;
+
+      int tid = threadIdx.x;
+      int base = blockIdx.x * blockDim.x * 2;
+
+      const float4* g0 = gmem + base + tid;
+      const float4* g1 = gmem + base + blockDim.x + tid;
+
+      cp_async_16B_ca(&tile0[tid], g0);
+      cp_async_16B_ca(&tile1[tid], g1);
+
+      // 把当前线程此前未提交的两条 cp.async 收成同一个 per-thread group。
+      // 注意：commit_group 只是提交/分组，不等待数据已经写入 shared。
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      asm volatile("cp.async.commit_group;\n" ::);
+
+      // 中间可以放与 tile0/tile1 无关的计算，用来和异步拷贝重叠。
+
+      // 等当前线程此前提交的所有 cp.async group 完成。
+      asm volatile("cp.async.wait_group 0;\n" ::);
+    #endif
+
+      // 这里每个线程只读取自己发起 cp.async 写入的位置；
+      // 因此 wait_group 0 足够保证当前线程自己的 tile0/tile1 数据可读。
+      out[base + tid] = tile0[tid];
+      out[base + blockDim.x + tid] = tile1[tid];
+    }
+
+  启动时 dynamic shared memory 至少需要：
+
+    2 * blockDim.x * sizeof(float4)
+
+  为什么这里写 __align__(16)：
+
+    extern __shared__ __align__(16) unsigned char smem_bytes[];
+
+    · cp.async ..., 16 一次拷贝 16B，global 源地址和 shared 目标地址通常都要满足
+      16B 自然对齐。
+    · smem_bytes 的元素类型是 unsigned char，类型本身只要求 1B 对齐。
+    · __align__(16) 的作用是要求 dynamic shared memory 的基地址，也就是
+      &smem_bytes[0]，至少按 16B 对齐。
+    · 这样后续 reinterpret_cast<float4*>(smem_bytes) 或把 smem_bytes 作为
+      16B cp.async 的 shared 目标地址时，起始地址满足指令对齐要求。
+
+  但 __align__(16) 只保证 dynamic shared memory 的起始地址对齐，不自动保证每个
+  子区域都对齐。如果在 smem_bytes 里手动切多个区域，每个需要 16B 对齐的区域前
+  仍然要做 padding：
+
+    __device__ __forceinline__ size_t align_up(size_t x, size_t align) {
+      return (x + align - 1) & ~(align - 1);
+    }
+
+    extern __shared__ __align__(16) unsigned char smem_bytes[];
+
+    size_t off = 0;
+
+    float* rms_tmp = reinterpret_cast<float*>(smem_bytes + off);
+    off += blockDim.x * sizeof(float);
+
+    // 下一个区域要作为 float4 / cp.async 16B 目标使用，先把 offset 补到 16B 对齐。
+    off = align_up(off, 16);
+    float4* tile = reinterpret_cast<float4*>(smem_bytes + off);
+    off += blockDim.x * sizeof(float4);
+
+    // kernel launch 传入的 dynamic_smem_bytes 要包含 padding 后的 off。
+
+  对这个执行线程来说：
+    · cp_async_16B_ca(&tile0[tid], g0) 发起第一条拷贝，但还没有形成已提交 group。
+    · cp_async_16B_ca(&tile1[tid], g1) 发起第二条拷贝，也还没有形成已提交 group。
+    · cp.async.commit_group 把当前线程这两条未提交的 cp.async 收成同一个 group。
+    · cp.async.wait_group 0 等当前线程此前提交的 group 全部完成。
+    · wait_group 0 之后，当前线程读取自己写入的 tile0[tid] / tile1[tid] 是安全的。
+
+  如果后续代码要读取其他线程写入的 shared 位置，例如 thread 0 读取 tile0[1]，
+  那么只做 wait_group 0 还不够，因为 wait_group 只等待当前线程自己的 cp.async。
+  这时需要所有线程先 wait_group 0，再用 __syncthreads() 做 block 级线程同步：
+
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+
+    // 现在可以读取同一个 block 内其他线程写入的 shared 数据。
+
+  注意：
+    · 同一个 group 内多个 cp.async 之间没有顺序保证。
+    · 不要让同一个 group 内多条 cp.async 写同一个 shared 地址；这类写法没有可靠语义。
+    · commit_group 不等价于 wait_group；它只负责把未提交的 cp.async 收成 group。
+
+
+================================================================================
+五、wait_group N：N 是"允许仍未完成的最新 group 数量"
+================================================================================
+
+  语法：
+
+    cp.async.wait_group N;
+
+  inline PTX：
+
+    template <int N>
+    __device__ __forceinline__ void cp_async_wait_group() {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      asm volatile("cp.async.wait_group %0;\n" : : "n"(N));
+    #endif
+    }
+
+  这里的 "n"(N)：
+    · 表示 N 是编译期整数立即数。
+    · PTX 语法需要字面量 N，不能用运行时寄存器。
+
+  wait_group N 的语义：
+
+    当前执行线程等待，直到它自己提交过的 cp.async group 中，
+    只剩最新的 N 个或更少 group 仍然 pending；
+    更老的 group 必须已经完成。
+
+  常用值：
+
+    cp.async.wait_group 0
+      · 等当前线程此前提交的所有 cp.async group 完成。
+      · 最保守，适合马上要读刚搬进 shared 的数据。
+
+    cp.async.wait_group 1
+      · 允许最新 1 个 group 还在飞。
+      · 常用于双缓冲：等待更老 group 可用，同时保留下一组拷贝继续异步进行。
+
+  完整例子：双缓冲中预取 tile0、预取 tile1，然后用 wait_group 1 消费 tile0。
+
+    // 复用第四节的 helper：
+    //   cp_async_16B_ca(void* smem_ptr, const void* glob_ptr)
+    //
+    // 每个线程负责搬运一个 float4：
+    //   tile0[tid] <- gmem[base + tid]
+    //   tile1[tid] <- gmem[base + blockDim.x + tid]
+
+    __global__ void wait_group_1_example(const float4* __restrict__ gmem,
+                                         float4* __restrict__ out) {
+      extern __shared__ __align__(16) unsigned char smem_bytes[];
+
+      float4* tile0 = reinterpret_cast<float4*>(smem_bytes);
+      float4* tile1 = tile0 + blockDim.x;
+
+      int tid = threadIdx.x;
+      int base = blockIdx.x * blockDim.x * 2;
+
+      const float4* g0 = gmem + base + tid;
+      const float4* g1 = gmem + base + blockDim.x + tid;
+
+      // group 0：预取当前要消费的 tile0。
+      cp_async_16B_ca(&tile0[tid], g0);
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      asm volatile("cp.async.commit_group;\n" ::);
+    #endif
+
+      // group 1：预取下一块 tile1。
+      cp_async_16B_ca(&tile1[tid], g1);
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      asm volatile("cp.async.commit_group;\n" ::);
+
+      // 等到只允许最新 1 个 group 仍然 pending。
+      // 此时 group 0 已完成，group 1 可以仍在后台搬运。
+      asm volatile("cp.async.wait_group 1;\n" ::);
+    #endif
+
+      // 这里只读取当前线程自己写入的 tile0[tid]。
+      // wait_group 1 已保证 group 0 完成，所以 tile0[tid] 可读。
+      // tile1[tid] 仍可能没有完成，此处不能读取 tile1。
+      float4 v0 = tile0[tid];
+
+      // 这里放对 tile0 的计算；计算期间 tile1 的 cp.async 可以继续进行。
+      out[base + tid] = v0;
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      // 真正要消费 tile1 前，必须再等待所有更早 group 完成。
+      asm volatile("cp.async.wait_group 0;\n" ::);
+    #endif
+
+      float4 v1 = tile1[tid];
+      out[base + blockDim.x + tid] = v1;
+    }
+
+  启动时 dynamic shared memory 至少需要：
+
+    2 * blockDim.x * sizeof(float4)
+
+  对当前线程来说：
+    · 第一条 cp_async_16B_ca + commit_group 形成 group 0。
+    · 第二条 cp_async_16B_ca + commit_group 形成 group 1。
+    · cp.async.wait_group 1 表示：允许最新 1 个 group 仍未完成。
+    · 因为 group 1 是最新 group，所以 group 1 可以 pending。
+    · group 0 比 group 1 更老，因此 wait_group 1 返回时 group 0 必须已经完成。
+    · 所以此时可以消费 tile0，但不能消费 tile1。
+    · 消费 tile1 前，需要再执行 cp.async.wait_group 0。
+
+  如果消费 tile0 时只读取自己线程写入的 tile0[tid]，wait_group 1 就足够。
+  如果要读取其他线程写入的 tile0 位置，则每个线程需要先 wait_group 1，
+  再执行 __syncthreads()，保证 block 内所有线程的 group 0 都完成并到达同步点：
+
+    asm volatile("cp.async.wait_group 1;\n" ::);
+    __syncthreads();
+
+    // 现在可以读取同一 block 内其他线程写入的 tile0。
+    // 但 tile1 仍然可能 pending，不能读 tile1。
+
+  wait_all：
+
+    cp.async.wait_all;
+
+  概念上等价于：
+
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+
+
+================================================================================
+六、为什么 wait_group 后经常还要 __syncthreads()
+================================================================================
+
+  关键区别：
+
+    cp.async.wait_group
+      · 等当前执行线程自己提交的 cp.async group。
+      · 不是 block barrier。
+      · 不等待其他线程发出的 cp.async。
+
+    __syncthreads()
+      · 等同一个 block 内所有线程到达同步点。
+      · 让 block 内线程在继续读 shared memory 前对齐。
+      · 但它本身不保证 cp.async 完成。
+
+  因此常见安全序列是：
+
+    cp.async.ca.shared.global ...;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    __syncthreads();
+
+  含义：
+    1. 每个线程发起自己的 global -> shared 拷贝。
+    2. 每个线程 commit 自己的 cp.async group。
+    3. 每个线程 wait_group 0，等自己发出的 cp.async 完成。
+    4. __syncthreads() 等整个 block 所有线程都完成第 3 步。
+    5. 之后 block 内线程可以交叉读取 shared memory tile。
+
+  如果少了 wait_group：
+
+    cp.async.ca.shared.global ...;
+    cp.async.commit_group;
+    __syncthreads();       // 不够
+    x = smem[i];           // 可能读到 cp.async 尚未完成的数据
+
+  问题：
+    · __syncthreads() 只说明所有线程到了 barrier。
+    · 它不是 cp.async completion mechanism。
+    · cp.async 的完成仍要由 wait_group / wait_all / mbarrier 观察。
+
+  如果少了 __syncthreads：
+
+    cp.async.ca.shared.global ...;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    x = smem[other_thread_index];  // 可能不安全
+
+  问题：
+    · 当前线程只等了自己发出的 cp.async。
+    · other_thread_index 对应位置可能由其他线程搬运。
+    · 其他线程可能还没有 wait 完，也可能还没把对应 shared 数据准备好。
+
+
+================================================================================
+七、什么时候可以不加 __syncthreads()
+================================================================================
+
+  核心判断不是"用了 shared memory 就必须 __syncthreads()"，而是看 shared memory
+  是否形成了跨线程依赖。
+
+  可以不加 block barrier 的典型条件可以拆成两类：
+
+    1. 数据消费关系：producer 和 consumer 是同一个线程
+
+       也就是每个线程只读取自己发起 cp.async 写入的 shared 地址，例如：
+
+         thread 0: cp.async 写 smem[0]，后面只读 smem[0]
+         thread 1: cp.async 写 smem[1]，后面只读 smem[1]
+
+       这种情况下，当前线程执行 wait_group 0 后，已经知道"自己写给自己读"的
+       shared 数据完成了，不需要等其他线程。
+
+    2. buffer 生命周期：不会在其他线程仍可能使用时复用或覆盖同一块 shared buffer
+
+       如果某个 shared buffer 后面要被其他线程读取，或者下一轮会被其他线程提前写入覆盖，
+       就需要用 __syncthreads() 管住"所有线程都已经消费完 / 都准备好进入下一轮"。
+       如果每个线程的 shared 槽位只在本线程内部短暂中转，生命周期不跨线程，
+       通常不需要 block barrier。
+
+  原来的说法里，"只读取自己写入的地址"、"不存在跨线程消费"、"不需要保证其他线程完成"
+  本质上是在描述同一个条件：没有跨线程 shared memory 依赖。真正额外要检查的是
+  shared buffer 是否会被提前复用或覆盖。
+
+  示例：每个线程只读自己的槽位。
+
+    __global__ void self_consume(const int* gmem, int* out) {
+      __shared__ int smem[256];
+
+      int tid = threadIdx.x;
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&smem[tid]));
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 4;\n"
+          :
+          : "r"(saddr), "l"(&gmem[tid]));
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+    #else
+      smem[tid] = gmem[tid];
+    #endif
+
+      // 只读自己刚搬的 smem[tid]，没有跨线程依赖。
+      out[tid] = smem[tid];
+    }
+
+  这个例子只是说明同步边界；真实代码里如果不共享数据，直接读 gmem[tid] 往往更简单。
+
+
+================================================================================
+八、什么时候必须加 __syncthreads()
+================================================================================
+
+  只要 shared memory tile 会被 block 内多个线程共同读取，通常就需要：
+
+    cp.async.wait_group ...
+    __syncthreads()
+
+  示例：每个线程搬一个元素，后面 thread 0 汇总整个 tile。
+
+    __global__ void block_sum_after_async_copy(const int* gmem, int* out) {
+      __shared__ int tile[256];
+
+      int tid = threadIdx.x;
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&tile[tid]));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 4;\n"
+          :
+          : "r"(saddr), "l"(&gmem[tid]));
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+    #else
+      tile[tid] = gmem[tid];
+    #endif
+
+      // 必须等 block 内所有线程都完成自己的 cp.async / 普通 store。
+      __syncthreads();
+
+      if (tid == 0) {
+        int sum = 0;
+        for (int i = 0; i < 256; ++i) {
+          sum += tile[i];
+        }
+        out[blockIdx.x] = sum;
+      }
+    }
+
+  如果去掉 __syncthreads()：
+    · thread 0 可能在其他线程还没完成 wait_group 前就读取 tile[i]。
+    · 即使 thread 0 自己 wait_group 0 已完成，也只说明 thread 0 自己发出的 cp.async 完成。
+
+
+================================================================================
+十、边界处理：src-size / zero-fill 思路
+================================================================================
+
+  cp.async 支持可选的 src-size 参数。它表示实际从 src 复制多少字节；当 src-size 小于
+  cp-size 时，dst 剩余字节会被填 0。
+
+  用途：
+    · tile 最后一段不满 16B。
+    · 想避免读取 global 越界。
+    · shared 中未覆盖的字节希望清零。
+
+  概念写法：
+
+    if (valid_bytes == 16) {
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 16;\n"
+          :
+          : "r"(smem), "l"(glob_ptr));
+    } else {
+      // valid_bytes 应在 0..15；剩余字节 zero-fill。
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+          :
+          : "r"(smem), "l"(glob_ptr), "r"(valid_bytes));
+    }
+
+  注意：
+    · src-size 大于 cp-size 是错误语义。
+    · full copy 时通常直接用无 src-size 版本。
+    · 这只处理 global 读取边界；shared 目标地址仍然不能越过已分配 shared memory。
+
+
+================================================================================
+十一、双缓冲流水线：wait_group 1 的典型直觉
+================================================================================
+
+  双缓冲目标：
+
+    buffer 0：当前正在计算
+    buffer 1：下一块正在 cp.async 搬运
+
+  简化伪代码：
+
+    // 预取 tile 0
+    cp.async tile0 -> smem_buffer0
+    cp.async.commit_group
+
+    // 预取 tile 1
+    cp.async tile1 -> smem_buffer1
+    cp.async.commit_group
+
+    // 允许最新 1 个 group 继续 pending，等待更老 group 完成。
+    cp.async.wait_group 1
+    __syncthreads()
+
+    compute smem_buffer0
+
+    __syncthreads()
+
+    // 后续循环中继续预取 tile 2，同时计算 tile 1。
+
+  这里 wait_group 1 的直觉：
+    · group 0 是更老 group，需要完成，因为马上要算 tile 0。
+    · group 1 是最新 group，可以还在飞，因为 tile 1 稍后才用。
+
+  为什么这里仍然出现 __syncthreads：
+    · tile0 是整个 block 共同消费的 shared tile。
+    · wait_group 1 只保证当前线程自己的更老 group 完成。
+    · block 内所有线程都要完成各自对 tile0 的搬运后，才能共同计算 tile0。
+
+  上面其实有两个不同目的的 __syncthreads：
+
+    1. compute smem_buffer0 之前的 __syncthreads()
+
+       cp.async.wait_group 1;
+       __syncthreads();
+       compute smem_buffer0;
+
+       作用是保证整个 block 都已经完成 tile0 的准备工作。
+       wait_group 1 只说明"当前线程自己的 group 0 已完成"；
+       __syncthreads() 进一步保证所有线程都走到这里。
+       如果 compute 会读取其他线程搬进 smem_buffer0 的数据，这个 barrier 通常必须有。
+
+    2. compute smem_buffer0 之后的 __syncthreads()
+
+       compute smem_buffer0;
+       __syncthreads();
+
+       作用是保护 shared buffer 的生命周期：所有线程都必须先读完 / 用完
+       smem_buffer0，后续循环才能把 smem_buffer0 复用给 tile2。
+
+       如果没有这个 barrier，可能出现：
+
+         thread 0 已经算完 tile0，开始 cp.async tile2 -> smem_buffer0
+         thread 7 还没算完 tile0，仍然在读 smem_buffer0
+
+       这时 thread 0 会提前覆盖 smem_buffer0，thread 7 读到的就可能不再是 tile0。
+       所以 compute 之后的 barrier 不是为了等待 cp.async 完成，而是为了防止
+       shared buffer 在其他线程还没消费完时被下一轮写入覆盖。
+
+  真正高性能双缓冲还需要处理：
+
+    1. shared buffer 复用前的同步
+
+       双缓冲通常是：
+
+         smem_buffer0 存 tile0、tile2、tile4 ...
+         smem_buffer1 存 tile1、tile3、tile5 ...
+
+       也就是说，同一个 shared buffer 会被隔一轮复用。复用前必须确认：
+
+         · 上一轮读这个 buffer 的线程都已经读完。
+         · 下一轮写这个 buffer 的线程不会提前覆盖旧数据。
+
+       对 block 共同消费的 tile，常见做法是在 compute 之后加：
+
+         __syncthreads();
+
+       这个 barrier 不是等待 cp.async 完成，而是保证所有线程都结束了对旧 tile 的消费，
+       然后下一轮才可以把同一块 buffer 用作新的 cp.async 目标。
+
+    2. 边界 tile
+
+       最后一块 tile 经常不满。例如每个 tile 搬 16B，但剩余有效数据只有 4B、8B
+       或者更少。此时不能盲目执行：
+
+         cp.async.ca.shared.global [s], [g], 16;
+
+       否则可能从 global 越界读取，或者把无效数据当成有效数据计算。
+
+       常见处理方式：
+
+         · 保证输入张量提前 padding 到 tile 大小。
+         · 对满 tile 使用 16B cp.async。
+         · 对尾部不满 tile 使用带 src-size 的 cp.async，让剩余字节之外 zero-fill。
+         · 或者尾部回退普通 load/store，并显式写 0。
+
+       边界处理不仅影响正确性，也影响流水线形态：尾部 tile 可能需要单独分支，避免
+       破坏主循环里规整的预取/计算节奏。
+
+    3. 每个线程负责哪些元素
+
+       双缓冲不是只写两个 shared 数组就能变快，还要设计线程到数据的映射。例如：
+
+         · 每个线程搬 4B、8B 还是 16B。
+         · 一个 warp 搬连续地址，还是跨 stride 搬。
+         · 每个线程搬进 shared 的位置，后续是否由自己消费，还是被整个 block 共同消费。
+         · 每个线程计算多少元素，计算量是否足够覆盖下一块 tile 的 cp.async 延迟。
+
+       如果每个线程只搬很少数据、后续计算也很短，cp.async 还没来得及被计算隐藏，
+       额外的 shared memory 中转和同步可能反而更慢。
+
+       对本项目这类 per-head / per-token kernel，需要特别区分：
+
+         · QKV 是否只是线程私有数据。
+         · cos/sin 或 weight 是否会被多个线程或多个 head 复用。
+         · shared memory 中转是否真的减少 global load，还是只是多了一次 shared load。
+
+    4. bank conflict 和 global memory coalescing
+
+       global memory 侧要尽量合并访问：
+
+         · 同一个 warp 的线程最好访问连续、对齐的 global 地址。
+         · 16B cp.async 最好让源地址满足 16B 对齐。
+         · 避免每个线程访问很分散的地址，否则 HBM transaction 效率会变差。
+
+       shared memory 侧要避免严重 bank conflict：
+
+         · shared memory 被划分为 bank。
+         · 如果同一 warp 多个线程同时访问落在同一 bank 的不同地址，访问会被拆分。
+         · 常见办法是调整 shared layout、加 padding、改变 `[row][col]` 的排列。
+
+       所以 shared tile 的布局要同时满足两边：
+
+         · 写入时：global -> shared 的地址连续、对齐、适合 cp.async。
+         · 读取时：compute 阶段访问 shared 不产生严重 bank conflict。
+
+       有时为了 compute 阶段读 shared 更顺，会牺牲一点写入布局；也有时为了 cp.async
+       更规整，会在 shared 中做 padding。这个需要结合实际访问模式取舍。
+
+    5. occupancy 与 register/shared memory 占用
+
+       双缓冲会增加资源占用：
+
+         · shared memory 至少需要两份 tile buffer。
+         · 还可能需要 padding、临时变量、索引、指针、循环状态。
+         · 为了展开流水线，寄存器里通常还要保存 current/next 的地址和中间计算值。
+
+       资源占用变大后，一个 SM 上能同时驻留的 block/warp 数可能下降，也就是 occupancy
+       下降。occupancy 下降不一定坏，因为更好的流水线可能减少等待；但如果下降太多，
+       GPU 可能没有足够 warp 去隐藏延迟。
+
+       因此双缓冲是否更快，需要同时看：
+
+         · cp.async 是否真的和计算重叠。
+         · 每个 tile 的计算量是否足够长。
+         · shared memory 占用是否把可驻留 block 数压得太低。
+         · register 数是否导致 occupancy 下降或 spill。
+         · 减少的 global memory stall 是否大于新增的 shared load/store 和同步成本。
+
+       实践上通常需要 benchmark 比较：
+
+         · 直接 global -> register。
+         · 单 buffer global -> shared -> register。
+         · 双 buffer cp.async + shared -> register。
+         · 只把可复用数据放 shared，线程私有数据直接进 register。
+
+
+================================================================================
+十二、和 __syncthreads 的关系速查
+================================================================================
+
+  ┌────────────────────────────────────────┬──────────────────────────────────────┐
+  │ 操作                                   │ 保证什么                             │
+  ├────────────────────────────────────────┼──────────────────────────────────────┤
+  │ cp.async                               │ 发起当前线程的异步 global->shared 拷贝 │
+  │ cp.async.commit_group                  │ 把当前线程未提交的 cp.async 收成 group │
+  │ cp.async.wait_group 0                  │ 当前线程此前提交的 group 全部完成      │
+  │ cp.async.wait_group 1                  │ 当前线程允许最新 1 个 group 仍 pending │
+  │ cp.async.wait_all                      │ 当前线程等待所有 prior cp.async 完成   │
+  │ __syncthreads()                        │ block 内线程都到达 barrier            │
+  │ __syncthreads() 单独使用               │ 不保证 cp.async 已完成                │
+  │ wait_group 单独使用                    │ 不等待其他线程的 cp.async             │
+  │ wait_group + __syncthreads             │ 常用于 block 共同消费 shared tile 前   │
+  └────────────────────────────────────────┴──────────────────────────────────────┘
+
+  最重要的两句话：
+
+    cp.async.wait_group 解决"异步拷贝完成了吗"。
+    __syncthreads() 解决"其他线程也走到这里了吗"。
+
+
+================================================================================
+十三、常见错误
+================================================================================
+
+  错误 1：以为 __syncthreads 等待 cp.async 完成
+
+    cp.async ...;
+    cp.async.commit_group;
+    __syncthreads();       // 错：这不是 cp.async completion wait
+    use_smem();
+
+  正确：
+
+    cp.async ...;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    __syncthreads();
+    use_smem();
+
+
+  错误 2：以为 wait_group 等待整个 block
+
+    cp.async ...;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    use_smem_written_by_other_threads();  // 可能不安全
+
+  正确：
+
+    cp.async ...;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    __syncthreads();
+    use_smem_written_by_other_threads();
+
+
+  错误 3：把 CUDA C++ shared 指针直接传给 cp.async
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "l"(&smem[0]), "l"(gmem));  // 错
+
+  正确：
+
+    uint32_t saddr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&smem[0]));
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(saddr), "l"(gmem));
+
+
+  错误 4：同一个 group 内多条 cp.async 写同一 shared 地址
+
+    cp.async [s], [g0], 16;
+    cp.async [s], [g1], 16;
+    cp.async.commit_group;
+
+  问题：
+    · 同一个 group 内没有顺序保证。
+    · 多条 cp.async 写同一目的地址没有可靠结果。
+
+
+  错误 5：16B 拷贝没有处理边界
+
+    cp.async.cg.shared.global [saddr], [gptr], 16;  // gptr 可能只剩 4 字节有效
+
+  应处理：
+    · global 读取边界。
+    · shared 写入边界。
+    · 对齐要求。
+    · 不满 16B 时是否用 src-size/zero-fill 或回退普通 load/store。
+
+
+
+
+
+
+================================================================================
+参考
+================================================================================
+
+  · NVIDIA PTX ISA: Data Movement and Conversion Instructions: cp.async
+    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+
+  关键点：
+    · cp.async 支持 global -> shared，cp-size 常用 4/8/16。
+    · cp.async.commit_group 将当前线程此前未提交的 cp.async 收成 per-thread group。
+    · cp.async.wait_group N 中 N 是整数常量；N=0 表示等待此前 group 全部完成。
+    · wait_group / wait_all 只为 cp.async 提供完成与可见性，不替代其他内存操作同步。

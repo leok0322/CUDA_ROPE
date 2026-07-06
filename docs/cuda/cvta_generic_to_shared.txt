@@ -1,0 +1,502 @@
+================================================================================
+__cvta_generic_to_shared 用法解析：CUDA C++ 指针到 PTX shared 地址的转换
+================================================================================
+
+核心一句话：
+  · __cvta_generic_to_shared(ptr) 把一个指向 shared memory 的 CUDA C++ 指针表达
+    转成 PTX shared 地址空间内部的地址值。
+  · 普通 CUDA C++ 读写 shared memory 时通常不需要它；编译器会自己生成 ld.shared /
+    st.shared。
+  · 手写需要 shared 地址操作数的 PTX 指令时才常用它，最典型就是
+    cp.async.*.shared.global。
+  · 对 cp.async 来说，global 源地址通常按 64-bit global/device pointer 传入；
+    shared 目标地址通常要转成 32-bit shared 地址/offset 后用 "r" 约束传入。
+
+
+================================================================================
+一、为什么需要这个 intrinsic
+================================================================================
+
+  CUDA C++ 里可以把 shared memory 当普通指针表达式使用：
+
+    __shared__ float smem[256];
+    float* p = &smem[threadIdx.x];
+    p[0] = 1.0f;
+
+  这里的 p 是 CUDA C++ 层面的指针表达。现代 CUDA 中，设备端普通指针经常按
+  generic pointer 表示，可能是 64-bit 形式；它能表达 global/shared/local 等不同
+  地址空间。
+
+  但 PTX 指令有自己的地址空间要求。例如：
+
+    cp.async.ca.shared.global [dst_smem], [src_gmem], 16;
+
+  这条指令的两个操作数不是同一种地址：
+    · dst_smem：shared 地址空间里的地址，通常放在 32-bit register 中。
+    · src_gmem：global 地址空间里的地址，通常是 64-bit device/global pointer。
+
+  所以，当 dst 来自 CUDA C++ 的 shared 指针时，需要显式转换：
+
+    uint32_t dst =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+  概念上：
+
+    smem_ptr = CUDA C++ 指针/generic pointer，表达"指向 shared memory"
+    dst      = PTX shared 地址空间内部的地址/offset，给 shared 专用指令使用
+
+  二者描述的是同一个 shared memory 位置，但表达形式不同。
+
+
+================================================================================
+二、基本用法
+================================================================================
+
+  典型写法：
+
+    __shared__ int smem[128];
+
+    int* p = &smem[threadIdx.x];
+    uint32_t saddr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(p));
+
+  注意：
+    · 传入参数必须实际指向 shared memory。
+    · 不要把 global pointer / local pointer / host pointer 传给它。
+    · 不要自己用 reinterpret_cast 或减固定 base 来推导 shared offset。
+    · __cvta_generic_to_shared 只做地址空间表示转换，不会搬运数据，也不会同步线程。
+
+  对普通 shared memory 访问，不需要写它：
+
+    __shared__ int smem[128];
+    smem[threadIdx.x] = threadIdx.x;  // 编译器自己生成 shared store
+    int x = smem[0];                  // 编译器自己生成 shared load
+
+  只有当你手写 PTX，且 PTX 指令明确要求 shared 地址操作数时，才需要手动转换。
+
+
+================================================================================
+三、返回类型：size_t，但 cp.async 常转成 uint32_t
+================================================================================
+
+  __cvta_generic_to_shared(ptr) 的 C++ 返回类型是 size_t：
+
+    size_t raw =
+        __cvta_generic_to_shared(smem_ptr);
+
+  size_t 是 C/C++ 标准库里的无符号整数类型，通常用来表示对象大小、字节数、数组长度等。
+  它的位宽取决于平台 / ABI：
+
+    64-bit 平台：size_t 通常是 64-bit unsigned integer，sizeof(size_t) == 8
+    32-bit 平台：size_t 通常是 32-bit unsigned integer，sizeof(size_t) == 4
+
+  在常见 64 位 Linux / x86-64 / CUDA host 编译环境下，size_t 通常就是 64-bit 无符号
+  整数。但这里不要只按"整数大小"理解它；对 __cvta_generic_to_shared 来说，这个返回值
+  的语义是：
+
+    shared memory 地址空间内部的地址/offset
+
+  所以常见 cp.async 写法会再转成 uint32_t：
+
+    uint32_t dst =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(dst), "l"(glob_ptr));
+
+  原因：
+    · intrinsic 返回 size_t，是 CUDA C++ 层面的返回类型。
+    · cp.async 的 shared 目标操作数通常要求 shared 地址空间里的 32-bit 地址。
+    · 内联 PTX 里 "r"(dst) 表示把 dst 放进 32-bit register。
+    · global 源地址 glob_ptr 仍然是 64-bit device/global pointer，通常用 "l" 约束。
+
+  因此可以记成：
+
+    __cvta_generic_to_shared 返回类型：size_t
+    返回值语义：shared 地址空间内部地址/offset
+    cp.async 常用形式：static_cast<uint32_t>(...) 后用 "r" 传入
+
+
+================================================================================
+四、适用范围：device 代码 + shared memory 指针
+================================================================================
+
+  __cvta_generic_to_shared 是设备端地址转换 intrinsic，应该出现在 device 代码路径里：
+
+    __global__ kernel 内部
+    __device__ 函数内部
+    __host__ __device__ 函数的 device 分支内部
+
+  如果同一段代码也会被 host 趟解析，通常要用 __CUDA_ARCH__ 把它保护起来：
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t dst =
+          static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                   :
+                   : "r"(dst), "l"(gmem_ptr));
+    #endif
+
+  适合传入的地址：
+    · 静态 shared memory：__shared__ T smem[N]; 里的 &smem[i]
+    · 动态 shared memory：extern __shared__ unsigned char smem[]; 里的 smem + offset
+    · 明确指向 shared memory 的 helper 参数，例如 void* smem_ptr
+
+  不适合传入的地址：
+    · cudaMalloc 得到的 global/HBM 地址
+    · 普通 local memory 地址
+    · host 指针
+    · 不确定地址空间的任意 void*
+
+
+
+================================================================================
+五、例子1：cp.async 把 global 数据异步搬到 shared
+================================================================================
+
+  动态 shared memory 也一样，只要指针实际指向当前 block 的 shared memory，就可以转换。
+
+    __global__ void copy_dynamic_smem(const int* gmem, int* out) {
+      extern __shared__ unsigned char raw_smem[];
+
+      int* smem = reinterpret_cast<int*>(raw_smem);
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t dst =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&smem[threadIdx.x]));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 4;\n"
+          :
+          : "r"(dst), "l"(&gmem[threadIdx.x]));
+
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+      __syncthreads();
+    #else
+      smem[threadIdx.x] = gmem[threadIdx.x];
+      __syncthreads();
+    #endif
+
+      out[threadIdx.x] = smem[threadIdx.x];
+    }
+
+  启动时第三个 kernel launch 参数给动态 shared memory 字节数：
+
+    copy_dynamic_smem<<<grid, block, sizeof(int) * block.x>>>(gmem, out);
+
+  这里 raw_smem / smem 都指向 shared memory；区别只是 C++ 类型不同。
+  __cvta_generic_to_shared 关心的是地址空间，不关心你把它解释成 unsigned char*、
+  int* 还是 float*。
+
+
+================================================================================
+六、例子 2：封装成项目里常见的 helper
+================================================================================
+
+  本项目 src/inference/async_util.cuh 里就是这种模式：
+
+    __device__ __forceinline__ void cp_async_shared_global_16_cg(
+        void* smem_ptr, const void* glob_ptr) {
+    #if defined(USE_ROCM)
+      *reinterpret_cast<int4*>(smem_ptr) =
+          *reinterpret_cast<const int4*>(glob_ptr);
+    #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t smem =
+          static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                   :
+                   : "r"(smem), "l"(glob_ptr));
+    #elif defined(__CUDA_ARCH__)
+      *reinterpret_cast<int4*>(smem_ptr) =
+          *reinterpret_cast<const int4*>(glob_ptr);
+    #else
+      (void)smem_ptr;
+      (void)glob_ptr;
+    #endif
+    }
+
+  这个封装里有三层分支：
+    · ROCm：没有 NVIDIA cp.async，退回普通 load/store。
+    · CUDA sm_80+：使用 cp.async，并用 __cvta_generic_to_shared 转 shared 目标地址。
+    · CUDA sm_80 以下：没有 cp.async，退回普通 load/store。
+
+  为什么 helper 参数用 void*：
+    · 调用者可以传 &smem[i]、reinterpret_cast 后的 shared buffer 等不同类型。
+    · helper 内部只关心"这是 shared memory 的目标地址"。
+    · 真正传给 cp.async 前，再统一转成 PTX shared 地址。
+
+
+================================================================================
+七、例子 3：按线程拷贝 16 字节 tile
+================================================================================
+
+  cp.async 常见粒度是 4/8/16 字节；16 字节拷贝通常要求地址按 16 字节对齐，实际项目里
+  常配合 int4、float4 或对齐后的 shared buffer 使用。
+
+    __global__ void copy_tile_16B(const int4* gmem, int4* out) {
+      __shared__ int4 tile[256];
+
+      int tid = threadIdx.x;
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t dst =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&tile[tid]));
+
+      asm volatile(
+          "cp.async.cg.shared.global [%0], [%1], 16;\n"
+          :
+          : "r"(dst), "l"(&gmem[tid]));
+
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+      __syncthreads();
+    #else
+      tile[tid] = gmem[tid];
+      __syncthreads();
+    #endif
+
+      out[tid] = tile[tid];
+    }
+
+  这里：
+    · &tile[tid] 指向 shared memory，必须转换后才能作为 cp.async 的 shared dst。
+    · &gmem[tid] 指向 global memory，不做 __cvta_generic_to_shared。
+    · 16 字节粒度更适合向量化搬运，但要注意对齐和越界。
+
+
+================================================================================
+九、常见错误
+================================================================================
+
+  错误 1：把 shared 指针直接传给 cp.async 的 shared 操作数
+
+    __shared__ int smem[1];
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "l"(&smem[0]), "l"(&gmem[0]));  // 错
+
+  问题：
+    · &smem[0] 是 CUDA C++ 指针表达，不是 PTX shared 地址空间内部的 32-bit 地址。
+    · "l" 还会按 64-bit 操作数传入，和 cp.async shared dst 的常见要求不匹配。
+
+  正确写法：
+
+    uint32_t dst =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&smem[0]));
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :
+        : "r"(dst), "l"(&gmem[0]));
+
+
+  错误 2：把 global pointer 转成 shared 地址
+
+    uint32_t bad =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&gmem[0]));  // 错
+
+  问题：
+    · gmem 指向 global/HBM，不是 shared memory。
+    · __cvta_generic_to_shared 只适合用于实际指向 shared memory 的地址。
+
+
+  错误 3：以为转换会做同步或拷贝
+
+    uint32_t dst =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&smem[0]));
+
+  这行只是算出 shared 地址表示。它不会：
+    · 从 global 搬数据；
+    · 等待 cp.async 完成；
+    · 让其他线程看见 shared memory 写入。
+
+  数据搬运和同步仍然要靠 cp.async、commit_group、wait_group、__syncthreads 等操作完成。
+
+
+================================================================================
+十、和其他地址转换 intrinsic 的关系
+================================================================================
+
+  __cvta_generic_to_shared 属于"generic pointer -> 指定地址空间地址"这一类 intrinsic。
+  相关概念还有：
+
+    __cvta_generic_to_global(ptr)
+    __cvta_generic_to_local(ptr)
+    __cvta_generic_to_constant(ptr)
+
+  选择哪个 intrinsic 取决于 ptr 实际指向哪个 CUDA 地址空间。
+
+  它们和下面这种写法不是同一个语义：
+
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+
+  区别：
+
+    · reinterpret_cast<uintptr_t>(ptr)
+      只是把 CUDA C++ 指针变量里保存的地址值当成整数看。
+      它不做地址空间转换，不检查 ptr 实际来自 global / shared / local / constant。
+
+    · __cvta_generic_to_xxx(ptr)
+      是 CUDA 地址空间转换 intrinsic，语义是把 generic pointer 转成指定地址空间
+      的地址表示。例如 __cvta_generic_to_shared(ptr) 得到的是 shared 地址空间里的
+      地址/offset，而不是普通 64-bit C++ 指针整数。
+
+  什么时候两者结果可能一致：
+
+    1. ptr 本来就是 global memory pointer，并且目标指令也需要 64-bit global 地址。
+
+       例如 kernel 参数里的 gmem 指针：
+
+         __global__ void kernel(const float* gmem) {
+           auto a = reinterpret_cast<uintptr_t>(gmem);
+           auto b = __cvta_generic_to_global(gmem);
+         }
+
+       在常见 CUDA 设备代码里，global pointer 本身就是 64-bit global/device 地址。
+       因此 a 和 b 的数值通常可能相同，或者至少都可以作为 global 地址传给
+       ld.global / cp.async 的 global 源操作数。
+
+       所以 cp.async 的 global 源地址一般直接写：
+
+         "l"(gmem)
+
+       或显式写成：
+
+         auto glob_addr = reinterpret_cast<uintptr_t>(gmem);
+         "l"(glob_addr)
+
+       通常不需要额外调用 __cvta_generic_to_global(gmem)。
+
+    2. 编译器已经能静态确定 ptr 是目标地址空间指针。
+
+       这时 __cvta_generic_to_global(ptr) 这类转换可能被编译器优化成 no-op，
+       最终机器层面看起来和指针整数转换没有区别。但这只是实现结果相同，
+       不是 C++ 语义完全相同。
+
+  什么时候两者结果通常不一致，或者不能互相替代：
+
+    先区分两个概念：
+
+      · 物理存储位置：数据最终可能在 HBM/DRAM、shared SRAM、constant cache 等硬件中。
+      · PTX 地址空间语义：global / shared / local / constant 是不同的逻辑地址空间，
+        对应不同指令，例如 ld.global / ld.shared / ld.local / ld.const。
+
+    local memory 和 constant memory 的底层存储很多情况下也可能来自 HBM/DRAM，
+    地址值也可能是 64-bit；但这不等于它们就是 global 地址空间。64-bit 只说明
+    "装地址的寄存器宽度"，不说明这个地址应该被哪一种 PTX 地址空间指令解释。
+
+    1. shared memory pointer
+
+       例如：
+
+         __shared__ float smem[256];
+
+         auto a = reinterpret_cast<uintptr_t>(&smem[0]);
+         auto b = __cvta_generic_to_shared(&smem[0]);
+
+       a 是 CUDA C++ generic pointer 的整数表示；
+       b 是 PTX shared 地址空间里的地址/offset。
+
+       对 cp.async 的 shared 目标地址，需要的是 b，并且常转成 uint32_t：
+
+         uint32_t saddr =
+             static_cast<uint32_t>(__cvta_generic_to_shared(&smem[0]));
+
+       不能用 reinterpret_cast<uintptr_t>(&smem[0]) 代替。
+
+    2. local memory pointer
+
+       local memory 是每个线程私有的地址空间。对局部数组、寄存器溢出到 local memory
+       的对象，如果要手写 local 地址空间 PTX，应该使用：
+
+         __cvta_generic_to_local(ptr)
+
+       reinterpret_cast<uintptr_t>(ptr) 只是 generic pointer 的整数值，不一定等于
+       local 地址空间指令期望的 local 地址表示。
+
+       注意：local memory 物理上可能落在 HBM/DRAM，但语义上仍然是 per-thread 私有
+       地址空间。不同线程里的 local 地址不能简单当成普通 global 地址互相访问。
+       如果手写的是 ld.local / st.local 这类 local 地址空间指令，就应该给它 local
+       地址空间表示，而不是把 generic pointer 的整数值当成 global 地址。
+       __cvta_generic_to_local(ptr) 的返回类型也是 size_t；在 64-bit CUDA 设备代码里，
+       这个值通常可以看作 64-bit 宽度的地址值。但它的语义仍然是 local address-space
+       address，不是普通 global/HBM 地址。位宽可能一样，地址空间解释不同。
+
+    3. constant memory pointer
+
+       如果 ptr 实际指向 __constant__ memory，并且你要手写 constant 地址空间相关 PTX，
+       应该使用：
+
+         __cvta_generic_to_constant(ptr)
+
+       reinterpret_cast<uintptr_t>(ptr) 不能表达"把 generic pointer 转成 constant
+       地址空间地址"这个语义。
+
+       注意：constant memory 的数据也可能最终存在 device memory 中，但访问语义是
+       read-only、走 constant 地址空间和相关 cache/broadcast 路径。手写 ld.const
+       这类指令时，应使用 constant 地址空间表示，而不是假设"反正都在 HBM，所以等价
+       于 global pointer"。
+
+    4. ptr 的实际地址空间和 intrinsic 不匹配
+
+       例如把 shared pointer 传给 __cvta_generic_to_global(ptr)，或者把 global pointer
+       传给 __cvta_generic_to_shared(ptr)，语义就是错的。转换函数不会替你搬数据，
+       也不会把一块内存从一个地址空间变成另一个地址空间。
+
+       "地址空间不匹配"指的是：ptr 实际来自一种 CUDA 地址空间，却用另一种地址空间的
+       cvta intrinsic 或 PTX 指令去解释它。例如：
+
+         __shared__ float smem[256];
+         auto bad = __cvta_generic_to_global(&smem[0]);  // 错：shared 不是 global
+
+         float local_arr[16];
+         auto bad2 = __cvta_generic_to_global(&local_arr[0]);  // 错：local 不是 global
+
+       即使某个地址值看起来是 64-bit，也不能说明它可以被 ld.global、ld.local、
+       ld.const、ld.shared 任意一种指令正确解释。
+
+  速记：
+
+    · 只是要把 global pointer 作为 64-bit 地址传给 cp.async 的 global 源操作数：
+      直接 "l"(ptr) 或 reinterpret_cast<uintptr_t>(ptr) 通常就够。
+    · 要把 shared/local/constant generic pointer 传给对应地址空间的 PTX 操作数：
+      使用对应的 __cvta_generic_to_xxx(ptr)。
+    · 数值偶尔相同不代表语义等价；手写 inline PTX 时应该按指令要求的地址空间来选。
+
+  对本文最常见场景：
+
+    global -> shared 的 cp.async:
+      · global 源地址：直接传 global pointer，内联 PTX 常用 "l"。
+      · shared 目标地址：用 __cvta_generic_to_shared 转换，内联 PTX 常用 "r"。
+
+
+================================================================================
+十一、速查表
+================================================================================
+
+  ┌──────────────────────────────────────┬──────────────────────────────────────┐
+  │ 场景                                  │ 是否需要 __cvta_generic_to_shared    │
+  ├──────────────────────────────────────┼──────────────────────────────────────┤
+  │ smem[i] = x                           │ 不需要，编译器处理 shared store      │
+  │ x = smem[i]                           │ 不需要，编译器处理 shared load       │
+  │ extern __shared__ 的 smem + offset      │ 需要，若作为 PTX shared 地址操作数   │
+  │ 普通 C++ 函数里传递 shared 指针        │ 通常不需要                           │
+  │ 手写 ld.shared / st.shared PTX         │ 需要，若操作数要求 shared 地址       │
+  │ 手写 cp.async.*.shared.global          │ 需要，目标 shared 地址要转换         │
+  │ global pointer 作为 cp.async 源地址    │ 不用这个 intrinsic                   │
+  │ host pointer                           │ 不能用于这个 intrinsic               │
+  └──────────────────────────────────────┴──────────────────────────────────────┘
+
+
+================================================================================
+十二、最容易记住的三句话
+================================================================================
+
+  1. CUDA C++ 的 shared 指针不等于 cp.async 要的 shared 地址操作数。
+  2. cp.async 的 shared 目标地址用 __cvta_generic_to_shared 转，global 源地址不要转。
+  3. __cvta_generic_to_shared 只转换地址表示，不搬数据、不同步、不保证可见性。
