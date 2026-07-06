@@ -278,6 +278,15 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
 
     cp.async.wait_group N;
 
+  这里的 N 不能省略。也就是说：
+
+    cp.async.wait_group;      // 错：不是默认 N = 0，而是语法不完整
+    cp.async.wait_group 0;    // 对：等待当前线程此前提交的所有 group 完成
+    cp.async.wait_all;        // 对：等价于 commit_group + wait_group 0
+
+  如果想表达"等待全部 prior cp.async 完成"，应该显式写 wait_group 0，
+  或直接使用 cp.async.wait_all。
+
   inline PTX：
 
     template <int N>
