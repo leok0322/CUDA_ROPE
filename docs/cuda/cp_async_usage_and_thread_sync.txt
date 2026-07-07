@@ -9,6 +9,8 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
     等待它完成。
   · cp.async.wait_group 等的是"当前执行线程自己提交的 cp.async group"，不是 block 级
     barrier。
+  · 如果 shared memory 后续只在同一个 warp 内被多个 lane 协作读取，通常需要
+    __syncwarp()；如果跨 warp / 跨整个 block 读取，通常需要 __syncthreads()。
   · 如果 shared memory 后续会被 block 内多个线程交叉读取，通常还需要 __syncthreads()。
   · __syncthreads() 不能替代 cp.async.wait_group；它不会保证 cp.async 已完成。
 
@@ -564,6 +566,122 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
 
 
 ================================================================================
+九、什么时候需要 __syncwarp()
+================================================================================
+
+  CUDA 里常用的是 __syncwarp()，不是 __asyncwarp。它是 warp 级同步原语：
+
+    · 等 mask 中指定的 lane 都执行到同一个 __syncwarp(mask)。
+    · 对参与同步的 lane，提供 warp 内 memory ordering。
+    · 同步范围只在一个 warp 内，不会等待其他 warp。
+
+  cp.async 场景下，需要 __syncwarp() 的典型条件是：
+
+    1. shared tile 由同一个 warp 的多个 lane 协作写入。
+    2. wait_group 之后，某些 lane 会读取其他 lane 搬进 shared memory 的数据。
+    3. producer / consumer 都限制在同一个 warp 内，不涉及其他 warp。
+
+  这时常见安全序列是：
+
+    cp.async.ca.shared.global ...;   // 每个 lane 搬自己负责的一段
+    cp.async.commit_group;
+    cp.async.wait_group 0;           // 每个 lane 等自己发出的 cp.async 完成
+    __syncwarp();                    // warp 内 lane 对齐
+
+    // 现在同一个 warp 内可以读取其他 lane 搬进来的 shared 数据。
+
+  注意这里两个同步解决的是不同问题：
+
+    · cp.async.wait_group 0：
+      当前 lane 等"自己"提交的 cp.async group 完成。
+
+    · __syncwarp()：
+      等同一个 warp 内其他 lane 也完成 wait_group，并让这些 lane 的 shared memory
+      写入对彼此可见。
+
+  示例：每个 lane 搬一个元素，lane 0 汇总本 warp 的 32 个元素。
+  为了突出同步关系，下面假设 blockDim.x 是 32 的整数倍，且 dynamic shared memory
+  至少分配 blockDim.x * sizeof(float) 字节。
+
+    __global__ void warp_sum_after_async_copy(const float* gmem, float* out) {
+      extern __shared__ __align__(16) unsigned char smem_bytes[];
+      float* tile = reinterpret_cast<float*>(smem_bytes);
+
+      int tid = threadIdx.x;
+      int lane = tid & 31;
+      int warp_id = tid >> 5;
+      int warp_base = warp_id * 32;
+
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      uint32_t saddr =
+          static_cast<uint32_t>(__cvta_generic_to_shared(&tile[warp_base + lane]));
+
+      asm volatile(
+          "cp.async.ca.shared.global [%0], [%1], 4;\n"
+          :
+          : "r"(saddr), "l"(&gmem[blockIdx.x * blockDim.x + tid]));
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+    #else
+      tile[warp_base + lane] = gmem[blockIdx.x * blockDim.x + tid];
+    #endif
+
+      // 只需要 warp 内同步：lane 0 只读取同一个 warp 其他 lane 写入的数据。
+      __syncwarp();
+
+      if (lane == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+          sum += tile[warp_base + i];
+        }
+        out[blockIdx.x * (blockDim.x / 32) + warp_id] = sum;
+      }
+    }
+
+  这个例子里，如果把 __syncwarp() 去掉，lane 0 可能在其他 lane 尚未执行完
+  wait_group 0 时读取 tile[warp_base + i]。即使 lane 0 自己的 wait_group 0 已经返回，
+  也只说明 lane 0 自己发出的 cp.async 完成，不说明其他 lane 的 cp.async 完成。
+
+  什么时候 __syncwarp() 足够，而不需要 __syncthreads()：
+
+    · producer 和 consumer 都在同一个 warp 内。
+    · shared buffer 不会被其他 warp 读取。
+    · shared buffer 的复用也只由这个 warp 自己控制。
+
+  什么时候必须用 __syncthreads()：
+
+    · 一个 warp 会读取另一个 warp 搬进 shared memory 的数据。
+    · shared tile 是 block 级共同消费的数据。
+    · shared buffer 会被不同 warp 轮流复用，需要保证整个 block 都完成上一轮消费。
+
+  什么时候连 __syncwarp() 也可以不加：
+
+    · 每个 lane 只读取自己发起 cp.async 写入的 shared 地址。
+    · 不存在 peer lane 之间的 shared memory 读写依赖。
+    · shared buffer 不会被其他 lane 提前覆盖。
+
+  mask 版本：
+
+    unsigned mask = __ballot_sync(0xffffffffu, participate);
+    if (participate) {
+      // participating lanes 发起 cp.async / wait_group ...
+      __syncwarp(mask);
+    }
+
+  __syncwarp(mask) 只同步 mask 中的 lane。mask 中列出的 lane 都必须执行到同一个
+  __syncwarp(mask)。如果只有部分 lane 参与，应该用正确的 mask；不要让只有部分 lane
+  进入 __syncwarp(0xffffffffu)。
+
+  "warp 天然同步"不能替代 __syncwarp()：
+
+    · Volta 及之后架构支持 independent thread scheduling，同一个 warp 内的 lane 在
+      分支、stall、memory latency 下不能被当成严格 lockstep 的程序语义来依赖。
+    · cp.async 本身是异步拷贝，wait_group 又是 per-thread / per-lane 的等待。
+    · 一旦同一个 warp 内出现"某个 lane 读其他 lane 写入的 shared 数据"，就应该显式
+      写出 __syncwarp()，让依赖关系清楚且正确。
+
+
+================================================================================
 十、边界处理：src-size / zero-fill 思路
 ================================================================================
 
@@ -773,7 +891,7 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
 
 
 ================================================================================
-十二、和 __syncthreads 的关系速查
+十二、和 __syncwarp / __syncthreads 的关系速查
 ================================================================================
 
   ┌────────────────────────────────────────┬──────────────────────────────────────┐
@@ -784,16 +902,19 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
   │ cp.async.wait_group 0                  │ 当前线程此前提交的 group 全部完成      │
   │ cp.async.wait_group 1                  │ 当前线程允许最新 1 个 group 仍 pending │
   │ cp.async.wait_all                      │ 当前线程等待所有 prior cp.async 完成   │
+  │ __syncwarp(mask)                       │ mask 内 warp lanes 都到达 barrier      │
   │ __syncthreads()                        │ block 内线程都到达 barrier            │
   │ __syncthreads() 单独使用               │ 不保证 cp.async 已完成                │
   │ wait_group 单独使用                    │ 不等待其他线程的 cp.async             │
+  │ wait_group + __syncwarp                │ 常用于 warp 内共同消费 shared tile 前  │
   │ wait_group + __syncthreads             │ 常用于 block 共同消费 shared tile 前   │
   └────────────────────────────────────────┴──────────────────────────────────────┘
 
-  最重要的两句话：
+  最重要的三句话：
 
     cp.async.wait_group 解决"异步拷贝完成了吗"。
-    __syncthreads() 解决"其他线程也走到这里了吗"。
+    __syncwarp() 解决"同一个 warp 的其他 lane 也走到这里了吗"。
+    __syncthreads() 解决"整个 block 的其他线程也走到这里了吗"。
 
 
 ================================================================================
@@ -832,7 +953,23 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
     use_smem_written_by_other_threads();
 
 
-  错误 3：把 CUDA C++ shared 指针直接传给 cp.async
+  错误 3：以为同一个 warp 内天然不需要 __syncwarp()
+
+    cp.async ...;              // 每个 lane 写 shared tile 的一段
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    use_smem_written_by_peer_lane();  // 可能不安全
+
+  正确：
+
+    cp.async ...;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    __syncwarp();
+    use_smem_written_by_peer_lane();
+
+
+  错误 4：把 CUDA C++ shared 指针直接传给 cp.async
 
     asm volatile(
         "cp.async.ca.shared.global [%0], [%1], 4;\n"
@@ -850,7 +987,7 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
         : "r"(saddr), "l"(gmem));
 
 
-  错误 4：同一个 group 内多条 cp.async 写同一 shared 地址
+  错误 5：同一个 group 内多条 cp.async 写同一 shared 地址
 
     cp.async [s], [g0], 16;
     cp.async [s], [g1], 16;
@@ -861,7 +998,7 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
     · 多条 cp.async 写同一目的地址没有可靠结果。
 
 
-  错误 5：16B 拷贝没有处理边界
+  错误 6：16B 拷贝没有处理边界
 
     cp.async.cg.shared.global [saddr], [gptr], 16;  // gptr 可能只剩 4 字节有效
 

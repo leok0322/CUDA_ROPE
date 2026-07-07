@@ -180,6 +180,88 @@
 
 
 ================================================================================
+四·补、类模板偏特化实战：只固定一部分模板参数
+================================================================================
+
+  类模板偏特化的核心：
+
+    · 主模板先声明完整的参数列表。
+    · 偏特化版本只固定其中一部分参数。
+    · 没固定的参数继续写在 template<...> 里，让编译器匹配时再推导。
+
+  例子：给 packed_as 增加一个 is_scalar 参数，用来区分“标量加载”和“向量化加载”。
+
+    template <typename scalar_t, uint num, bool is_scalar = false>
+    struct packed_as;   // 只声明主模板，不给通用 type
+
+    // 向量化路径：全部参数都定死，是全特化。
+    template <>
+    struct packed_as<float, 4, false> {
+      using type = float4;
+    };
+
+    template <>
+    struct packed_as<float, 2, false> {
+      using type = float2;
+    };
+
+    template <>
+    struct packed_as<float, 1, false> {
+      using type = float;
+    };
+
+    // 标量路径：只固定 num=1、is_scalar=true，scalar_t 仍然开放，是偏特化。
+    template <typename scalar_t>
+    struct packed_as<scalar_t, 1, true> {
+      using type = scalar_t;
+    };
+
+  这条偏特化：
+
+    template <typename scalar_t>
+    struct packed_as<scalar_t, 1, true> { ... };
+
+  含义是：
+
+    · 第 1 个模板参数 scalar_t 不固定，可以是 __half、__nv_bfloat16、float 等。
+    · 第 2 个模板参数固定为 1。
+    · 第 3 个模板参数固定为 true。
+
+  因此：
+
+    packed_as<__half, 1, true>::type          // 匹配偏特化，type = __half
+    packed_as<__nv_bfloat16, 1, true>::type   // 匹配偏特化，type = __nv_bfloat16
+    packed_as<float, 4, false>::type          // 匹配全特化，type = float4
+
+  但这些仍然是非法组合：
+
+    packed_as<float, 8, false>::type          // 没有特化，报“不完整类型”
+    packed_as<__half, 2, true>::type          // 标量分支只允许 num=1
+    packed_as<__half, 1, false>::type         // 向量化分支没有支持 __half 作为 packed 基准类型
+
+  这里主模板故意只声明、不定义：
+
+    template <typename scalar_t, uint num, bool is_scalar = false>
+    struct packed_as;
+
+  不建议写成：
+
+    template <typename scalar_t, uint num, bool is_scalar = false>
+    struct packed_as {
+      using type = scalar_t;
+    };
+
+  原因：
+
+    · 这个通用实现太宽，会让 packed_as<float, 8, false> 这类非法组合悄悄退化成 float。
+    · 原本应该在编译期暴露的错误被掩盖，后面可能变成错误的 load/store 宽度。
+    · trait 常用“主模板只声明 + 合法组合特化”的写法，把它当成编译期白名单。
+
+  如果多个偏特化都能匹配，编译器会用 partial ordering 选择“更特化”的那个。
+  如果分不出谁更特化，就会二义性报错。因此 trait 的偏特化条件应尽量互斥、清楚。
+
+
+================================================================================
 五、函数模板“想偏特化”怎么办：用重载 / 委托类模板 / if constexpr
 ================================================================================
 
