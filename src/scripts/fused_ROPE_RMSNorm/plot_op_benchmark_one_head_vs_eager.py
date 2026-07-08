@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["matplotlib"]
 # ///
-"""把 benchmark_results/python_op_benchmark_result.txt 画成折线图（自定义算子 vs eager）。
+"""把 benchmark_results/ROPE_python_op_benchmark_result_one_head.txt 画成折线图（自定义算子 vs eager）。
 
 数据来源：benchmark_fused_qknorm_rope.py 追加写的结果文件，每次运行一段，行形如：
   [2026-06-28 08:28:03]  repeats=100 warmup=10  sweep: ...
@@ -14,10 +14,10 @@
 按 (dtype, head_dim, interleave, num_heads) 分组：每组 op 用实线○、eager 用虚线△（同色）。
 
 用法：
-  uv run src/scripts/plot_op_benchmark.py                 # 最近一次运行，GFLOPS 对比
-  uv run src/scripts/plot_op_benchmark.py --metric time   # 改画中位耗时(ms)
-  uv run src/scripts/plot_op_benchmark.py --metric speedup
-  uv run src/scripts/plot_op_benchmark.py --all-runs      # 汇总文件里的全部运行（按时间戳区分）
+  uv run src/scripts/plot_op_benchmark_one_head_vs_eager.py                 # 最近一次运行，GFLOPS 对比
+  uv run src/scripts/plot_op_benchmark_one_head_vs_eager.py --metric time   # 改画中位耗时(ms)
+  uv run src/scripts/plot_op_benchmark_one_head_vs_eager.py --metric speedup
+  uv run src/scripts/plot_op_benchmark_one_head_vs_eager.py --all-runs      # 汇总文件里的全部运行（按时间戳区分）
 """
 import argparse
 import os
@@ -34,7 +34,7 @@ import matplotlib.ticker as ticker
 ROOT = Path(__file__).parent.parent.parent.parent
 # 默认读 benchmark 实际写入的结果文件（benchmark_fused_qknorm_rope.py 的 DEFAULT_RESULT_FILE）；
 #   可经 --result-file 改读别的（如 autotune 的 ROPE_autotune_op_benchmark_result.txt）。
-DEFAULT_RESULT_FILE = ROOT / "benchmark_results" / "ROPE_python_op_benchmark_result.txt"
+DEFAULT_RESULT_FILE = ROOT / "benchmark_results" / "ROPE_python_op_benchmark_result_one_head.txt"
 OUTPUT_DIR = ROOT / "plot_output"
 
 _HEADER_RE = re.compile(r"^\[(?P<ts>[^\]]+)\]\s+repeats=")
@@ -159,7 +159,8 @@ def main() -> None:
 
     plt.tight_layout()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out = OUTPUT_DIR / f"op_benchmark_{args.metric}.png"
+    output_name = f"one_head_vs_eager_{args.metric}.png"
+    out = OUTPUT_DIR / output_name
     plt.savefig(out, dpi=150)
     print(f"已保存：{out}")
 

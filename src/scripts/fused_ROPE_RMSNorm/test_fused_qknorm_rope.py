@@ -9,7 +9,7 @@
 多组配置会有缓存与"替换 pass 重复注册"的状态串扰，子进程隔离最干净、结果最可信。
 
 运行：
-  ./run_check_op.sh                      # 经 venv，跑全量扫描
+  ./src/scripts/fused_ROPE_RMSNorm/run_check_op.sh               # 经 venv，跑全量扫描
   uv run python src/scripts/test_fused_qknorm_rope.py            # 全量
   uv run python src/scripts/test_fused_qknorm_rope.py --dtype float16 --head-dim 128   # 过滤子集
   （内部用）... --worker --dtype float16 --head-dim 128 --interleave 1   # 单组合 worker

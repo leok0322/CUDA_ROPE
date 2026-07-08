@@ -17,6 +17,7 @@ num_tokens ∈ {128, 512, 2048, 8192}，head_dim ∈ {64, 128, 256}，(Hq,Hk,Hv)
 
 - [算法：QK-Norm + RoPE](#算法qk-norm--rope)
 - [CUDA Kernel 实现](#cuda-kernel-实现)
+- [NHeads op 算法 0](#nheads-op-算法-0)
 - [接入 PyTorch：torch.compile 子图替换](#接入-pytorchtorchcompile-子图替换)
 - [性能：自定义算子 vs eager](#性能自定义算子-vs-eager)
 - [为什么快](#为什么快)
@@ -55,16 +56,28 @@ num_tokens ∈ {128, 512, 2048, 8192}，head_dim ∈ {64, 128, 256}，(Hq,Hk,Hv)
 
 ## CUDA Kernel 实现
 
-`src/kernels/` 下渐进式的 4 个 kernel（C++ 端 `./validation <id>` 走 K0–K3，互为正确性对照）：
+`src/kernels/` 下包含渐进式 K0–K3 和 NHeads 实验实现（C++ 端 `./validation <id>` 走 K0–K3，互为正确性对照）：
 
 | id | 文件 | 说明 |
 |----|------|------|
 | K0 | `0_ROPE_kernel_base.cuh` | 单线程/朴素 RoPE 基准，非合并访问，作对照 |
 | K1 | `1_ROPE_kernel_naive.cuh` | 多线程并行 RoPE，合并访问 |
 | K2 | `2_ROPE_kernel_vectorize.cuh` | 向量化 load/store 的 RoPE |
-| **K3** | **`3_fuesd_QKNorm_and_ROPE_kernel.cuh`** | **★融合 QK-RMSNorm + RoPE**，Python 自定义算子用的就是它 |
+| **K3** | **`3_fuesd_QKNorm_and_ROPE_kernel.cuh`** | **one-head 融合 QK-RMSNorm + RoPE**：一个 warp 处理一个 head，是当前性能对照基线 |
+| **NHeads A0** | **`4_fused_QKNorm_ROPE_NHeads_kernel.cuh`** | **一个 warp 处理同一 token 的多个 Q/K heads**；算法 0 用 `cp.async` 双缓冲预取 QKV，当前默认宏启用 |
 
-**K3（核心）的设计**：
+当前 `src/kernels/common.cuh` 的默认宏是：
+
+```cpp
+#define is_MULTI_HEAD_PER_WARP 1
+#define HEADS_PER_WARP 32
+#define ALGORITHM 0
+```
+
+因此 Python 自定义算子默认走 **NHeads A0**；把 `is_MULTI_HEAD_PER_WARP` 改成 `0` 后，才会回到 K3
+one-head kernel。
+
+**K3 one-head 的设计**：
 
 - **warp-per-head**：一个 warp（32 lane）处理一个 (token, QK-head)，32 个 lane 均分 head_dim；
 - **RMSNorm 规约**：lane 内 `__shfl_xor_sync` 蝶形规约求 $\sum x^2$（5 轮，无共享内存、无 `__syncthreads`）；
@@ -77,6 +90,47 @@ num_tokens ∈ {128, 512, 2048, 8192}，head_dim ∈ {64, 128, 256}，(Hq,Hk,Hv)
 
 > 渐进对比：[`kernel0_vs_kernel1.txt`](docs/algorithm/fused_ROPE_RMSNorm/kernel0_vs_kernel1.txt)、
 > [`kernel2_vs_kernel0.txt`](docs/algorithm/fused_ROPE_RMSNorm/kernel2_vs_kernel0.txt)。
+
+---
+
+## NHeads op 算法 0
+
+NHeads 算法 0 的目标是让一个 warp 连续处理同一 token 的多个 Q/K heads，并尝试把
+`next head` 的 QKV 加载和 `current head` 的 RMSNorm/RoPE 计算重叠。
+
+核心映射：
+
+- 一个 warp 负责同一 token 内最多 `HEADS_PER_WARP` 个 Q/K heads；
+- 一个 block 含 `BLOCK_SIZE_X / 32` 个 warp；
+- grid 按 token 独立切分：每个 token 需要 `ceil((num_heads_q + num_heads_k) / HEADS_PER_WARP)` 个 warp；
+- V heads 不参与 QK-Norm/RoPE，仍然透传。
+
+算法 0 的数据路径：
+
+```text
+QKV:          HBM -> cp.async -> dynamic SMEM 双缓冲 -> register -> RMSNorm/RoPE -> HBM
+cos/sin:      HBM -> register
+q/k weight:   HBM -> register
+```
+
+dynamic SMEM 只给 QKV 双缓冲使用。每个 warp 只需要 current/next 两个 head slot：
+
+```cpp
+dynamicSMEM =
+    warpsPerBlock * 32 * 2 * elementBytesPerHeadPerThread;
+```
+
+其中 `2` 是双缓冲 channel 数，不是 `HEADS_PER_WARP`。SMEM layout 按
+`[warp][buffer][lane][element]` 排布，使同一 warp 内每个 lane 读回自己负责的连续片段，降低 bank
+conflict 风险。QKV 的 HBM 指针也是 warp 内连续地址，能形成合并访问。
+
+关键限制是：当前 QKV 数据没有 block/warp 内复用。每个 lane 预取的是自己后续要消费的片段，因此
+SMEM 在这里主要承担异步流水的中转，而不是共享缓存。只有当 `cp.async` 隐藏掉的 HBM 延迟大于
+`SMEM -> register` 读回、`wait_group`、双缓冲索引和额外控制逻辑的成本时，NHeads A0 才会比
+one-head 更快。
+
+更详细的数据加载策略见
+[`docs/algorithm/fused_ROPE_RMSNorm/one_warp_n_heads_data_loading_strategy.txt`](docs/algorithm/fused_ROPE_RMSNorm/one_warp_n_heads_data_loading_strategy.txt)。
 
 ---
 
@@ -104,7 +158,7 @@ torch.compile(model)  ──编译期──▶  子图被替换成 torch.ops.ROP
 - **自定义算子 = `torch.compile(model)` 热路径**（子图已替换成一次融合 kernel）；
 - CUDA Event 计时，WARMUP=10 + REPEATS=100 取中位数；`speedup = eager_median / op_median`。
 
-**head_dim=128，(Hq,Hk,Hv)=(8,8,8)**（GFLOPS 越高越好；数据：sm_86，最近一次 benchmark）：
+**head_dim=128，(Hq,Hk,Hv)=(8,8,8)**（GFLOPS 越高越好；数据：one-head op 基线，sm_86）：
 
 | num_tokens | fp16 op / eager / 加速 | bf16 op / eager / 加速 | fp32 op / eager / 加速 |
 |-----------:|:----------------------:|:----------------------:|:----------------------:|
@@ -118,12 +172,45 @@ torch.compile(model)  ──编译期──▶  子图被替换成 torch.ops.ROP
 - **峰值**：fp16/bf16 在大 num_tokens 下约 **280–284 GFLOPS**；fp32 约 **135–142 GFLOPS**（每元素 2× 字节、带宽瓶颈，故约为半精度一半）。
 - **加速比随规模增大**：num_tokens=128 时 ~4–5×，num_tokens≥2048 时 **~10–12×**（小规模受固定 launch/开销主导，大规模带宽饱和、eager 的多算子开销被充分拉开）。
 - **正确性**：全部组合 `allclose` 通过（fp32 atol/rtol=1e-3，fp16=1e-2，bf16=3e-2）。
-- **非法组合**：float×256（需 `packed_as<float,8>`）被算子守卫优雅拒绝（SKIP），不计失败。
+- **模板守卫**：若某个 `(dtype, head_dim)` 组合需要超过已特化向量类型的访问宽度，会在模板守卫处
+  拒绝并记为 SKIP，不计失败；one-head/NHeads 对比只统计两边都实际产出的共同配置。
 
-折线图（op 实线○ / eager 虚线△，横轴 num_tokens）：
+**one-head op vs NHeads A0**（两份结果按相同 `(dtype, head_dim, num_tokens, heads)` 对齐比较）：
+
+| 统计项 | 结果 |
+|--------|------|
+| 共同配置数 | 36 |
+| one-head 更快 | 25 |
+| NHeads A0 更快 | 8 |
+| 基本持平 | 3 |
+| NHeads A0 / one-head 几何平均速度比 | 0.953× |
+
+按 dtype 聚合，速度比定义为 `one_head_ms / nheads_ms`，大于 1 表示 NHeads A0 更快：
+
+| dtype | NHeads A0 胜出 | 几何平均速度比 |
+|-------|----------------|----------------|
+| float16 | 2 / 12 | 0.919× |
+| bfloat16 | 4 / 12 | 1.001× |
+| float32 | 2 / 12 | 0.940× |
+
+结论：当前数据下 **one-head op 整体更稳**，NHeads A0 只在少数配置点更快，大规模
+`num_tokens=8192` 时两者接近。NHeads A0 不占优的主要原因不是 HBM 合并访问或 SMEM bank
+conflict 没做好，而是 QKV 路径多了一层 `HBM -> SMEM -> register` 中转；QKV 又没有跨线程复用，
+所以 `cp.async` 流水隐藏的延迟多数时候不足以抵消 SMEM 读回和控制逻辑成本。
+
+> 注意：当前仓库里的 one-head 结果时间戳是 `2026-06-28`，NHeads A0 结果时间戳是 `2026-07-07`。
+> 严格横向比较时，建议同一构建、同一机器状态下连续重跑两组 benchmark。
+
+折线图命令：
 
 ```bash
-./src/scripts/fused_ROPE_RMSNorm/run_plot_op.sh            # → plot_output/op_benchmark_gflops.png
+# one-head op vs eager
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_eager.sh
+# → plot_output/one_head_vs_eager_{gflops,time,speedup}.png
+
+# one-head op vs NHeads A0
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh
+# → plot_output/one_head_vs_NHeads_{gflops,time,speedup}.png
 ```
 
 ---
@@ -157,12 +244,23 @@ head/token、向量化宽度、grid 映射），而非线程块大小（见下�
 # 2) 性能：自定义算子 vs eager 耗时/GFLOPS，结果追加写 benchmark_results/ROPE_python_op_benchmark_result.txt
 ./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh
 ./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --token-sizes 256 1024 4096
+# 若要给 one-head vs NHeads 对比图使用，需要切换 is_MULTI_HEAD_PER_WARP/ALGORITHM 并重编译 .so，
+# 再分别把两次运行写入固定文件名：
+./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --result-file benchmark_results/ROPE_python_op_benchmark_result_one_head.txt
+./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --result-file benchmark_results/ROPE_python_op_benchmark_result_NHeads.txt
 
-# 3) 画图：把 benchmark 结果画成折线图 → plot_output/op_benchmark_{metric}.png
-./src/scripts/fused_ROPE_RMSNorm/run_plot_op.sh                 # GFLOPS
-./src/scripts/fused_ROPE_RMSNorm/run_plot_op.sh --metric speedup
+# 3) 画图：one-head op vs eager → plot_output/one_head_vs_eager_{metric}.png
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_eager.sh
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_eager.sh --metric speedup
 
-# 4) 自动调优 BLOCK_SIZE_X：sed 改宏 → 重编译 .so → benchmark → 取最佳（见下节）
+# 4) 画图：one-head op vs NHeads A0 → plot_output/one_head_vs_NHeads_{metric}.png
+#    默认读取 benchmark_results/ROPE_python_op_benchmark_result_one_head.txt
+#    和 benchmark_results/ROPE_python_op_benchmark_result_NHeads.txt。
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh --metric time
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh --metric speedup
+
+# 5) 自动调优 BLOCK_SIZE_X：sed 改宏 → 重编译 .so → benchmark → 取最佳（见下节）
 ./src/scripts/fused_ROPE_RMSNorm/autotune_block_size_x.sh
 ```
 
