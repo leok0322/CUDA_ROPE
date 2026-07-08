@@ -18,6 +18,7 @@ num_tokens ∈ {128, 512, 2048, 8192}，head_dim ∈ {64, 128, 256}，(Hq,Hk,Hv)
 - [算法：QK-Norm + RoPE](#算法qk-norm--rope)
 - [CUDA Kernel 实现](#cuda-kernel-实现)
 - [NHeads op 算法 0](#nheads-op-算法-0)
+- [NHeads op 算法 1](#nheads-op-算法-1)
 - [接入 PyTorch：torch.compile 子图替换](#接入-pytorchtorchcompile-子图替换)
 - [性能：自定义算子 vs eager](#性能自定义算子-vs-eager)
 - [为什么快](#为什么快)
@@ -65,6 +66,7 @@ num_tokens ∈ {128, 512, 2048, 8192}，head_dim ∈ {64, 128, 256}，(Hq,Hk,Hv)
 | K2 | `2_ROPE_kernel_vectorize.cuh` | 向量化 load/store 的 RoPE |
 | **K3** | **`3_fuesd_QKNorm_and_ROPE_kernel.cuh`** | **one-head 融合 QK-RMSNorm + RoPE**：一个 warp 处理一个 head，是当前性能对照基线 |
 | **NHeads A0** | **`4_fused_QKNorm_ROPE_NHeads_kernel.cuh`** | **一个 warp 处理同一 token 的多个 Q/K heads**；算法 0 用 `cp.async` 双缓冲预取 QKV，当前默认宏启用 |
+| **NHeads A1** | **`4_fused_QKNorm_ROPE_NHeads_kernel.cuh`** | 在 A0 基础上继续把 cos/sin 用 `cp.async` 预取到 dynamic SMEM，尝试让 QKV 加载、cos/sin 加载和 RMSNorm/RoPE 计算形成更深流水 |
 
 当前 `src/kernels/common.cuh` 的默认宏是：
 
@@ -75,7 +77,7 @@ num_tokens ∈ {128, 512, 2048, 8192}，head_dim ∈ {64, 128, 256}，(Hq,Hk,Hv)
 ```
 
 因此 Python 自定义算子默认走 **NHeads A0**；把 `is_MULTI_HEAD_PER_WARP` 改成 `0` 后，才会回到 K3
-one-head kernel。
+one-head kernel。若要测试 NHeads A1，把 `ALGORITHM` 改成 `1` 并重新构建 `.so`。
 
 **K3 one-head 的设计**：
 
@@ -134,6 +136,66 @@ one-head 更快。
 
 ---
 
+## NHeads op 算法 1
+
+NHeads 算法 1 在算法 0 的基础上进一步把当前 token 的 `cos/sin` 也搬到 dynamic SMEM。它的目标是把
+QKV 预取、cos/sin 预取和当前 head 的 RMSNorm/RoPE 计算交错起来，减少直接从 HBM 读
+`cos/sin` 时暴露出的延迟。
+
+算法 1 的数据路径：
+
+```text
+QKV:          HBM -> cp.async -> dynamic SMEM 双缓冲 -> register -> RMSNorm/RoPE -> HBM
+cos/sin:      HBM -> cp.async -> dynamic SMEM(per-warp) -> register
+q/k weight:   HBM -> register
+```
+
+dynamic SMEM 需要手动切分成两段：
+
+```text
+[QKV double buffer][warp0 cos][warp0 sin][warp1 cos][warp1 sin]...
+```
+
+QKV 仍然使用 `[warp][buffer][lane][element]` 的双缓冲 layout；cos/sin 不按 head 再开 buffer，
+因为同一 token 的所有 Q/K head 共用同一行 cos/sin。cos/sin 是独立 tensor，所以分别搬
+`cos[token, :]` 和 `sin[token, :]`。
+
+执行流水的核心直觉：
+
+```text
+预取 head0 QKV
+预取 token 对应 cos/sin
+
+for current head:
+  预取 next head QKV
+  等 current head QKV 完成
+  计算 current head RMSNorm
+  等 cos/sin 完成
+  计算 current head RoPE
+  写回 current head
+```
+
+RoPE 前的等待要区分是否已经发出了 next QKV：
+
+```cpp
+if (i + 1 < headNumInWarp) {
+  // 最新 group 是 next QKV，允许它继续在途，只等待更老的 cos/sin。
+  cp_async_wait_group<1>();
+} else {
+  // 没有 next QKV 时，cos/sin 可能就是最新 group，必须全部等完。
+  cp_async_wait_group<0>();
+}
+__syncwarp();
+```
+
+注意 `cp.async` 单条拷贝宽度只能是 4/8/16B。当前算法 1 按 16B chunk 搬 cos/sin，因此要求
+每行 `half * sizeof(cache_scalar_t)` 是 16B 的整数倍；不满足时，launch 端应回退到算法 0，
+否则最后一笔 16B 拷贝会越过该行有效范围。算法 1 的收益只来自流水隐藏延迟；QKV 本身仍然没有
+跨线程复用，因此如果 SMEM 中转、`commit/wait`、地址计算和同步成本超过隐藏掉的 HBM 延迟，
+算法 1 就不一定比 one-head 或 A0 更快。
+
+---
+
 ## 接入 PyTorch：torch.compile 子图替换
 
 不直接手调算子，而是让 `torch.compile` **自动**把模型里的子图替换成融合 kernel（`src/app/`）：
@@ -175,31 +237,34 @@ torch.compile(model)  ──编译期──▶  子图被替换成 torch.ops.ROP
 - **模板守卫**：若某个 `(dtype, head_dim)` 组合需要超过已特化向量类型的访问宽度，会在模板守卫处
   拒绝并记为 SKIP，不计失败；one-head/NHeads 对比只统计两边都实际产出的共同配置。
 
-**one-head op vs NHeads A0**（两份结果按相同 `(dtype, head_dim, num_tokens, heads)` 对齐比较）：
+**one-head / NHeads A0 / NHeads A1 对比**（按相同 `(dtype, head_dim, num_tokens, heads)` 对齐比较；
+0.5% 以内记为基本持平）：
 
-| 统计项 | 结果 |
-|--------|------|
-| 共同配置数 | 36 |
-| one-head 更快 | 25 |
-| NHeads A0 更快 | 8 |
-| 基本持平 | 3 |
-| NHeads A0 / one-head 几何平均速度比 | 0.953× |
+| 对比 | 共同配置 | 后者更快 | 前者更快 | 基本持平 | 后者 / 前者几何平均速度比 |
+|------|---------:|---------:|---------:|---------:|--------------------------:|
+| one-head → NHeads A0 | 36 | 6 | 21 | 9 | 0.953× |
+| NHeads A0 → NHeads A1 | 36 | 22 | 5 | 9 | 1.047× |
+| one-head → NHeads A1 | 36 | 19 | 11 | 6 | 0.997× |
 
-按 dtype 聚合，速度比定义为 `one_head_ms / nheads_ms`，大于 1 表示 NHeads A0 更快：
+按 `head_dim` 聚合，表中 `A / B` 定义为 `B_ms / A_ms`，大于 1 表示左侧的 `A` 更快：
 
-| dtype | NHeads A0 胜出 | 几何平均速度比 |
-|-------|----------------|----------------|
-| float16 | 2 / 12 | 0.919× |
-| bfloat16 | 4 / 12 | 1.001× |
-| float32 | 2 / 12 | 0.940× |
+| 对比 | hd=64 | hd=128 | hd=256 |
+|------|------:|-------:|-------:|
+| NHeads A1 / NHeads A0 | 1.112× | 1.101× | 0.937× |
+| NHeads A1 / one-head | 1.099× | 0.999× | 0.904× |
 
-结论：当前数据下 **one-head op 整体更稳**，NHeads A0 只在少数配置点更快，大规模
-`num_tokens=8192` 时两者接近。NHeads A0 不占优的主要原因不是 HBM 合并访问或 SMEM bank
-conflict 没做好，而是 QKV 路径多了一层 `HBM -> SMEM -> register` 中转；QKV 又没有跨线程复用，
-所以 `cp.async` 流水隐藏的延迟多数时候不足以抵消 SMEM 读回和控制逻辑成本。
+结论：
 
-> 注意：当前仓库里的 one-head 结果时间戳是 `2026-06-28`，NHeads A0 结果时间戳是 `2026-07-07`。
-> 严格横向比较时，建议同一构建、同一机器状态下连续重跑两组 benchmark。
+- **A1 明显优于 A0 的主要区间是 `head_dim=64/128`**：A1 多预取 cos/sin，能更好地覆盖加载延迟；
+- **A1 和 one-head 整体接近**：A1 胜出点更多，但几何平均速度比约 `0.997×`，说明整体没有压倒性优势；
+- **`head_dim=256` 下 one-head 更稳**：A1 多了 `HBM -> SMEM -> register` 中转、`cp.async`
+  `commit/wait`、`__syncwarp`、地址计算和更高 SMEM 占用。高维度下每个 head 的计算/搬运更重，
+  这些额外成本不一定能被流水隐藏掉；
+- **A0 不占优的核心原因不是 HBM 合并访问或 SMEM bank conflict 没做好**，而是 QKV 没有跨线程复用。
+  QKV 先进 SMEM 的收益只来自异步流水；如果隐藏掉的 HBM 延迟小于 SMEM 读回和控制逻辑成本，就会亏。
+
+> 注意：当前仓库里的 one-head 结果时间戳是 `2026-06-28`，NHeads A0 是 `2026-07-07`，
+> NHeads A1 是 `2026-07-08`。严格横向比较时，建议同一构建、同一机器状态下连续重跑三组 benchmark。
 
 折线图命令：
 
@@ -208,9 +273,14 @@ conflict 没做好，而是 QKV 路径多了一层 `HBM -> SMEM -> register` 中
 ./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_eager.sh
 # → plot_output/one_head_vs_eager_{gflops,time,speedup}.png
 
-# one-head op vs NHeads A0
+# one-head op vs NHeads A0/A1
 ./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh
-# → plot_output/one_head_vs_NHeads_{gflops,time,speedup}.png
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh --nheads-algorithm 1
+# → plot_output/one_head_vs_NHeads_algorithm{0|1}_{gflops,time,speedup}.png
+
+# NHeads A0 vs NHeads A1
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_NHeads_algorithm_compare.sh
+# → plot_output/NHeads_algorithm_compare_{gflops,time,speedup}.png
 ```
 
 ---
@@ -245,22 +315,28 @@ head/token、向量化宽度、grid 映射），而非线程块大小（见下�
 ./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh
 ./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --token-sizes 256 1024 4096
 # 若要给 one-head vs NHeads 对比图使用，需要切换 is_MULTI_HEAD_PER_WARP/ALGORITHM 并重编译 .so，
-# 再分别把两次运行写入固定文件名：
+# 再分别把运行结果写入固定文件名：
 ./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --result-file benchmark_results/ROPE_python_op_benchmark_result_one_head.txt
-./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --result-file benchmark_results/ROPE_python_op_benchmark_result_NHeads.txt
+./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --result-file benchmark_results/ROPE_python_op_benchmark_result_NHeads_algorithm0.txt
+./src/scripts/fused_ROPE_RMSNorm/run_benchmark_op.sh --result-file benchmark_results/ROPE_python_op_benchmark_result_NHeads_algorithm1.txt
 
 # 3) 画图：one-head op vs eager → plot_output/one_head_vs_eager_{metric}.png
 ./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_eager.sh
 ./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_eager.sh --metric speedup
 
-# 4) 画图：one-head op vs NHeads A0 → plot_output/one_head_vs_NHeads_{metric}.png
+# 4) 画图：one-head op vs NHeads A0/A1
 #    默认读取 benchmark_results/ROPE_python_op_benchmark_result_one_head.txt
-#    和 benchmark_results/ROPE_python_op_benchmark_result_NHeads.txt。
+#    和 benchmark_results/ROPE_python_op_benchmark_result_NHeads_algorithm0.txt。
 ./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh --nheads-algorithm 1
 ./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh --metric time
 ./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_one_head_vs_NHeads.sh --metric speedup
 
-# 5) 自动调优 BLOCK_SIZE_X：sed 改宏 → 重编译 .so → benchmark → 取最佳（见下节）
+# 5) 画图：NHeads A0 vs NHeads A1 → plot_output/NHeads_algorithm_compare_{metric}.png
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_NHeads_algorithm_compare.sh
+./src/scripts/fused_ROPE_RMSNorm/run_plot_op_benchmark_NHeads_algorithm_compare.sh --metric time
+
+# 6) 自动调优 BLOCK_SIZE_X：sed 改宏 → 重编译 .so → benchmark → 取最佳（见下节）
 ./src/scripts/fused_ROPE_RMSNorm/autotune_block_size_x.sh
 ```
 
