@@ -15,23 +15,30 @@
 // 说明：本文件只用到 torch 的 c10::Half / c10::BFloat16 两个类型，无需 <torch/extension.h>
 //   那套巨型伞头(会拖进 pybind11 / 整个 ATen / <Python.h>)，故改用上面两个 headeronly 头。
 
-template<typename scalar_t, uint num>
+template<typename scalar_t, uint num,bool is_scalar>
 struct packed_as;
 
 template <>
-struct packed_as<float,4> {
+struct packed_as<float,4,false> {
   using type = float4;
 };
 
 template <>
-struct packed_as<float,2> {
+struct packed_as<float,2,false> {
   using type = float2;
 };
 
 template <>
-struct packed_as<float,1> {
+struct packed_as<float,1,false> {
   using type = float;
 };
+
+
+template <typename scalar_t>
+struct packed_as<scalar_t,1,true> {
+  using type = scalar_t;
+};
+
 
 
 // _typeConvert：类型转换 traits，实现【静态多态(编译期多态)】。它把 torch/C++ 标量类型

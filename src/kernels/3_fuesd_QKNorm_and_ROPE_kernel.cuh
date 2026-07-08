@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include "common.cuh"
 #include "typeConvert.cuh"  // std::is_same_v的依赖
 #include "compact.cuh"
 
@@ -60,7 +59,7 @@ __global__ void fused_QKNorm_and_ROPE_kernel(void* qkv_void, const void* cos_voi
     //   float×256 → numPerFourBytesPerThread=8 → packed_as<float,8> 未特化，故被 launch_ 的 if constexpr 挡在外、不实例化到这里。
     // 由此进到本 kernel 的组合，numPerFourBytesPerThread 必 ∈ {1,2,4}，packed_as<float,N> 必有特化。
     // numPerFourBytesPerThread是模板参数，需要是编译期常量，所以head_dim必须是编译期常量，这也是把head_dim作为模板参数的原因
-    using T_tran = typename packed_as<float,numPerFourBytesPerThread>::type;
+    using T_tran = typename packed_as<float,numPerFourBytesPerThread,false>::type;
 
     uint offsetElementPerThread;
     // Token和Head级别的偏移
@@ -89,6 +88,7 @@ __global__ void fused_QKNorm_and_ROPE_kernel(void* qkv_void, const void* cos_voi
     // 循环次数是编译期常量，所以#pragma unroll可以全部展开
 
     // 计算RMSNorm
+    // numPerT_in2PerThread 是 constexpr，循环展开后 i 是常量；对 vecTran 的重解释分块通常会优化成寄存器切片/搬移，而不是落到 local memory 再读回。
 #pragma unroll
     for (uint i = 0; i < numPerT_in2PerThread; i++) {
       auto vecCompute { *(reinterpret_cast<T_in2*>(&vecTran) + i) };
@@ -218,6 +218,5 @@ __global__ void fused_QKNorm_and_ROPE_kernel(void* qkv_void, const void* cos_voi
 #if ((!defined __CUDA_ARCH__) || __CUDA_ARCH__ < 800) && (!defined USE_ROCM)
 }
 #endif
-
 
 

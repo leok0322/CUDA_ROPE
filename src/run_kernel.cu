@@ -4,6 +4,8 @@
 #include <torch/extension.h>
 #include "dispatch.h"
 #include "validation.h"
+#include "kernels/common.cuh"
+#include <cstdint>  // std::uintptr_t: host侧检查data_ptr地址对齐
 
 
 template<typename qkv_scalar_t,typename cache_scalar_t, uint head_dim>
@@ -16,68 +18,202 @@ void launch_fused_QKNorm_and_ROPE_kernel(
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v,
     int64_t num_tokens, int64_t rotary_dim, double eps) {
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // ★(dtype, head_dim) 合法性守卫（方案B：必须放在【模板函数】里用 if constexpr）。
-  //   kernel 每线程做向量化 load/store，取 numPerFourBytes 个 4 字节，对应 packed_as<float,N>：
-  //       numPerFourBytes = (head_dim/32) * sizeof(qkv_scalar_t) / 4
-  //   packed_as 只特化 N∈{1,2,4}(float/float2/float4，最大 16 字节)，没有 float8(32 字节向量)。
-  //   合法：half/bf16 的 64/128/256(N=1/2/4)、float 的 64/128(N=2/4)；非法：float×256 → N=8。
-  //
-  //   守卫为何放这里：dispatch 仍会写出并实例化 launch_...<float,256> 本身；但本函数【是模板】，
-  //   实例化它时下面的 if constexpr 条件依赖模板参数(head_dim/qkv_scalar_t)，N=8 时含 kernel 的
-  //   真支【整段丢弃、不实例化】→ fused_QKNorm_and_ROPE_kernel<float,...,256> 从不实例化 →
-  //   不碰 packed_as<float,8>。运行期真撞上非法组合则走 else 抛 TORCH_CHECK(false)。
-  //   （若放进 dispatch 宏(非模板上下文)则丢弃支仍 fully checked、仍实例化，挡不住——见
-  //     docs/c++/switch_case_fallthrough_and_warnings.txt 第九节。）
-  // ───────────────────────────────────────────────────────────────────────────
-  constexpr uint numElemsPerThread {head_dim / 32};
-  constexpr uint numPerFourBytes {numElemsPerThread * static_cast<uint>(sizeof(qkv_scalar_t)) / 4};
 
-  if constexpr (numPerFourBytes >= 1 && numPerFourBytes <= 4) {
-    // ─────────────────────────────────────────────────────────────────────────
-    // 本 kernel【真正需要】的约束(都已在别处显式守住，此处汇总)：
-    //   ① head_dim % 64 == 0          —— static_assert(下方)。一个 head 由 32 lane 处理、每 lane
-    //                                    一次处理 2 个元素(成对 T_in2)，故 head_dim/32 须为偶 → %64。
-    //   ② BLOCK_SIZE_X % 32 == 0      —— static_assert(下方)。并行模型是"一个 warp(32 lane)负责一个
-    //                                    (token,head)"，blockDim.x 须为整 warp。
-    //   ③ rotary_dim % (head_dim/32)==0 —— TORCH_CHECK(下方)。RoPE 用 lane 级边界判定，rotary 边界
-    //                                    须落在 lane 边界(每条 lane 要么全旋转要么全不转)。
-    //   ④ (dtype,head_dim) 使 numPerFourBytes∈{1,2,4} —— 外层 if constexpr。packed_as<float,N> 须有特化。
-    //
-    // 注：曾有 `half(=rotary_dim/2) % BLOCK_SIZE_X == 0` 的检查，已删除——它是旧的"整块线程铺 half 维"
-    //     设计的遗留，与当前 warp-per-head 模型无关(BLOCK_SIZE_X 只决定每块几个 warp、用于算 grid，
-    //     和每个 head 内部的 half 维无关)。该检查会误杀 head_dim=64(half=32%64≠0)等合法配置。
-    // ─────────────────────────────────────────────────────────────────────────
-    static_assert(BLOCK_SIZE_X % 32 == 0, "BLOCK_SIZE_X需要是32的倍数，因为一个warp负责一行");
-    uint totalQKHeads {static_cast<uint>(num_tokens * (num_heads_q + num_heads_k))};
-    uint warpsPerBlock {BLOCK_SIZE_X / 32};
-    dim3 gridSize {1,cuda::ceil_div(totalQKHeads,warpsPerBlock),1};
-    dim3 blockSize {BLOCK_SIZE_X,1,1};
+  // 不能在这里直接 static_assert(sizeof(qkv_scalar_t) <= sizeof(cache_scalar_t)):
+  // ROPE_DISPATCH_FLOATING_TYPES 的 switch case 都会被编译,嵌套 dispatch 会实例化
+  // qkv/cache 的所有 dtype 组合。非法组合应该由 if constexpr 丢弃真正的 kernel
+  // 实例化,运行时真选中时再 TORCH_CHECK 报错。
+  if constexpr (sizeof(qkv_scalar_t) <= sizeof(cache_scalar_t)) {
+    constexpr uint elementNumPerHeadPerThread {head_dim / 32};
+    constexpr uint elementBytesPerHeadPerThread {elementNumPerHeadPerThread * static_cast<uint>(sizeof(qkv_scalar_t))};
+    constexpr uint packedNum { elementBytesPerHeadPerThread / 4 };
+
+    // qkv/q_weight/k_weight在kernel里会按elementBytesPerHeadPerThread(4B/8B/16B)
+    // 做向量化load/store或cp.async拷贝。base pointer必须满足对应访问宽度的对齐;
+    // 后续head/lane offset都是elementBytesPerHeadPerThread的整数倍,不会破坏base对齐。
+    ROPE_ST_TORCH_CHECK(reinterpret_cast<std::uintptr_t>(qkv_ptr) % elementBytesPerHeadPerThread == 0,
+                    "qkv data_ptr must be aligned to ", elementBytesPerHeadPerThread,
+                    " bytes for vectorized QKV load/store and cp.async");
+    ROPE_ST_TORCH_CHECK(reinterpret_cast<std::uintptr_t>(q_weight_ptr) % elementBytesPerHeadPerThread == 0,
+                    "q_weight data_ptr must be aligned to ", elementBytesPerHeadPerThread,
+                    " bytes for vectorized weight load");
+    ROPE_ST_TORCH_CHECK(reinterpret_cast<std::uintptr_t>(k_weight_ptr) % elementBytesPerHeadPerThread == 0,
+                    "k_weight data_ptr must be aligned to ", elementBytesPerHeadPerThread,
+                    " bytes for vectorized weight load");
+
+  // 和上面的dtype精度守卫一样,这里也必须用if constexpr:
+  // dispatch会编译到float×head_dim=256这类packedNum=8的组合;非法组合要在模板内丢弃
+  // 真正的kernel实例化,运行时真选中时再走else报错。
+  if constexpr (packedNum >= 1 && packedNum <= 4) {
+      // ─────────────────────────────────────────────────────────────────────────
+      // 本 kernel【真正需要】的约束(都已在别处显式守住，此处汇总)：
+      //   ① head_dim % 64 == 0          —— static_assert(下方)。一个 head 由 32 lane 处理、每 lane
+      //                                    一次处理 2 个元素(成对 T_in2)，故 head_dim/32 须为偶 → %64。
+      //   ② BLOCK_SIZE_X % 32 == 0      —— static_assert(下方)。并行模型是"一个 warp(32 lane)负责一个
+      //                                    (token,head)"，blockDim.x 须为整 warp。
+      //   ③ rotary_dim % (head_dim/32)==0 —— TORCH_CHECK(下方)。RoPE 用 lane 级边界判定，rotary 边界
+      //                                    须落在 lane 边界(每条 lane 要么全旋转要么全不转)。
+      //   ④ (dtype,head_dim) 使 numPerFourBytes∈{1,2,4} —— 外层 if constexpr。packed_as<float,N> 须有特化。
+      //
+      // 注：曾有 `half(=rotary_dim/2) % BLOCK_SIZE_X == 0` 的检查，已删除——它是旧的"整块线程铺 half 维"
+      //     设计的遗留，与当前 warp-per-head 模型无关(BLOCK_SIZE_X 只决定每块几个 warp、用于算 grid，
+      //     和每个 head 内部的 half 维无关)。该检查会误杀 head_dim=64(half=32%64≠0)等合法配置。
+      // ─────────────────────────────────────────────────────────────────────────
 
 
-    static_assert(head_dim % 64 == 0,"一个head被32个线程处理，每个线程一次处理2个元素，需要dim是64的倍数");
+      static_assert(head_dim % 64 == 0,"一个head被32个线程处理，每个线程一次处理2个元素，需要dim是64的倍数");
 
-    // RoPE 旋转用【lane 级】边界判定(kernel 里 if(cosSinInitDimPerThread<half) 一次性判整条 lane)，
-    // 故要求 rotary 边界【正好落在 lane 边界】：rotary_dim 必须是 numElemsPerThread(=head_dim/32) 的
-    // 整数倍 ⟹ 每条 lane 要么全旋转、要么全不旋转，无需在循环内逐对判。否则(边界落 lane 中间)会算错。
-    //   等价：half(=rotary_dim/2) 须为 (head_dim/32)/2 的整数倍。
-    // 实践：全旋转(rotary_dim==head_dim)恒满足；head_dim=64 因 rotary_dim 必偶也恒满足；
-    //       整齐的部分旋转(rotary_dim 为 8/16 倍数)通常满足。此处显式守住，违反则报错而非静默算错。
-    TORCH_CHECK(rotary_dim % numElemsPerThread == 0,
-                "[fused_QKNorm_and_ROPE] rotary_dim(=", rotary_dim, ") 必须是 head_dim/32(=",
-                numElemsPerThread, ") 的整数倍(RoPE lane 级边界判定要求 rotary 边界对齐 lane 边界)");
+      // RoPE 旋转用【lane 级】边界判定(kernel 里 if(cosSinInitDimPerThread<half) 一次性判整条 lane)，
+      // 故要求 rotary 边界【正好落在 lane 边界】：rotary_dim 必须是 numElemsPerThread(=head_dim/32) 的
+      // 整数倍 ⟹ 每条 lane 要么全旋转、要么全不旋转，无需在循环内逐对判。否则(边界落 lane 中间)会算错。
+      //   等价：half(=rotary_dim/2) 须为 (head_dim/32)/2 的整数倍。
+      // 实践：全旋转(rotary_dim==head_dim)恒满足；head_dim=64 因 rotary_dim 必偶也恒满足；
+      //       整齐的部分旋转(rotary_dim 为 8/16 倍数)通常满足。此处显式守住，违反则报错而非静默算错。
+      TORCH_CHECK(rotary_dim % elementNumPerHeadPerThread == 0,
+                  "[fused_QKNorm_and_ROPE] rotary_dim(=", rotary_dim, ") 必须是 head_dim/32(=",
+                  elementNumPerHeadPerThread, ") 的整数倍(RoPE lane 级边界判定要求 rotary 边界对齐 lane 边界)");
 
-    fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,head_dim><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
-         num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
-    cudaCheck(cudaGetLastError());
+      static_assert(BLOCK_SIZE_X % 32 == 0, "BLOCK_SIZE_X需要是32的倍数，因为一个warp负责一行");
+
+      uint totalQKHeads {static_cast<uint>(num_tokens * (num_heads_q + num_heads_k))};
+      constexpr uint warpsPerBlock {BLOCK_SIZE_X / 32};
+
+      if constexpr (!is_MULTI_HEAD_PER_WARP) {
+        // ───────────────────────────────────────────────────────────────────────────
+        // ★(dtype, head_dim) 合法性守卫（方案B：必须放在【模板函数】里用 if constexpr）。
+        //   kernel 每线程做向量化 load/store，取 numPerFourBytes 个 4 字节，对应 packed_as<float,N>：
+        //       numPerFourBytes = (head_dim/32) * sizeof(qkv_scalar_t) / 4
+        //   packed_as 只特化 N∈{1,2,4}(float/float2/float4，最大 16 字节)，没有 float8(32 字节向量)。
+        //   合法：half/bf16 的 64/128/256(N=1/2/4)、float 的 64/128(N=2/4)；非法：float×256 → N=8。
+        //
+        //   守卫为何放这里：dispatch 仍会写出并实例化 launch_...<float,256> 本身；但本函数【是模板】，
+        //   实例化它时下面的 if constexpr 条件依赖模板参数(head_dim/qkv_scalar_t)，N=8 时含 kernel 的
+        //   真支【整段丢弃、不实例化】→ fused_QKNorm_and_ROPE_kernel<float,...,256> 从不实例化 →
+        //   不碰 packed_as<float,8>。运行期真撞上非法组合则走 else 抛 TORCH_CHECK(false)。
+        //   （若放进 dispatch 宏(非模板上下文)则丢弃支仍 fully checked、仍实例化，挡不住——见
+        //     docs/c++/switch_case_fallthrough_and_warnings.txt 第九节。）
+        // ───────────────────────────────────────────────────────────────────────────
+
+        dim3 gridSize {1,cuda::ceil_div(totalQKHeads,warpsPerBlock),1};
+        dim3 blockSize {BLOCK_SIZE_X,1,1};
+
+        fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,head_dim><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
+             num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
+        cudaCheck(cudaGetLastError());
+      }
+      else if constexpr (is_MULTI_HEAD_PER_WARP) {
+        dim3 blockSize {BLOCK_SIZE_X,1,1};
+        // uint headsPerBlock {BLOCK_SIZE_X / 32 * HEADS_PER_WARP};
+        // dim3 gridSize {cuda::ceil_div(totalQKHeads,headsPerBlock),1,1};
+
+        // NHeads kernel不是把num_tokens*(num_heads_q+num_heads_k)看成一个连续head流来切分。
+        // kernel内部的映射是:
+        //   globalWarpIdx -> tokenIdx = globalWarpIdx / warpsPerToken
+        //                  -> warpIdxInToken = globalWarpIdx % warpsPerToken
+        // 因此每个token都独立需要ceil(qkHeadsPerToken / HEADS_PER_WARP)个warp。
+        // 如果直接用ceil(totalQKHeads / (warpsPerBlock * HEADS_PER_WARP)),当单个token的QK head数
+        // 不能被HEADS_PER_WARP整除时,会把前一个token的tail空位错误地让下一个token复用,导致grid偏小。
+        uint qkHeadsPerToken {static_cast<uint>((num_heads_q + num_heads_k))};
+        uint warpsPerToken {cuda::ceil_div(qkHeadsPerToken,HEADS_PER_WARP)};
+        uint totalWarps {static_cast<uint>(num_tokens) * warpsPerToken};
+        dim3 gridSize {cuda::ceil_div(totalWarps,warpsPerBlock),1,1};
+
+
+        // 动态SMEM分配
+        uint dynamicSMEM {};
+        if constexpr (ALGORITHM == 0) {
+          // algorithm 0只把QKV异步搬进dynamic SMEM。
+          // 逻辑上,一个warp最多处理HEADS_PER_WARP个head,但SMEM不需要为所有head各留一份;
+          // QKV流水只需要current/next两个buffer轮换,所以每个warp只分配2个head slot。
+          // 每个slot由32个lane组成,每个lane搬elementBytesPerHeadPerThread字节:
+          //   32 * HeadsNumPerWarpSMEM(=2) * elementBytesPerHeadPerThread
+          // 个字节。一个block有warpsPerBlock个warp,所以dynamic SMEM还要再乘warpsPerBlock。
+          // kernel内部使用时必须按warp/head/lane切分dynamicSmem offset,否则多个warp会覆盖同一段SMEM。
+          constexpr uint HeadsNumPerWarpSMEM {2};
+          dynamicSMEM = warpsPerBlock * 32 * HeadsNumPerWarpSMEM * elementBytesPerHeadPerThread;
+          // 调整dynamicSMEM时要同时检查硬件限制:这里的dynamicSMEM是每个block请求的动态shared memory字节数。
+          // dynamicSMEM + kernel静态shared memory不能超过当前GPU允许的per-block shared memory上限。
+          // 如果超过默认动态SMEM上限(常见默认值是48KB),host侧通常还需要在launch前用cudaFuncSetAttribute
+          // 设置cudaFuncAttributeMaxDynamicSharedMemorySize进行opt-in,但仍不能超过设备的opt-in上限。
+          // 后续若给algorithm 0增加QKV双缓冲、cos/sin/weight缓存或padding,必须同步更新该字节数并重新评估occupancy;
+          // dynamicSMEM过大会降低每个SM可驻留block数,超过限制则kernel launch会失败。
+          int deviceId {};
+          cudaCheck(cudaGetDevice(&deviceId));
+
+          // defaultSharedMemPerBlock是不用额外opt-in时,单个block默认可用的shared memory上限。
+          // staticSMEM + dynamicSMEM不超过这个值时,可以直接launch。
+          int defaultSharedMemPerBlock {};
+          cudaCheck(cudaDeviceGetAttribute(
+              &defaultSharedMemPerBlock,
+              cudaDevAttrMaxSharedMemoryPerBlock,
+              deviceId));
+
+          // optinSharedMemPerBlock是当前设备允许显式opt-in后的单个block shared memory更高上限。
+          // 如果defaultSharedMemPerBlock < staticSMEM + dynamicSMEM <= optinSharedMemPerBlock,
+          // 需要在launch前用cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize)为该kernel申请。
+          // 如果staticSMEM + dynamicSMEM超过这个值,当前设备不支持该shared memory配置,必须报错。
+          int optinSharedMemPerBlock {};
+          cudaCheck(cudaDeviceGetAttribute(
+              &optinSharedMemPerBlock,
+              cudaDevAttrMaxSharedMemoryPerBlockOptin,
+              deviceId));
+
+          cudaFuncAttributes kernelAttrs {};
+          cudaCheck(cudaFuncGetAttributes(
+              &kernelAttrs,
+              fused_QKNorm_ROPE_NHeads_kernel<qkv_scalar_t,cache_scalar_t,head_dim,HEADS_PER_WARP,ALGORITHM>));
+
+          // sharedSizeBytes是kernel编译期已经确定的静态shared memory用量,例如__shared__ float buf[1024]。
+          // 它不包含launch第三个参数传入的dynamicSMEM(extern __shared__ ...),所以总预算要按
+          // staticSMEM + dynamicSMEM判断。
+          const auto staticSMEM {static_cast<uint>(kernelAttrs.sharedSizeBytes)};
+          ROPE_ST_TORCH_CHECK(
+              static_cast<std::uint64_t>(staticSMEM) + dynamicSMEM <=
+                  static_cast<std::uint64_t>(optinSharedMemPerBlock),
+              "ALGORITHM=0 requires dynamicSMEM=", dynamicSMEM,
+              " bytes + staticSMEM=", staticSMEM,
+              " bytes, exceeds device opt-in per-block shared memory limit=",
+              optinSharedMemPerBlock, " bytes");
+
+          // 如果超过默认per-block shared memory上限,但没有超过opt-in上限,需要先给该kernel特化设置
+          // cudaFuncAttributeMaxDynamicSharedMemorySize;否则<<<..., dynamicSMEM>>>启动会因为shared memory过大失败。
+          // 这里是把该kernel特化的cudaFuncAttributeMaxDynamicSharedMemorySize属性设置为dynamicSMEM。
+          // 它表示"允许这个kernel使用的最大dynamic shared memory字节数";真正本次launch分配多少,
+          // 仍由下面<<<gridSize, blockSize, dynamicSMEM>>>的第三个参数决定。
+          if (static_cast<std::uint64_t>(staticSMEM) + dynamicSMEM >
+              static_cast<std::uint64_t>(defaultSharedMemPerBlock)) {
+            cudaCheck(cudaFuncSetAttribute(
+                fused_QKNorm_ROPE_NHeads_kernel<qkv_scalar_t,cache_scalar_t,head_dim,HEADS_PER_WARP,ALGORITHM>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(dynamicSMEM)));
+          }
+
+          fused_QKNorm_ROPE_NHeads_kernel<qkv_scalar_t,cache_scalar_t,head_dim,HEADS_PER_WARP,ALGORITHM><<<gridSize,blockSize,dynamicSMEM>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
+              num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
+          cudaCheck(cudaGetLastError());
+        } else if constexpr (ALGORITHM == 1) {
+
+
+        } else if constexpr (ALGORITHM == 2) {
+
+
+        }
+      }
+    }
+    else {
+      // 非法 (dtype, head_dim)：如 float×256(每线程 32 字节，需 packed_as<float,8>，无此向量类型)。
+      // 因在模板内，本支整段【不实例化】kernel；仅在运行期真撞上时抛错。
+      TORCH_CHECK(false,
+                  "[fused_QKNorm_and_ROPE] head_dim=", head_dim,
+                  " 不支持当前 dtype：每线程需 ", packedNum,
+                  " 个 4 字节(packed_as<float,", packedNum,
+                  ">)，仅支持 1/2/4(float/float2/float4)。例如 float×256 非法，请用 half/bf16。");
+    }
   } else {
-    // 非法 (dtype, head_dim)：如 float×256(每线程 32 字节，需 packed_as<float,8>，无此向量类型)。
-    // 因在模板内，本支整段【不实例化】kernel；仅在运行期真撞上时抛错。
     TORCH_CHECK(false,
-                "[fused_QKNorm_and_ROPE] head_dim=", head_dim,
-                " 不支持当前 dtype：每线程需 ", numPerFourBytes,
-                " 个 4 字节(packed_as<float,", numPerFourBytes,
-                ">)，仅支持 1/2/4(float/float2/float4)。例如 float×256 非法，请用 half/bf16。");
+                "[fused_QKNorm_and_ROPE] cos/sin dtype must be no narrower than qkv dtype; "
+                "got sizeof(qkv_scalar_t)=", sizeof(qkv_scalar_t),
+                ", sizeof(cache_scalar_t)=", sizeof(cache_scalar_t));
   }
 }
 
@@ -101,20 +237,25 @@ void fused_QKNorm_and_ROPE_neox(
   ROPE_ST_TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
   ROPE_ST_TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
   ROPE_ST_TORCH_CHECK(cos.dim() == 2,
-                  "Cos/sin cache must be 2D: [num_tokens, rotary_dim/2] ]");
+                  "Cos/sin cache must be 2D: [num_tokens, rotary_dim/2]");
   ROPE_ST_TORCH_CHECK(sin.dim() == 2,
-                  "Cos/sin cache must be 2D: [num_tokens, rotary_dim/2] ]");
+                  "Cos/sin cache must be 2D: [num_tokens, rotary_dim/2]");
   ROPE_ST_TORCH_CHECK(q_weight.size(0) == head_dim,
                   "Query weights size must match head dimension");
   ROPE_ST_TORCH_CHECK(k_weight.size(0) == head_dim,
                   "Key weights size must match head dimension");
 
-  ROPE_ST_TORCH_CHECK(cos.size(1) % 2 == 0, "rotary_dim must be even");
-  ROPE_ST_TORCH_CHECK(sin.size(1) % 2 == 0, "rotary_dim must be even");
-  ROPE_ST_TORCH_CHECK(cos.size(1) <= head_dim,
+  ROPE_ST_TORCH_CHECK(rotary_dim % 2 == 0, "rotary_dim must be even");
+  ROPE_ST_TORCH_CHECK(rotary_dim <= head_dim,
                   "rotary_dim must be less than or equal to head_dim");
-  ROPE_ST_TORCH_CHECK(sin.size(1) <= head_dim,
-                  "rotary_dim must be less than or equal to head_dim");
+  ROPE_ST_TORCH_CHECK(cos.size(0) == qkv.size(0),
+                  "cos first dimension must match num_tokens");
+  ROPE_ST_TORCH_CHECK(sin.size(0) == qkv.size(0),
+                  "sin first dimension must match num_tokens");
+  ROPE_ST_TORCH_CHECK(cos.size(1) == rotary_dim / 2,
+                  "cos second dimension must be rotary_dim / 2");
+  ROPE_ST_TORCH_CHECK(sin.size(1) == rotary_dim / 2,
+                  "sin second dimension must be rotary_dim / 2");
   ROPE_ST_TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
                       qkv.scalar_type() == k_weight.scalar_type(),
                   "qkv, q_weight and k_weight must have the same dtype");
@@ -130,6 +271,13 @@ void fused_QKNorm_and_ROPE_neox(
   auto k_weight_ptr { k_weight.data_ptr() };
   auto cos_ptr { cos.data_ptr() };
   auto sin_ptr { sin.data_ptr() };
+
+  // NHeads kernel中cos/sin可能用float/float2/float4形式做4B/8B/16B向量化读取。
+  // kernel内部只证明token/lane offset不会破坏对齐;这里负责保证base pointer本身至少16B对齐。
+  ROPE_ST_TORCH_CHECK(reinterpret_cast<std::uintptr_t>(cos_ptr) % 16 == 0,
+                  "cos data_ptr must be at least 16B aligned for vectorized cos load");
+  ROPE_ST_TORCH_CHECK(reinterpret_cast<std::uintptr_t>(sin_ptr) % 16 == 0,
+                  "sin data_ptr must be at least 16B aligned for vectorized sin load");
 
   // qkv.scalar_type() 返回的是【枚举类 torch::headeronly::ScalarType 的一个枚举值】
   //   (如 ScalarType::Half / ::BFloat16 / ::Float)——是“值”，不是类型，等价于 at::kHalf 等。
@@ -204,6 +352,3 @@ void fused_QKNorm_and_ROPE_neox(
   //     cudaCheck(cudaGetLastError());
   // }));
 }
-
-
-

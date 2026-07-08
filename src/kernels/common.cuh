@@ -20,3 +20,18 @@
 #ifndef BLOCK_SIZE_Y
 #define BLOCK_SIZE_Y 4
 #endif
+
+
+#ifndef is_MULTI_HEAD_PER_WARP
+#define is_MULTI_HEAD_PER_WARP 1
+#endif
+
+
+#ifndef HEADS_PER_WARP
+#define HEADS_PER_WARP 32
+#endif
+
+
+#ifndef ALGORITHM
+#define ALGORITHM 0
+#endif

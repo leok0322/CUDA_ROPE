@@ -273,53 +273,267 @@
 
   这个方案承认 cos/sin 和 q/k weight 的相同点：如果它们都能被当前 lane 在寄存器中跨
   多个 head 复用，并且寄存器压力可接受，那么 cos/sin 直接进寄存器可以省掉 SMEM 中转。
+  当前 src/kernels/4_fused_QKNorm_ROPE_NHeads_kernel.cuh 的 algorithm 0 就是在向这个
+  方案实现：
+
+    · QKV 使用 cp.async global -> shared，按 current/next 两个 SMEM channel 双缓冲。
+    · cos/sin 在 head 循环外从 global/read-only cache 加载到当前线程寄存器。
+    · q_weight/k_weight 在 head 循环外向量化加载到当前线程寄存器，并被多个 head 复用。
+    · head 循环中只复用 QKV SMEM buffer，不再为 cos/sin 或 q/k weight 分配 SMEM。
+
+  动态 SMEM 大小也按这个实现收敛为：
+
+    HeadsNumPerWarpSMEM = 2
+
+    dynamic_smem_bytes =
+        warpsPerBlock
+      * 32
+      * HeadsNumPerWarpSMEM
+      * elementBytesPerHeadPerThread
+
+  这里的 2 不是 HEADS_PER_WARP，而是 current/next 两个 QKV buffer。一个 warp 逻辑上
+  可以处理 HEADS_PER_WARP 个 head，但不需要把所有 head 的 QKV 同时放进 SMEM。
 
   伪代码形态：
 
-    cp_async_qkv_head(0, qkv_buf0);
+    // 1. head 循环外：cos/sin 进寄存器。
+    //    当前实现不一定声明 float 数组，而是按 T_cache_tran packed 类型保存。
+    //    如果一个 lane 完全不在 rotary_dim 范围内，可以不加载；后续 RoPE 分支也不会使用。
+    if (cosSinNumPerHeadPerThread * laneIdx < rotary_dim / 2) {
+      elementCos = load_packed_or_scalar_cos(tokenIdx, laneIdx);
+      elementSin = load_packed_or_scalar_sin(tokenIdx, laneIdx);
+    }
+
+    // 2. head 循环外：q/k weight 进寄存器。
+    //    当前实现用 T_in_tran 一次向量化加载，然后在 RMSNorm 循环中按 T_in 拆出标量。
+    elementQWeight = vector_load(q_weight + laneIdx * elementNumPerHeadPerThread);
+    elementKWeight = vector_load(k_weight + laneIdx * elementNumPerHeadPerThread);
+
+    // 3. 先预取 head0 QKV 到 channel0。
+    cp_async_qkv_head(0, qkv_channel[0]);
     cp_async_commit_group();
 
-    float q_w[elementNumPerHeadPerThread];
-    float k_w[elementNumPerHeadPerThread];
-    float cos_reg[elementNumPerHeadPerThread / 2];
-    float sin_reg[elementNumPerHeadPerThread / 2];
-
-    #pragma unroll
-    for (uint i = 0; i < elementNumPerHeadPerThread; ++i) {
-      uint dim = laneIdx * elementNumPerHeadPerThread + i;
-      q_w[i] = convert(q_weight[dim]);
-      k_w[i] = convert(k_weight[dim]);
-    }
-
-    #pragma unroll
-    for (uint i = 0; i < elementNumPerHeadPerThread / 2; ++i) {
-      uint half_dim = (laneIdx * elementNumPerHeadPerThread + 2 * i) / 2;
-      cos_reg[i] = convert(cos[tokenIdx * (rotary_dim / 2) + half_dim]);
-      sin_reg[i] = convert(sin[tokenIdx * (rotary_dim / 2) + half_dim]);
-    }
-
-    cp_async_wait_group<0>();  // head0 QKV 到位。
-    __syncwarp();
-
     for (uint k = 0; k < headNumInWarp; ++k) {
-      uint next = k + 1;
+      // 当前 head 要先等它对应的 cp.async group 完成。
+      // k=0 等初始化时发出的 head0；k>0 等上一轮预取的 head k。
+      cp_async_wait_group<0>();
 
-      if (next < headNumInWarp) {
-        cp_async_qkv_head(next, (next & 1) ? qkv_buf1 : qkv_buf0);
+      uint currentHead = firstHeadIdx + k;
+      bool currentIsQ = currentHead < num_heads_q;
+
+      // 4. 尽早预取 next head，让 next QKV global load 和 current head 计算重叠。
+      if (k + 1 < headNumInWarp) {
+        uint nextChannel = (k + 1) % 2;
+        cp_async_qkv_head(k + 1, qkv_channel[nextChannel]);
         cp_async_commit_group();
       }
 
-      vec_T qkv_vec = load_qkv_from_smem((k & 1) ? qkv_buf1 : qkv_buf0);
+      // 5. current head 从 current channel 读取。
+      uint currentChannel = k % 2;
+      load_current_qkv_from_smem(qkv_channel[currentChannel], elementPerHeadPerThread);
 
-      compute_qknorm(qkv_vec, q_w, k_w, elements);
-      apply_rope_from_register_cos_sin(elements, cos_reg, sin_reg);
-      store_back_qkv(k, elements);
+      // 6. RMSNorm：按 currentIsQ 选择 q_weight 或 k_weight。
+      //    注意不能用 next head 的 isQ 覆盖 currentIsQ。
+      compute_qknorm(elementPerHeadPerThread,
+                     currentIsQ ? elementQWeight : elementKWeight);
 
-      if (next < headNumInWarp) {
-        cp_async_wait_group<0>();
-        __syncwarp();
+      // 7. RoPE：使用 head 循环外加载到寄存器的 elementCos/elementSin。
+      if (cosSinNumPerHeadPerThread * laneIdx < rotary_dim / 2) {
+        apply_rope_from_register_cos_sin(elementPerHeadPerThread,
+                                         elementCos,
+                                         elementSin);
       }
+
+      // 8. 普通 global store 写回 current head。
+      //    写回不需要等 next QKV 预取完成；下一轮循环开头 wait_group<0> 再保证 next QKV 到位。
+      store_back_qkv(currentHead, elementPerHeadPerThread);
     }
+
+  与代码对应的几个关键点：
+
+    1. cos/sin 的寄存器类型不是固定 float 数组。
+       当前实现先计算：
+
+         cosSinNumPerHeadPerThread   = elementNumPerHeadPerThread / 2
+         cosSinBytesPerHeadPerThread = cosSinNumPerHeadPerThread * sizeof(T_cache)
+
+       如果是最小半精度标量场景，就用 T_cache 标量；否则用 float/float2/float4
+       作为 packed 读取类型。这样可以覆盖 2B 标量和 4B/8B/16B 向量化读取。
+
+    2. q_weight/k_weight 一次性向量化加载。
+       当前实现是：
+
+         elementQWeight =
+           reinterpret_cast<const T_in_tran*>(
+             &q_weight[elementNumPerHeadPerThread * laneIdx])[0]
+
+         elementKWeight =
+           reinterpret_cast<const T_in_tran*>(
+             &k_weight[elementNumPerHeadPerThread * laneIdx])[0]
+
+       RMSNorm 内再把 elementQWeight/elementKWeight 按 T_in* 拆成每个元素的 weight。
+       这种“对 packed 寄存器临时量取地址再拆包”的写法通常会被 nvcc 优化成寄存器内切片，
+       但不是 C++ 语义保证，最终仍要看 PTX/SASS 或 ptxas -v 是否出现 local memory spill。
+
+       当前 sm_86 编译结果给出的证据是：algorithm 0 的 NHeads kernel 多个实例均显示：
+
+         0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+
+       这说明当前代码形态下，对 elementQWeight/elementKWeight 取地址拆包没有导致
+       local memory spill。对应 register 用量大致是：
+
+         head_dim=64   : 32~36 registers/thread
+         head_dim=128  : 34~36 registers/thread
+         head_dim=256  : 56 registers/thread
+
+       因此当前证据支持：
+
+         · 没有寄存器溢出到 local memory。
+         · 对 packed 局部变量取地址被编译器优化成了寄存器内切片/搬移。
+         · head_dim=256 的寄存器压力更高，但仍然没有 spill。
+
+       这不是永久保证。如果后续增加临时变量、扩大 live range、加入更多流水状态或改变
+       编译选项，仍应重新检查 ptxas 输出中的 spill stores / spill loads。
+
+       写回阶段的 elementT_tranPerThreadStore 也是同类问题：
+
+         T_in_tran elementT_tranPerThreadStore;
+         reinterpret_cast<T_in2*>(&elementT_tranPerThreadStore)[j] = ...
+
+       当前同一份 ptxas 输出也显示 0 bytes stack frame / 0 spill stores / 0 spill loads，
+       因此当前写回组包没有落到 local memory。
+
+    3. cp.async 不使用 T_in_tran。
+       QKV 预取只需要 global 地址、shared 地址和拷贝宽度。拷贝宽度来自
+       elementBytesPerHeadPerThread，只允许 4B/8B/16B。T_in_tran 主要用于普通向量化
+       load/store 或 packed 寄存器表示。
+
+    4. 当前实现通常不需要额外 __syncwarp()。
+       每个 lane 只读取自己通过 cp.async 写入的 SMEM 地址：
+
+         qkv_smem[warp][channel][lane][element]
+
+       不存在 lane A 写入、lane B 读取的 shared memory 依赖。cp_async_wait_group<0>()
+       已经保证“当前线程自己发出的 cp.async”完成。如果后续改成跨 lane 消费 SMEM tile，
+       或者不同 lane 之间存在生产/消费关系，就需要在 wait_group 后加 __syncwarp()。
+
+  QKV 双缓冲 SMEM layout 与 bank conflict：
+
+    方案 2 虽然把 cos/sin 和 q/k weight 放在寄存器中，但 QKV 仍然需要两个 per-warp
+    SMEM buffer，用来做 current/next head 的双缓冲。每个 warp 只需要保存两个 head
+    slot，而不是保存 HEADS_PER_WARP 个 head：
+
+      HeadsNumPerWarpSMEM = 2
+
+    推荐把 QKV SMEM 切成：
+
+      [warp][buffer][lane][element]
+
+    对应元素 offset：
+
+      offset =
+          warpIdxPerBlock * HeadsNumPerWarpSMEM * 32 * elementNumPerHeadPerThread
+        + bufferIdx       * 32 * elementNumPerHeadPerThread
+        + laneIdx         * elementNumPerHeadPerThread
+        + elementIdx
+
+    当前代码中：
+
+      currentChannel = k % 2
+      nextChannel    = (k + 1) % 2
+
+      current head 读取:
+
+        smem_base[
+            warpIdxPerBlock * 32 * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread
+          + currentChannel  * 32 * elementNumPerHeadPerThread
+          + laneIdx         * elementNumPerHeadPerThread
+          + elementIdx]
+
+      next head 预取:
+
+        smem_base[
+            warpIdxPerBlock * 32 * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread
+          + nextChannel     * 32 * elementNumPerHeadPerThread
+          + laneIdx         * elementNumPerHeadPerThread]
+
+    含义：
+
+      · warp 维度：block 内每个 warp 有自己的 QKV 双缓冲区域。
+      · buffer 维度：0/1 两个 slot，对应 current/next head。
+      · lane 维度：同一个 head 内 32 个 lane 各自保存自己负责的连续元素。
+      · element 维度：当前 lane 负责的 elementNumPerHeadPerThread 个 QKV 元素。
+
+    不推荐把 buffer 放在 lane 后面：
+
+      [warp][lane][buffer][element]
+
+    对应元素 offset：
+
+      offset =
+          warpIdxPerBlock * 32 * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread
+        + laneIdx         * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread
+        + bufferIdx       * elementNumPerHeadPerThread
+        + elementIdx
+
+    两种 layout 的 bank conflict 差别可以用一个简化模型看出来。假设 shared memory 有
+    32 个 bank，bank 宽度按 4B 估算：
+
+      bank = (byte_address / 4) % 32
+
+    令：
+
+      E = elementNumPerHeadPerThread
+      B = sizeof(T_in)
+      H = HeadsNumPerWarpSMEM = 2
+
+    其中：
+
+      · E 是一个 lane 在一个 head 内负责的 QKV 元素个数。例如 head_dim=64 时，
+        E=head_dim/32=2；head_dim=128 时，E=4；head_dim=256 时，E=8。
+      · B 是单个 T_in 元素的字节数。例如 half/bf16 时 B=2B，float 时 B=4B。
+      · H 是每个 warp 在 SMEM 中保留的 QKV buffer 数量。双缓冲 current/next 时 H=2。
+
+    如果后续同一个 warp 从 SMEM 读回 QKV 时，每个 lane 读取同一个 buffer 中自己负责的
+    同一相对 elementIdx，那么相邻 lane 的地址间隔分别是：
+
+      [warp][lane][buffer][element]:
+        lane_stride_bytes = H * E * B
+        bank_stride       = H * E * B / 4
+
+      [warp][buffer][lane][element]:
+        lane_stride_bytes = E * B
+        bank_stride       = E * B / 4
+
+    因为第一种 layout 的 lane stride 多乘了 H，也就是把双缓冲维度夹在 lane 和 element
+    之间，所以 bank stride 被额外放大。以 H=2 为例：
+
+      half/bf16, head_dim=64:
+        E = 2, B = 2
+        [warp][lane][buffer][element]  bank_stride = 2, 约 2-way conflict
+        [warp][buffer][lane][element]  bank_stride = 1, 通常不冲突
+
+      half/bf16, head_dim=128:
+        E = 4, B = 2
+        [warp][lane][buffer][element]  bank_stride = 4, 约 4-way conflict
+        [warp][buffer][lane][element]  bank_stride = 2, 约 2-way conflict
+
+      float, head_dim=64:
+        E = 2, B = 4
+        [warp][lane][buffer][element]  bank_stride = 4, 约 4-way conflict
+        [warp][buffer][lane][element]  bank_stride = 2, 约 2-way conflict
+
+    因此方案 2 推荐：
+
+      [warp][buffer][lane][element]
+
+    它不能保证所有 dtype/head_dim 都完全没有 bank conflict，但比
+    [warp][lane][buffer][element] 少一个 HeadsNumPerWarpSMEM 倍数，通常更适合“每个 lane
+    消费自己搬入的连续 QKV 片段”的读回模式。
+
+    注意：cp.async 写入 shared 的阶段不是主要按普通 st.shared bank conflict 来判断。
+    需要重点分析的是后续 compute 阶段从 QKV SMEM 读回寄存器的 ld.shared 模式。SMEM
+    layout 的主要价值也是为了让后续读取更顺，而不仅是为了让 cp.async 目标地址规整。
 
   优点：
 
@@ -627,16 +841,28 @@
   执行顺序：
 
     1. 计算 tokenIdx、firstHeadIdx、headNumInWarp。
-    2. 预取 head0 QKV 到 qkv_buf0，commit。
-    3. 加载 q_weight/k_weight 到寄存器 q_w/k_w。
-    4. 加载当前 token 的 cos/sin 到寄存器 cos_reg/sin_reg。
-    5. wait_group<0>，保证 head0 QKV 到位。
-    6. 对每个 head：
-       · 预取 next QKV 到另一个 qkv buffer。
-       · 从 current QKV buffer 读到寄存器。
-       · 用 q_w/k_w 计算 QK RMSNorm。
-       · 用 cos_reg/sin_reg 做 RoPE。
-       · 写回 qkv。
+    2. head 循环外加载当前 token 的 cos/sin 到寄存器 elementCos/elementSin。
+    3. head 循环外加载 q_weight/k_weight 到寄存器 elementQWeight/elementKWeight。
+    4. 预取 head0 QKV 到 qkv_channel0，commit。
+    5. 对每个 head k：
+       · wait_group<0>，保证 current head 的 QKV 已经到达 current channel。
+       · currentHead = firstHeadIdx + k，currentIsQ = currentHead < num_heads_q。
+       · 如果 k+1 < headNumInWarp，预取 next head QKV 到 nextChannel=(k+1)%2，commit。
+       · 从 currentChannel=k%2 的 QKV buffer 读到寄存器。
+       · 用 currentIsQ 选择 elementQWeight/elementKWeight 计算 QK RMSNorm。
+       · 用 elementCos/elementSin 做 RoPE。
+       · 普通 global store 写回 current head。
+
+  注意：
+
+    · next head 的 QKV 预取应该使用 nextChannel=(k+1)%2；current head 读取使用
+      currentChannel=k%2。二者不能混用。
+    · currentIsQ 必须按 currentHead 计算，不能被 next head 的 isQ 覆盖，否则跨 Q/K
+      边界时会选错 q_weight/k_weight。
+    · 当前实现每个 lane 只消费自己写入的 SMEM 片段，通常不需要 __syncwarp()；如果改成
+      跨 lane 共享 SMEM tile，则 wait_group 后还需要 warp/block 级同步。
+    · 写回 current head 是普通 global store，不需要等待 next head 预取完成。下一轮开头的
+      wait_group<0> 负责保证 next head QKV 到位。
 
   主要观察指标：
 
