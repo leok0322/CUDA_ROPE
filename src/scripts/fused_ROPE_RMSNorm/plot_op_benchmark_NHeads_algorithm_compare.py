@@ -3,11 +3,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["matplotlib"]
 # ///
-"""比较 one-head 算子和 NHeads 算子的 benchmark 结果并画折线图。
+"""比较两个 NHeads 算法 benchmark 结果并画折线图。
 
 默认读取：
-  benchmark_results/ROPE_python_op_benchmark_result_one_head.txt
   benchmark_results/ROPE_python_op_benchmark_result_NHeads_algorithm0.txt
+  benchmark_results/ROPE_python_op_benchmark_result_NHeads_algorithm1.txt
 
 两份文件格式与 benchmark_fused_qknorm_rope.py 追加写出的结果一致，行形如：
   [2026-06-28 08:28:03]  repeats=100 warmup=10  sweep: ...
@@ -15,15 +15,21 @@
         eager: median=0.57ms perf=3.2 GFLOPS  eager/op=5.04x  correct=PASS
 
 横轴 = num_tokens。纵轴按 --metric 选择：
-  gflops  : one-head op 与 NHeads op 的 GFLOPS
-  time    : one-head op 与 NHeads op 的中位耗时(ms)
-  speedup : NHeads 相对 one-head 的加速比，定义为 one_head_ms / nheads_ms
+  gflops  : 两个 NHeads op 的 GFLOPS
+  time    : 两个 NHeads op 的中位耗时(ms)
+  speedup : B 相对 A 的加速比，定义为 A_ms / B_ms
 
 用法：
-  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_one_head_vs_NHeads.py
-  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_one_head_vs_NHeads.py --nheads-algorithm 1
-  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_one_head_vs_NHeads.py --metric time
-  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_one_head_vs_NHeads.py --metric speedup
+  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_NHeads_algorithm_compare.py
+  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_NHeads_algorithm_compare.py --metric time
+  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_NHeads_algorithm_compare.py --metric speedup
+
+如果需要比较任意两个文件：
+  uv run src/scripts/fused_ROPE_RMSNorm/plot_op_benchmark_NHeads_algorithm_compare.py \
+    --a-file benchmark_results/ROPE_python_op_benchmark_result_NHeads_algorithm0.txt \
+    --b-file benchmark_results/ROPE_python_op_benchmark_result_NHeads_algorithm0.txt \
+    --a-label "NHeads A0" \
+    --b-label "NHeads A0 copy"
 """
 import argparse
 import os
@@ -39,12 +45,8 @@ import matplotlib.ticker as ticker
 
 # 本文件在 src/scripts/fused_ROPE_RMSNorm/，上溯 4 级 .parent 到项目根 CUDA_ROPE/。
 ROOT = Path(__file__).parent.parent.parent.parent
-DEFAULT_ONE_HEAD_FILE = ROOT / "benchmark_results" / "ROPE_python_op_benchmark_result_one_head.txt"
-DEFAULT_NHEADS_ALGORITHM = "0"
-NHEADS_FILES_BY_ALGORITHM = {
-    "0": ROOT / "benchmark_results" / "ROPE_python_op_benchmark_result_NHeads_algorithm0.txt",
-    "1": ROOT / "benchmark_results" / "ROPE_python_op_benchmark_result_NHeads_algorithm1.txt",
-}
+DEFAULT_A_FILE = ROOT / "benchmark_results" / "ROPE_python_op_benchmark_result_NHeads_algorithm0.txt"
+DEFAULT_B_FILE = ROOT / "benchmark_results" / "ROPE_python_op_benchmark_result_NHeads_algorithm1.txt"
 OUTPUT_DIR = ROOT / "plot_output"
 
 _HEADER_RE = re.compile(r"^\[(?P<ts>[^\]]+)\]\s+repeats=")
@@ -141,108 +143,96 @@ def index_records(records: list[dict], label: str) -> dict[tuple, dict]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--metric", choices=["gflops", "time", "speedup"], default="gflops",
-                    help="纵轴指标：gflops(默认) / time(中位 ms) / speedup(NHeads/one-head)")
-    ap.add_argument("--one-head-file", default=str(DEFAULT_ONE_HEAD_FILE),
-                    help=f"one-head benchmark 结果文件（缺省={DEFAULT_ONE_HEAD_FILE}）")
-    ap.add_argument("--nheads-algorithm", choices=sorted(NHEADS_FILES_BY_ALGORITHM),
-                    default=DEFAULT_NHEADS_ALGORITHM,
-                    help="选择 NHeads benchmark 结果文件：0 -> algorithm0，1 -> algorithm1；"
-                         "当显式传 --nheads-file 时此参数只用于输出文件名")
-    ap.add_argument("--nheads-file", default=None,
-                    help="NHeads benchmark 结果文件；显式传入后覆盖 --nheads-algorithm 对应的默认文件")
+                    help="纵轴指标：gflops(默认) / time(中位 ms) / speedup(B/A)")
+    ap.add_argument("--a-file", default=str(DEFAULT_A_FILE),
+                    help=f"A benchmark 结果文件（缺省={DEFAULT_A_FILE}）")
+    ap.add_argument("--b-file", default=str(DEFAULT_B_FILE),
+                    help=f"B benchmark 结果文件（缺省={DEFAULT_B_FILE}）")
+    ap.add_argument("--a-label", default="NHeads algorithm0",
+                    help="图例中的 A 名称")
+    ap.add_argument("--b-label", default="NHeads algorithm1",
+                    help="图例中的 B 名称")
     args = ap.parse_args()
 
-    one_head_file = resolve_path(args.one_head_file)
-    if args.nheads_file:
-        nheads_file = resolve_path(args.nheads_file)
-        nheads_label = f"NHeads custom algorithm{args.nheads_algorithm}"
-        output_suffix = f"NHeads_custom_algorithm{args.nheads_algorithm}"
-    else:
-        nheads_file = NHEADS_FILES_BY_ALGORITHM[args.nheads_algorithm]
-        nheads_label = f"NHeads algorithm{args.nheads_algorithm}"
-        output_suffix = f"NHeads_algorithm{args.nheads_algorithm}"
+    a_ts, a_records = latest_run(parse_records(resolve_path(args.a_file), args.a_label))
+    b_ts, b_records = latest_run(parse_records(resolve_path(args.b_file), args.b_label))
 
-    one_ts, one_records = latest_run(parse_records(one_head_file, "one-head"))
-    nheads_ts, nheads_records = latest_run(parse_records(nheads_file, nheads_label))
-
-    one_by_key = index_records(one_records, "one-head")
-    nheads_by_key = index_records(nheads_records, nheads_label)
-    common_keys = sorted(set(one_by_key) & set(nheads_by_key), key=str)
+    a_by_key = index_records(a_records, args.a_label)
+    b_by_key = index_records(b_records, args.b_label)
+    common_keys = sorted(set(a_by_key) & set(b_by_key), key=str)
 
     if not common_keys:
         print("错误：两个结果文件没有可比较的共同配置", file=sys.stderr)
-        print(f"one-head latest run: {one_ts}, records={len(one_by_key)}", file=sys.stderr)
-        print(f"{nheads_label} latest run: {nheads_ts}, records={len(nheads_by_key)}", file=sys.stderr)
+        print(f"{args.a_label} latest run: {a_ts}, records={len(a_by_key)}", file=sys.stderr)
+        print(f"{args.b_label} latest run: {b_ts}, records={len(b_by_key)}", file=sys.stderr)
         sys.exit(1)
 
-    missing_in_nheads = len(set(one_by_key) - set(nheads_by_key))
-    missing_in_one = len(set(nheads_by_key) - set(one_by_key))
-    if missing_in_nheads or missing_in_one:
+    missing_in_b = len(set(a_by_key) - set(b_by_key))
+    missing_in_a = len(set(b_by_key) - set(a_by_key))
+    if missing_in_b or missing_in_a:
         print(
-            f"提示：仅绘制共同配置；one-head 独有 {missing_in_nheads} 条，"
-            f"{nheads_label} 独有 {missing_in_one} 条",
+            f"提示：仅绘制共同配置；{args.a_label} 独有 {missing_in_b} 条，"
+            f"{args.b_label} 独有 {missing_in_a} 条",
             file=sys.stderr,
         )
 
     groups: dict[tuple, list[tuple[dict, dict]]] = {}
     for key in common_keys:
-        groups.setdefault(group_key_from_key(key), []).append((one_by_key[key], nheads_by_key[key]))
+        groups.setdefault(group_key_from_key(key), []).append((a_by_key[key], b_by_key[key]))
     for pairs in groups.values():
         pairs.sort(key=lambda pair: pair[0]["num_tok"])
 
     fig, ax = plt.subplots(figsize=(12, 7))
     colors = [plt.cm.tab10(i % 10) for i in range(len(groups))]
     single = len(groups) == 1
-    all_nt = sorted({one["num_tok"] for pairs in groups.values() for one, _nheads in pairs})
+    all_nt = sorted({a["num_tok"] for pairs in groups.values() for a, _b in pairs})
 
     for i, (gkey, pairs) in enumerate(sorted(groups.items(), key=lambda kv: str(kv[0]))):
-        xs = [one["num_tok"] for one, _nheads in pairs]
+        xs = [a["num_tok"] for a, _b in pairs]
         lbl = group_label(gkey)
         c = colors[i]
 
         if args.metric == "gflops":
-            one_ys = [one["op_gf"] for one, _nheads in pairs]
-            nheads_ys = [nheads["op_gf"] for _one, nheads in pairs]
-            ax.plot(xs, one_ys, marker="o", linestyle="-",
+            ax.plot(xs, [a["op_gf"] for a, _b in pairs], marker="o", linestyle="-",
                     color=c, linewidth=1.8, markersize=6,
-                    label=("one-head" if single else f"{lbl} [one-head]"))
-            ax.plot(xs, nheads_ys, marker="^", linestyle="--",
+                    label=(args.a_label if single else f"{lbl} [{args.a_label}]"))
+            ax.plot(xs, [b["op_gf"] for _a, b in pairs], marker="^", linestyle="--",
                     color=c, linewidth=1.5, markersize=6,
-                    label=(nheads_label if single else f"{lbl} [{nheads_label}]"))
-            for one, nheads in pairs:
-                speedup = one["op_ms"] / nheads["op_ms"] if nheads["op_ms"] > 0 else float("inf")
-                ax.annotate(f"{speedup:.2f}x", xy=(one["num_tok"], nheads["op_gf"]),
+                    label=(args.b_label if single else f"{lbl} [{args.b_label}]"))
+            for a, b in pairs:
+                speedup = a["op_ms"] / b["op_ms"] if b["op_ms"] > 0 else float("inf")
+                ax.annotate(f"{speedup:.2f}x", xy=(a["num_tok"], b["op_gf"]),
                             xytext=(0, 8), textcoords="offset points",
                             ha="center", fontsize=7, color=c)
 
         elif args.metric == "time":
-            ax.plot(xs, [one["op_ms"] for one, _nheads in pairs], marker="o", linestyle="-",
+            ax.plot(xs, [a["op_ms"] for a, _b in pairs], marker="o", linestyle="-",
                     color=c, linewidth=1.8, markersize=6,
-                    label=("one-head" if single else f"{lbl} [one-head]"))
-            ax.plot(xs, [nheads["op_ms"] for _one, nheads in pairs], marker="^", linestyle="--",
+                    label=(args.a_label if single else f"{lbl} [{args.a_label}]"))
+            ax.plot(xs, [b["op_ms"] for _a, b in pairs], marker="^", linestyle="--",
                     color=c, linewidth=1.5, markersize=6,
-                    label=(nheads_label if single else f"{lbl} [{nheads_label}]"))
+                    label=(args.b_label if single else f"{lbl} [{args.b_label}]"))
 
         else:  # speedup
-            speedups = [one["op_ms"] / nheads["op_ms"] for one, nheads in pairs]
+            speedups = [a["op_ms"] / b["op_ms"] for a, b in pairs]
             ax.plot(xs, speedups, marker="D", linestyle="-",
                     color=c, linewidth=2.0, markersize=6,
-                    label=(lbl if not single else f"{nheads_label} / one-head"))
+                    label=(lbl if not single else f"{args.b_label} / {args.a_label}"))
 
     ylabel = {
         "gflops": "Performance (GFLOPS)",
         "time": "Median latency (ms)",
-        "speedup": "Speedup (one-head ms / NHeads ms)",
+        "speedup": f"Speedup ({args.a_label} ms / {args.b_label} ms)",
     }[args.metric]
     title = {
-        "gflops": "Fused QK-Norm+RoPE: one-head op vs NHeads op — GFLOPS",
-        "time": "Fused QK-Norm+RoPE: one-head op vs NHeads op — latency",
-        "speedup": "Fused QK-Norm+RoPE: NHeads speedup over one-head",
+        "gflops": "Fused QK-Norm+RoPE: NHeads algorithm compare — GFLOPS",
+        "time": "Fused QK-Norm+RoPE: NHeads algorithm compare — latency",
+        "speedup": "Fused QK-Norm+RoPE: NHeads algorithm speedup",
     }[args.metric]
 
     ax.set_xlabel("num_tokens", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(f"{title}   (one-head @ {one_ts}; {nheads_label} @ {nheads_ts})", fontsize=13)
+    ax.set_title(f"{title}   ({args.a_label} @ {a_ts}; {args.b_label} @ {b_ts})", fontsize=13)
     ax.set_xscale("log", base=2)
     ax.set_xticks(all_nt)
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{int(v)}"))
@@ -255,7 +245,7 @@ def main() -> None:
 
     plt.tight_layout()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out = OUTPUT_DIR / f"one_head_vs_{output_suffix}_{args.metric}.png"
+    out = OUTPUT_DIR / f"NHeads_algorithm_compare_{args.metric}.png"
     plt.savefig(out, dpi=150)
     print(f"已保存：{out}")
 

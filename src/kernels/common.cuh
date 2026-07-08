@@ -33,5 +33,5 @@
 
 
 #ifndef ALGORITHM
-#define ALGORITHM 0
+#define ALGORITHM 1
 #endif

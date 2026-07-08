@@ -208,7 +208,197 @@ kernel」。这正是 AT_DISPATCH_FLOATING_TYPES_AND2 内部 (D7) 那段检查�
 
 
 ================================================================================
-九、一图速记
+九、if constexpr vs switch/case：谁会编译哪些分支
+================================================================================
+
+1. 核心区别
+
+    if constexpr：
+      · 条件必须是编译期常量表达式。
+      · 在模板实例化时，编译器只保留命中的分支。
+      · 未命中分支是 discarded statement；对当前模板实参来说，不会实例化里面的模板调用。
+
+    switch/case：
+      · 选择哪个 case 是运行时控制流。
+      · 编译器必须让所有 case 里的代码都能编译。
+      · case 里如果调用某个模板特化，该调用会触发模板实例化；即使运行时永远走不到这个 case。
+
+  所以：
+
+    if constexpr 能用于“挡掉不合法模板组合”。
+    switch/case 只能用于“运行时选择执行哪个分支”，不能阻止 case 里的模板代码被编译/实例化。
+
+2. 本项目里的典型问题：packed_as<float,8>
+
+  假设只定义了：
+
+    packed_as<float,1> -> float
+    packed_as<float,2> -> float2
+    packed_as<float,4> -> float4
+
+  那么 `packed_as<float,8>` 是非法类型。对 `float + head_dim=256` 来说：
+
+    elementBytesPerHeadPerThread = (head_dim / 32) * sizeof(float)
+                                 = 8 * 4
+                                 = 32B
+    packedNum = elementBytesPerHeadPerThread / 4 = 8
+
+  如果代码写成运行时 switch：
+
+    switch (head_dim) {
+      case 64:
+        launch<float, 64>(...);
+        break;
+      case 128:
+        launch<float, 128>(...);
+        break;
+      case 256:
+        launch<float, 256>(...);   // 里面可能用 packed_as<float,8>
+        break;
+    }
+
+  即使运行时不选 `case 256`，这个 case 里的 `launch<float,256>` 仍然要编译，
+  从而实例化到 `packed_as<float,8>`，编译期就会报错。
+
+3. 正确挡法：放进模板里的 if constexpr
+
+    template <typename scalar_t, int head_dim>
+    void launch(...) {
+      constexpr int elementBytesPerThread =
+          (head_dim / 32) * sizeof(scalar_t);
+      constexpr int packedNum = elementBytesPerThread / 4;
+
+      if constexpr (packedNum >= 1 && packedNum <= 4) {
+        using Vec = typename packed_as<float, packedNum>::type;
+        fused_kernel<scalar_t, head_dim, Vec><<<...>>>(...);
+      } else {
+        TORCH_CHECK(false, "unsupported dtype/head_dim combination");
+      }
+    }
+
+  当实例化：
+
+    launch<float, 256>(...)
+
+  时：
+
+    packedNum == 8
+    if constexpr (packedNum >= 1 && packedNum <= 4) == false
+
+  因此 true 分支被丢弃，里面的：
+
+    packed_as<float,8>
+    fused_kernel<float,256,...>
+
+  都不会被实例化。运行时如果真的请求这个非法组合，会进入 else 分支报错，而不是编译失败。
+
+4. 和普通 if 的区别
+
+  如果写成普通 if：
+
+    if (packedNum >= 1 && packedNum <= 4) {
+      using Vec = typename packed_as<float, packedNum>::type;
+      ...
+    } else {
+      ...
+    }
+
+  即使 `packedNum` 是 constexpr，普通 if 的两个分支也都要通过编译检查；
+  非法分支仍可能触发 `packed_as<float,8>` 错误。要表达“编译期丢弃这个分支”，必须写
+  `if constexpr`。
+
+5. 运行期回退例子：cos/sin 16B cp.async 对齐检查
+
+  本项目 algorithm 1 如果用 16B cp.async 分别搬运 cos[token, :] 和 sin[token, :]，
+  会遇到一个运行期形状限制：
+
+    const auto half = static_cast<std::uint64_t>(rotary_dim / 2);
+    const auto totalBytesCosPerWarp =
+        half * static_cast<std::uint64_t>(sizeof(cache_scalar_t));
+
+    // algorithm 1 用 16B cp.async 分别搬 cos[token, :] 和 sin[token, :]。
+    // cos/sin 是两个独立 tensor，所以每段都要求 half * sizeof(cache_scalar_t)
+    // 是 16B 整数倍。否则最后一笔 16B cp.async 会越过该行有效范围。
+    if (totalBytesCosPerWarp % 16 != 0) {
+      launch_algorithm0(...);   // 运行期回退
+      return;
+    }
+
+    launch_algorithm1(...);
+
+  这个 `if` 是普通运行期分支。它的作用是：
+
+    - 编译期：algorithm 0 和 algorithm 1 两边的代码都必须能编译通过。
+    - 运行期：根据当前 rotary_dim/cache_scalar_t 组合，选择真正执行哪条路径。
+
+  所以它只能挡住“运行时 shape 不适合 algorithm 1”的情况，不能挡住“algorithm 1
+  对当前模板实参根本无法编译”的情况。比如 algorithm 1 分支里如果实例化了非法类型：
+
+    using Vec = typename packed_as<float, 0>::type;  // 假设 packed_as<float,0> 未定义
+
+  即使运行期一定会走 `launch_algorithm0(...)`，普通 `if` 也挡不住这个编译错误。
+
+  正确的结构通常是两层判断：
+
+    template <typename qkv_scalar_t, typename cache_scalar_t, int head_dim>
+    void launch(...) {
+      if constexpr (algorithm1_can_compile<qkv_scalar_t, cache_scalar_t, head_dim>) {
+        const auto half = static_cast<std::uint64_t>(rotary_dim / 2);
+        const auto totalBytesCosPerWarp =
+            half * static_cast<std::uint64_t>(sizeof(cache_scalar_t));
+
+        if (totalBytesCosPerWarp % 16 != 0) {
+          launch_algorithm0(...);   // 运行期 shape 不满足，回退
+          return;
+        }
+
+        launch_algorithm1(...);     // 编译期合法，运行期也满足 16B 要求
+      } else {
+        launch_algorithm0(...);     // 编译期不支持 algorithm 1，只编译 fallback
+      }
+    }
+
+  这里两种分支各管一层：
+
+    - `if constexpr` 管“这段 algorithm 1 代码对当前模板实参能不能编译”。
+    - 普通 `if` 管“当前运行期参数是否满足 algorithm 1 的地址/长度约束”。
+
+  对比 switch/case 也是一样：switch 只能运行期选择某个 case，不能阻止其他 case
+  里的模板 launch 被编译；如果某个 case 会实例化非法模板组合，仍然要在模板内部用
+  `if constexpr`、模板特化或 SFINAE 做编译期裁剪。
+
+6. 注意：if constexpr 不是预处理 #if
+
+  `if constexpr` 丢弃的是 C++ 语义里的分支，不是文本删除。它能挡住“依赖模板参数、
+  在当前实例下不该实例化”的代码，但不能藏住明显语法错误：
+
+    template <int N>
+    void f() {
+      if constexpr (N == 0) {
+        // ...
+      } else {
+        using T = typename packed_as<float, N>::type;  // N=0 时此分支丢弃，不实例化
+      }
+    }
+
+  但下面这种无论如何都是语法错误：
+
+    if constexpr (false) {
+      int x = ;  // 语法本身坏了，仍然不能写
+    }
+
+7. 对比表
+
+    | 机制                         | 选择时机 | 未选分支是否编译/实例化             | 能否挡非法模板组合 |
+    |------------------------------|----------|--------------------------------------|--------------------|
+    | 普通 if                      | 运行时   | 两边都要能编译                       | 否                 |
+    | switch/case                  | 运行时   | 所有 case 都要能编译；模板调用会实例化 | 否                 |
+    | if constexpr（模板上下文中） | 编译期   | 未选分支丢弃，不实例化依赖模板代码   | 是                 |
+    | 模板特化 / 重载 / SFINAE     | 编译期   | 未选候选不实例化                     | 是                 |
+
+
+================================================================================
+十、一图速记
 ================================================================================
 
     constexpr 函数  ── 提供 ──▶  一个「能在编译期算出的布尔/数值常量」
@@ -225,3 +415,5 @@ kernel」。这正是 AT_DISPATCH_FLOATING_TYPES_AND2 内部 (D7) 那段检查�
 相关文件：
     docs/c++/AT_DISPATCH_FLOATING_TYPES_AND2.txt  —— 该宏的完整逐层展开，
         其 (D7) 节即本文 Part B 第八点所讲的检查。
+    docs/c++/switch_case_fallthrough_and_warnings.txt —— switch/case 会编译所有 case、
+        不能阻止非法模板实例化的完整案例。

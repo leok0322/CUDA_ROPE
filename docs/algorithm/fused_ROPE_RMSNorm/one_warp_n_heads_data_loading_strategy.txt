@@ -188,64 +188,179 @@
     · cos/sin 用 cp.async 进入 SMEM，尝试和第一个 head 的 RMSNorm 重叠。
     · q_weight/k_weight 直接放寄存器，避免 q/k weight 的 SMEM 中转。
 
+  这里要特别区分 QKV 和 cos/sin 的加载粒度。
+
+  QKV 的加载是 lane-owned：
+
+    · 每个 head 的 QKV 都不同，不能跨 head 复用。
+    · lane i 搬自己后续要计算的 QKV slice，后面也由 lane i 从 SMEM 读回。
+    · SMEM layout 推荐仍然是：
+
+        [warp][qkv_buffer][lane][element]
+
+      其中 qkv_buffer 只有 current/next 两个 slot，用来做双缓冲。
+    · 每条 cp.async 的宽度是 elementBytesPerHeadPerThread，通常已经被限制为
+      4B/8B/16B。
+    · producer lane == consumer lane，通常 cp_async_wait_group 后就能读自己的 QKV；
+      不需要为了 QKV 本身额外做跨 lane 同步。
+
+  cos/sin 的加载是 warp-cooperative row copy：
+
+    · 同一个 token 的多个 head 复用同一份 cos/sin。
+    · cos/sin 不应该按 QKV 的 [head_buffer][lane][element] 存，也不需要 head_buffer。
+    · per-warp SMEM 中只需要一份当前 token 的 cos/sin：
+
+        [warp][cos_sin_element]
+
+      或者拆开看：
+
+        [warp][0, rotary_dim / 2)             -> cos
+        [warp][rotary_dim / 2, rotary_dim)    -> sin
+
+    · 搬运时不要让每个 lane 只搬自己要用的 1 个 half/bf16 元素。那样在
+      T_cache=half/bf16 且每 lane 只需 1 个 cos 时，单次数据只有 2B，而 cp.async
+      不支持 cp-size=2。
+    · 更合适的方式是整个 warp 协作，把 cos/sin 行当成 raw bytes 按 16B chunk 搬：
+
+        lane 0 搬第 0 个 16B
+        lane 1 搬第 1 个 16B
+        ...
+
+      这正是 vLLM NTokenHeads 版本解决 2B half/bf16 问题的方式：每条 cp.async 都是
+      16B，而不是 2B。
+    · 如果使用纯 16B cp.async，cos_sin_bytes 最好是 16B 的整数倍；否则需要 padding、
+      src-size/zero-fill 且保证不会覆盖相邻 slot，或者直接回退到寄存器/普通 load 版本。
+      vLLM NTokenHeads 对 rotary_bytes % 16 != 0 的情况选择回退 baseline。
+
+  因此，方案 1 不是“所有数据都按 lane-owned 方式进 SMEM”。更准确是：
+
+    QKV:
+      [warp][buffer][lane][element]，lane-owned，服务 current/next 双缓冲。
+
+    cos/sin:
+      [warp][cos/sin row]，warp 协作按 16B chunk 搬一整行，服务多个 head 复用。
+
   伪代码形态：
 
-    char* qkv_buf0 = this_warp_qkv;
-    char* qkv_buf1 = this_warp_qkv + qkv_tile_bytes_per_head;
+    // 当前代码中的权重加载放在 cp.async warmup 之前。
+    // 它使用 T_in_tran 一次性向量化加载 q_weight/k_weight 到寄存器，
+    // 后续每个 head 的 RMSNorm 再从 packed 寄存器值中拆出 T_in 标量。
+    elementQWeight = vector_load(q_weight + laneIdx * elementNumPerHeadPerThread);
+    elementKWeight = vector_load(k_weight + laneIdx * elementNumPerHeadPerThread);
 
-    cp_async_qkv_head(0, qkv_buf0);
+    // dynamic SMEM 被手动切成两块：
+    //
+    //   [QKV double buffer for all warps in block]
+    //   [warp0 cos][warp0 sin]
+    //   [warp1 cos][warp1 sin]
+    //   ...
+    //
+    // 其中 QKV 段按 T_in 解释，cos/sin 段按 T_cache 解释；因为二者 sizeof 可能不同，
+    // 跨区域切分必须用 char* 字节 offset，不能把整块 dynamicSmem 统一当 T_in* 做元素下标。
+    qkvBytesPerBlock =
+        warpsPerBlock * 32 * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread * sizeof(T_in);
+
+    qkv_channel0 =
+        dynamicSmem
+      + (warpIdxPerBlock * 32 * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread
+         + 0 * 32 * elementNumPerHeadPerThread
+         + laneIdx * elementNumPerHeadPerThread) * sizeof(T_in);
+
+    qkv_channel1 =
+        dynamicSmem
+      + (warpIdxPerBlock * 32 * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread
+         + 1 * 32 * elementNumPerHeadPerThread
+         + laneIdx * elementNumPerHeadPerThread) * sizeof(T_in);
+
+    cosBytesPerWarp = (rotary_dim / 2) * sizeof(T_cache);
+    sinBytesPerWarp = cosBytesPerWarp;
+
+    cosSinBaseForThisWarp =
+        qkvBytesPerBlock + warpIdxPerBlock * (cosBytesPerWarp + sinBytesPerWarp);
+
+    cos_smem = dynamicSmem + cosSinBaseForThisWarp;
+    sin_smem = cos_smem + cosBytesPerWarp;
+
+    // host 侧对应的 dynamic_smem_bytes：
+    //
+    //   warpsPerBlock * 32 * HeadsNumPerWarpSMEM * elementBytesPerHeadPerThread
+    // + warpsPerBlock * 2 * bytesCosPerWarp
+    //
+    // 这里的 2 分别是 cos 和 sin。只加一份 bytesCosPerWarp 会导致 sin 写越界。
+
+    // QKV: lane-owned copy。
+    // 每个 lane 只搬自己负责的 QKV slice，SMEM layout 是 [warp][buffer][lane][element]。
+    cp_async_qkv_head_lane_owned(head0, qkv_channel0);
     cp_async_commit_group();  // group0: head0 QKV
 
-    cp_async_cos_sin_to_smem(this_warp_cos_sin, tokenIdx);
+    // cos/sin: warp-cooperative row copy。
+    // 当前项目 cos 和 sin 是两个独立 tensor，所以分别把当前 token 的 cos 行和 sin 行
+    // 按 16B chunk 搬到当前 warp 的 [cos][sin] SMEM 段。
+    //
+    //   chunkId = laneIdx, laneIdx + 32, laneIdx + 64, ...
+    //   byteOffset = 16 * chunkId
+    //
+    //   cp.async(global_cos + tokenOffset + byteOffset,
+    //            smem_cos   + byteOffset,
+    //            16)
+    //
+    //   cp.async(global_sin + tokenOffset + byteOffset,
+    //            smem_sin   + byteOffset,
+    //            16)
+    //
+    // 这要求 cosBytesPerWarp 是 16B 的整数倍。当前 host 侧 algorithm 1 分支用
+    // bytesCosPerWarp % 16 != 0 做运行期检查，不满足时回退 one-head baseline。
+    for (uint chunkId = laneIdx; chunkId < cosBytesPerWarp / 16; chunkId += 32) {
+      uint byteOffset = 16 * chunkId;
+      cp_async_cos_16B(cos_smem + byteOffset, cos_global + tokenOffset + byteOffset);
+      cp_async_sin_16B(sin_smem + byteOffset, sin_global + tokenOffset + byteOffset);
+    }
     cp_async_commit_group();  // group1: cos/sin
 
-    // q/k weight 是同步 global/read-only load。放在 cp.async 之后做，
-    // 可以让这部分寄存器加载和前面的异步搬运在时间上部分重叠。
-    float q_w[elementNumPerHeadPerThread];
-    float k_w[elementNumPerHeadPerThread];
-
-    #pragma unroll
-    for (uint i = 0; i < elementNumPerHeadPerThread; ++i) {
-      uint dim = laneIdx * elementNumPerHeadPerThread + i;
-      q_w[i] = convert(q_weight[dim]);
-      k_w[i] = convert(k_weight[dim]);
-    }
-
-    cp_async_wait_group<1>();  // head0 QKV 完成，允许较新的 cos/sin 仍在途。
-    __syncwarp();
+    // head0 QKV 是 lane-owned，producer lane == consumer lane。
+    // wait_group<1> 保证较老的 head0 QKV 完成，同时允许较新的 cos/sin group 仍在途。
+    // 这里不需要为了 QKV 额外 __syncwarp()。
 
     for (uint k = 0; k < headNumInWarp; ++k) {
       uint next = k + 1;
 
+      cp_async_wait_group<1>();
+
       if (next < headNumInWarp) {
-        char* next_qkv_buf = (next & 1) ? qkv_buf1 : qkv_buf0;
-        cp_async_qkv_head(next, next_qkv_buf);
+        char* next_qkv_buf = (next & 1) ? qkv_channel1 : qkv_channel0;
+        cp_async_qkv_head_lane_owned(next, next_qkv_buf);
         cp_async_commit_group();
       }
 
-      char* cur_qkv_buf = (k & 1) ? qkv_buf1 : qkv_buf0;
+      char* cur_qkv_buf = (k & 1) ? qkv_channel1 : qkv_channel0;
       vec_T qkv_vec = load_qkv_from_smem(cur_qkv_buf);
 
-      // RMSNorm 使用寄存器里的 q_w/k_w；这段计算可以覆盖 cos/sin 剩余加载延迟
-      // 和 next head QKV 的加载延迟。
-      compute_qknorm(qkv_vec, q_w, k_w, elements);
+      // RMSNorm 使用寄存器里的 elementQWeight/elementKWeight；这段计算可以覆盖
+      // cos/sin 剩余加载延迟和 next head QKV 的加载延迟。
+      compute_qknorm(qkv_vec, elementQWeight, elementKWeight, elements);
 
-      if (k == 0) {
-        if (next < headNumInWarp) {
-          cp_async_wait_group<1>();  // 等较老的 cos/sin，允许最新 next QKV 仍在途。
-        } else {
-          cp_async_wait_group<0>();
-        }
-        __syncwarp();
-      }
-
-      apply_rope_from_smem_cos_sin(elements, cos_smem, sin_smem);
-      store_back_qkv(k, elements);
-
+      // RoPE 前必须保证 cos/sin 已经到达 SMEM。
+      // 如果本轮已经预取了 next QKV, 最新 group 是 next QKV; wait_group<1>
+      // 会等待更老的 cos/sin, 同时允许 next QKV 继续在途。
+      // 如果本轮没有 next QKV, cos/sin 仍可能是最新 group, 必须 wait_group<0>。
       if (next < headNumInWarp) {
-        cp_async_wait_group<0>();  // 下一轮读 next QKV 前保证它到位。
-        __syncwarp();
+        cp_async_wait_group<1>();
+      } else {
+        cp_async_wait_group<0>();
       }
+
+      // cos/sin 是 warp 协作搬入的。wait_group 只等待当前线程自己的 cp.async,
+      // __syncwarp() 用来保证本 warp 里 producer lane 写入的 SMEM 对 consumer lane 可见。
+      __syncwarp();
+
+      // 每个 lane 从 per-warp cos/sin SMEM 中读取自己负责的 rotary 位置：
+      //
+      //   cos index = laneIdx * (elementNumPerHeadPerThread / 2) + j
+      //   sin index = half + laneIdx * (elementNumPerHeadPerThread / 2) + j
+      //
+      // 这里必须包含 warp 的 cos/sin base offset，否则不同 warp 会读到同一份 cos/sin。
+      apply_rope_from_smem_cos_sin(elements, cos_smem, sin_smem, laneIdx);
+      store_back_qkv(k, elements);
     }
 
   优点：
@@ -259,6 +374,8 @@
     · cos/sin 仍然要从 SMEM 读回寄存器参与 RoPE。
     · 需要 per-warp cos/sin SMEM 和两个 QKV SMEM buffer。
     · cp.async group 顺序和 wait_group 安排更复杂。
+    · RoPE 前的 wait_group 需要根据是否已经发出 next QKV 分支处理；无条件
+      wait_group<0> 更简单但会等待 next QKV，减少重叠。
 
 
 --------------------------------------------------------------------------------
@@ -809,22 +926,36 @@
   执行顺序：
 
     1. 计算 tokenIdx、firstHeadIdx、headNumInWarp。
-    2. 预取 head0 QKV 到 qkv_buf0，commit。
-    3. 预取 cos/sin 到 this_warp_cos_sin，commit。
-    4. 加载 q_weight/k_weight 到寄存器 q_w/k_w。
-    5. wait_group<1>，保证 head0 QKV 到位，允许 cos/sin 继续在途。
-    6. 对每个 head：
+    2. 加载 q_weight/k_weight 到寄存器 elementQWeight/elementKWeight。
+       当前代码用 T_in_tran 向量化读取，然后 RMSNorm 阶段按 T_in 拆包。
+    3. 预取 head0 QKV 到 qkv_channel0，commit，形成 group0。
+    4. 预取当前 token 的 cos/sin 到当前 warp 的 per-warp cos/sin SMEM，commit，形成 group1。
+       cos/sin 是分开的两个 tensor，代码分别按 16B chunk 搬 cos 行和 sin 行。
+    5. 对每个 head：
+       · wait_group<1>，保证 current head 的 QKV 到位，允许较新的 group 继续在途。
        · 预取 next QKV 到另一个 qkv buffer。
        · 从 current QKV buffer 读到寄存器。
-       · 用 q_w/k_w 计算 QK RMSNorm。
-       · 第一个 head 进入 RoPE 前等待 cos/sin 到位。
+       · 用 elementQWeight/elementKWeight 计算 QK RMSNorm。
+       · 进入 RoPE 前等待 cos/sin：
+           如果本轮已经发出 next QKV，用 wait_group<1> 等更老的 cos/sin，
+           同时允许最新的 next QKV 继续在途；
+           如果没有 next QKV，用 wait_group<0> 等 cos/sin。
+       · __syncwarp()，保证 warp 协作搬入的 cos/sin 对本 warp 所有 lane 可见。
        · 从 cos/sin SMEM 读出并做 RoPE。
        · 写回 qkv。
+
+  RoPE 前 wait_group 的关键点：
+
+    · 直接 wait_group<0> 总是正确，但如果本轮已经发出了 next QKV，它也会等待 next QKV，
+      减少 next QKV 与当前 RoPE/写回的重叠。
+    · 分支写法更符合当前流水：有 next QKV 时 wait_group<1>，没有 next QKV 时 wait_group<0>。
+    · wait_group 只解决当前线程自己的 cp.async 完成问题；cos/sin 是 warp 协作搬入的，
+      所以 wait 后仍需要 __syncwarp() 解决跨 lane 共享。
 
   主要观察指标：
 
     · cos/sin cp.async 是否被 RMSNorm 和 next QKV 预取有效覆盖。
-    · q_w/k_w 长生命周期寄存器是否导致寄存器数过高。
+    · elementQWeight/elementKWeight 长生命周期寄存器是否导致寄存器数过高。
     · cos/sin SMEM 读取和 SMEM 占用是否可接受。
 
 

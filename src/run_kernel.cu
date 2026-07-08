@@ -102,34 +102,33 @@ void launch_fused_QKNorm_and_ROPE_kernel(
         cudaCheck(cudaGetLastError());
       }
       else if constexpr (is_MULTI_HEAD_PER_WARP) {
-        dim3 blockSize {BLOCK_SIZE_X,1,1};
-        // uint headsPerBlock {BLOCK_SIZE_X / 32 * HEADS_PER_WARP};
-        // dim3 gridSize {cuda::ceil_div(totalQKHeads,headsPerBlock),1,1};
-
-        // NHeads kernel不是把num_tokens*(num_heads_q+num_heads_k)看成一个连续head流来切分。
-        // kernel内部的映射是:
-        //   globalWarpIdx -> tokenIdx = globalWarpIdx / warpsPerToken
-        //                  -> warpIdxInToken = globalWarpIdx % warpsPerToken
-        // 因此每个token都独立需要ceil(qkHeadsPerToken / HEADS_PER_WARP)个warp。
-        // 如果直接用ceil(totalQKHeads / (warpsPerBlock * HEADS_PER_WARP)),当单个token的QK head数
-        // 不能被HEADS_PER_WARP整除时,会把前一个token的tail空位错误地让下一个token复用,导致grid偏小。
-        uint qkHeadsPerToken {static_cast<uint>((num_heads_q + num_heads_k))};
-        uint warpsPerToken {cuda::ceil_div(qkHeadsPerToken,HEADS_PER_WARP)};
-        uint totalWarps {static_cast<uint>(num_tokens) * warpsPerToken};
-        dim3 gridSize {cuda::ceil_div(totalWarps,warpsPerBlock),1,1};
-
-
         // 动态SMEM分配
         uint dynamicSMEM {};
+        // algorithm 0只把QKV异步搬进dynamic SMEM。
+        // 逻辑上,一个warp最多处理HEADS_PER_WARP个head,但SMEM不需要为所有head各留一份;
+        // QKV流水只需要current/next两个buffer轮换,所以每个warp只分配2个head slot。
+        // 每个slot由32个lane组成,每个lane搬elementBytesPerHeadPerThread字节:
+        //   32 * HeadsNumPerWarpSMEM(=2) * elementBytesPerHeadPerThread
+        // 个字节。一个block有warpsPerBlock个warp,所以dynamic SMEM还要再乘warpsPerBlock。
+        // kernel内部使用时必须按warp/head/lane切分dynamicSmem offset,否则多个warp会覆盖同一段SMEM。
+        constexpr uint HeadsNumPerWarpSMEM {2};
         if constexpr (ALGORITHM == 0) {
-          // algorithm 0只把QKV异步搬进dynamic SMEM。
-          // 逻辑上,一个warp最多处理HEADS_PER_WARP个head,但SMEM不需要为所有head各留一份;
-          // QKV流水只需要current/next两个buffer轮换,所以每个warp只分配2个head slot。
-          // 每个slot由32个lane组成,每个lane搬elementBytesPerHeadPerThread字节:
-          //   32 * HeadsNumPerWarpSMEM(=2) * elementBytesPerHeadPerThread
-          // 个字节。一个block有warpsPerBlock个warp,所以dynamic SMEM还要再乘warpsPerBlock。
-          // kernel内部使用时必须按warp/head/lane切分dynamicSmem offset,否则多个warp会覆盖同一段SMEM。
-          constexpr uint HeadsNumPerWarpSMEM {2};
+          dim3 blockSize {BLOCK_SIZE_X,1,1};
+          // uint headsPerBlock {BLOCK_SIZE_X / 32 * HEADS_PER_WARP};
+          // dim3 gridSize {cuda::ceil_div(totalQKHeads,headsPerBlock),1,1};
+
+          // NHeads kernel不是把num_tokens*(num_heads_q+num_heads_k)看成一个连续head流来切分。
+          // kernel内部的映射是:
+          //   globalWarpIdx -> tokenIdx = globalWarpIdx / warpsPerToken
+          //                  -> warpIdxInToken = globalWarpIdx % warpsPerToken
+          // 因此每个token都独立需要ceil(qkHeadsPerToken / HEADS_PER_WARP)个warp。
+          // 如果直接用ceil(totalQKHeads / (warpsPerBlock * HEADS_PER_WARP)),当单个token的QK head数
+          // 不能被HEADS_PER_WARP整除时,会把前一个token的tail空位错误地让下一个token复用,导致grid偏小。
+          uint qkHeadsPerToken {static_cast<uint>((num_heads_q + num_heads_k))};
+          uint warpsPerToken {cuda::ceil_div(qkHeadsPerToken,HEADS_PER_WARP)};
+          uint totalWarps {static_cast<uint>(num_tokens) * warpsPerToken};
+          dim3 gridSize {cuda::ceil_div(totalWarps,warpsPerBlock),1,1};
+
           dynamicSMEM = warpsPerBlock * 32 * HeadsNumPerWarpSMEM * elementBytesPerHeadPerThread;
           // 调整dynamicSMEM时要同时检查硬件限制:这里的dynamicSMEM是每个block请求的动态shared memory字节数。
           // dynamicSMEM + kernel静态shared memory不能超过当前GPU允许的per-block shared memory上限。
@@ -191,11 +190,97 @@ void launch_fused_QKNorm_and_ROPE_kernel(
           fused_QKNorm_ROPE_NHeads_kernel<qkv_scalar_t,cache_scalar_t,head_dim,HEADS_PER_WARP,ALGORITHM><<<gridSize,blockSize,dynamicSMEM>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
               num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
           cudaCheck(cudaGetLastError());
-        } else if constexpr (ALGORITHM == 1) {
+        }
+        else if constexpr (ALGORITHM == 1) {
+          uint half { static_cast<uint>(rotary_dim / 2) };
+          uint bytesCosPerWarp { half * static_cast<uint>(sizeof(cache_scalar_t)) };
+          // 如果bytesCosPerWarp不是16的倍数，不能统一将cos和sin通过一个warp里的线程用16字节指令加载到SMEM，所以回退到one_head算法
+          if  (bytesCosPerWarp % 16 != 0) {
+            dim3 gridSize {1,cuda::ceil_div(totalQKHeads,warpsPerBlock),1};
+            dim3 blockSize {BLOCK_SIZE_X,1,1};
 
+            fused_QKNorm_and_ROPE_kernel<qkv_scalar_t,cache_scalar_t,head_dim><<<gridSize,blockSize>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
+                 num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
+            cudaCheck(cudaGetLastError());
+          }
+          else {
+            dim3 blockSize {BLOCK_SIZE_X,1,1};
+            // uint headsPerBlock {BLOCK_SIZE_X / 32 * HEADS_PER_WARP};
+            // dim3 gridSize {cuda::ceil_div(totalQKHeads,headsPerBlock),1,1};
 
-        } else if constexpr (ALGORITHM == 2) {
+            // NHeads kernel不是把num_tokens*(num_heads_q+num_heads_k)看成一个连续head流来切分。
+            // kernel内部的映射是:
+            //   globalWarpIdx -> tokenIdx = globalWarpIdx / warpsPerToken
+            //                  -> warpIdxInToken = globalWarpIdx % warpsPerToken
+            // 因此每个token都独立需要ceil(qkHeadsPerToken / HEADS_PER_WARP)个warp。
+            // 如果直接用ceil(totalQKHeads / (warpsPerBlock * HEADS_PER_WARP)),当单个token的QK head数
+            // 不能被HEADS_PER_WARP整除时,会把前一个token的tail空位错误地让下一个token复用,导致grid偏小。
+            uint qkHeadsPerToken {static_cast<uint>((num_heads_q + num_heads_k))};
+            uint warpsPerToken {cuda::ceil_div(qkHeadsPerToken,HEADS_PER_WARP)};
+            uint totalWarps {static_cast<uint>(num_tokens) * warpsPerToken};
+            dim3 gridSize {cuda::ceil_div(totalWarps,warpsPerBlock),1,1};
 
+            // 一个block的每个warp都要保存一个token的half个cos和sin
+            dynamicSMEM = warpsPerBlock * 32 * HeadsNumPerWarpSMEM * elementBytesPerHeadPerThread +
+              warpsPerBlock * 2 * bytesCosPerWarp;
+            int deviceId {};
+            cudaCheck(cudaGetDevice(&deviceId));
+
+            // defaultSharedMemPerBlock是不用额外opt-in时,单个block默认可用的shared memory上限。
+            // staticSMEM + dynamicSMEM不超过这个值时,可以直接launch。
+            int defaultSharedMemPerBlock {};
+            cudaCheck(cudaDeviceGetAttribute(
+                &defaultSharedMemPerBlock,
+                cudaDevAttrMaxSharedMemoryPerBlock,
+                deviceId));
+
+            // optinSharedMemPerBlock是当前设备允许显式opt-in后的单个block shared memory更高上限。
+            // 如果defaultSharedMemPerBlock < staticSMEM + dynamicSMEM <= optinSharedMemPerBlock,
+            // 需要在launch前用cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize)为该kernel申请。
+            // 如果staticSMEM + dynamicSMEM超过这个值,当前设备不支持该shared memory配置,必须报错。
+            int optinSharedMemPerBlock {};
+            cudaCheck(cudaDeviceGetAttribute(
+                &optinSharedMemPerBlock,
+                cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                deviceId));
+
+            cudaFuncAttributes kernelAttrs {};
+            cudaCheck(cudaFuncGetAttributes(
+                &kernelAttrs,
+                fused_QKNorm_ROPE_NHeads_kernel<qkv_scalar_t,cache_scalar_t,head_dim,HEADS_PER_WARP,ALGORITHM>));
+
+            // sharedSizeBytes是kernel编译期已经确定的静态shared memory用量,例如__shared__ float buf[1024]。
+            // 它不包含launch第三个参数传入的dynamicSMEM(extern __shared__ ...),所以总预算要按
+            // staticSMEM + dynamicSMEM判断。
+            const auto staticSMEM {static_cast<uint>(kernelAttrs.sharedSizeBytes)};
+            ROPE_ST_TORCH_CHECK(
+                static_cast<std::uint64_t>(staticSMEM) + dynamicSMEM <=
+                    static_cast<std::uint64_t>(optinSharedMemPerBlock),
+                "ALGORITHM=1 requires dynamicSMEM=", dynamicSMEM,
+                " bytes + staticSMEM=", staticSMEM,
+                " bytes, exceeds device opt-in per-block shared memory limit=",
+                optinSharedMemPerBlock, " bytes");
+
+            // 如果超过默认per-block shared memory上限,但没有超过opt-in上限,需要先给该kernel特化设置
+            // cudaFuncAttributeMaxDynamicSharedMemorySize;否则<<<..., dynamicSMEM>>>启动会因为shared memory过大失败。
+            // 这里是把该kernel特化的cudaFuncAttributeMaxDynamicSharedMemorySize属性设置为dynamicSMEM。
+            // 它表示"允许这个kernel使用的最大dynamic shared memory字节数";真正本次launch分配多少,
+            // 仍由下面<<<gridSize, blockSize, dynamicSMEM>>>的第三个参数决定。
+            if (static_cast<std::uint64_t>(staticSMEM) + dynamicSMEM >
+                static_cast<std::uint64_t>(defaultSharedMemPerBlock)) {
+              cudaCheck(cudaFuncSetAttribute(
+                  fused_QKNorm_ROPE_NHeads_kernel<qkv_scalar_t,cache_scalar_t,head_dim,HEADS_PER_WARP,ALGORITHM>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                  static_cast<int>(dynamicSMEM)));
+            }
+
+            fused_QKNorm_ROPE_NHeads_kernel<qkv_scalar_t,cache_scalar_t,head_dim,HEADS_PER_WARP,ALGORITHM><<<gridSize,blockSize,dynamicSMEM>>>(qkv_ptr,cos_ptr,sin_ptr,q_weight_ptr,k_weight_ptr,
+                num_heads_q,num_heads_k,num_heads_v,rotary_dim,num_tokens,eps);
+            cudaCheck(cudaGetLastError());
+
+          }
+        }
+        else if constexpr (ALGORITHM == 2) {
 
         }
       }

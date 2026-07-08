@@ -95,6 +95,48 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
       · 拷贝字节数。
       · 非 bulk cp.async 常用 cp-size 只有 4、8、16。
 
+  重要限制：不能直接做 1B / 2B 拷贝。
+
+    cp.async 的 cp-size 不是任意字节数，非 bulk 形式常用合法宽度只有 4B / 8B / 16B。
+    因此下面这种写法不是合法的 cp.async 宽度：
+
+      cp.async.ca.shared.global [dst_smem], [src_gmem], 2;   // 错：cp-size 不支持 2B
+
+    这对 half / bf16 的 cos/sin cache 很重要。例如：
+
+      T_cache = half
+      每个线程只负责 1 个 cos 元素
+      sizeof(T_cache) = 2B
+
+    单个 cos 元素只有 2B，不能直接用一次 cp.async ..., 2 异步搬运。可选处理方式通常是：
+
+      1. 直接普通 global load 到寄存器：
+
+           half c = cos[offset];
+
+         对只有 2B 的数据，这通常比强行走 cp.async 更简单。
+
+      2. 合并连续两个 half/bf16，按 4B 搬运：
+
+           2 个 half = 4B
+
+         但要保证 global 源地址和 shared 目标地址都满足 4B 对齐，且这两个连续元素确实
+         都属于当前线程要搬运/后续要消费的数据。
+
+      3. 让某些线程按 4B 搬运，覆盖两个线程的数据：
+
+         这种做法会让 shared memory 数据跨 lane 共享；wait_group 后还需要 __syncwarp()
+         或 __syncthreads()，并且要重新设计 shared layout，复杂度更高。
+
+      4. 使用带 src-size 的 4B cp.async，把实际源字节数设成 2B：
+
+           cp.async.ca.shared.global [dst_smem], [src_gmem], 4, 2;
+
+         这会从 global 读取 2B，并把 shared 目标剩余字节 zero-fill；但 shared 侧仍然写
+         满 4B。如果每个线程的 shared slot 只预留 2B，这会覆盖相邻 slot。因此只有在
+         shared layout 给每个线程留了至少 4B/padding，或者明确允许这种 zero-fill 覆盖
+         的情况下才可用。
+
 
 ================================================================================
 三、inline PTX 写法：shared 地址用 "r"，global 地址用 "l"
@@ -712,6 +754,9 @@ cp.async 用法详解：global -> shared 异步拷贝、group 等待与线程间
     · src-size 大于 cp-size 是错误语义。
     · full copy 时通常直接用无 src-size 版本。
     · 这只处理 global 读取边界；shared 目标地址仍然不能越过已分配 shared memory。
+    · src-size 不会改变 shared 侧写入宽度。比如 cp-size=4、src-size=2 时，global
+      只读 2B，但 shared 仍写满 4B，剩余 2B zero-fill。因此它不能直接用于每线程
+      只有 2B shared slot 的 half/bf16 紧密排布，否则会覆盖相邻 slot。
 
 
 ================================================================================

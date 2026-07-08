@@ -29,6 +29,7 @@ torch.ops.ROPE_cuda.fused_qkv_norm_rope_{neox,interleave}，故对比的是：
   ./run_benchmark_op.sh                                   # 经 venv，跑默认扫描
   uv run python src/scripts/benchmark_fused_qknorm_rope.py --token-sizes 256 1024 4096
   （内部用）... --worker --dtype float16 --head-dim 128 --interleave 0 --token-size 512 ...
+  result_file 可经 --result-file 指定；其所在目录自动创建（dirname 为空时落当前目录）。
 """
 import argparse
 import datetime

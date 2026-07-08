@@ -350,8 +350,200 @@ __global__ void fused_QKNorm_ROPE_NHeads_kernel(void* qkv_void, const void* cos_
       }
     }
     else if constexpr (algorithm == 1) {
+      // 算法1：
+      // q_weight/K_weight分别加载到寄存器
+      // 每个线程预取Head0的qkv到SMEM、cos/sin到SMEM
+      // Head0计算RMSnorm、ROPE重叠和Head1加载qkv到SMEM重叠
+
+      // 提前将改线程要用到的cos/sin加载到寄存器，每个head复用可以复用
+      // 加载q_weight和k_weight
+      // 合并访问事务
+      auto elementQWeight  = reinterpret_cast<const T_in_tran*>(&q_weight[elementNumPerHeadPerThread * threadIdxPerWarp])[0];
+      auto elementKWeight  = reinterpret_cast<const T_in_tran*>(&k_weight[elementNumPerHeadPerThread * threadIdxPerWarp])[0];
+
+
+      // 当前thread，处理qkv的第tokenIdx个token的[fistHeadIdx,fistHeadIdx+headNumInWarp)个head的[threadIdxPerWarp * elementNumPerHeadPerThread,threadIdxPerWarp * elementNumPerHeadPerThread + elementNumPerHeadPerThread)个元素
+      // 传统的HBM数据同步
+      // auto element_tran = reinterpret_cast<T_tran*>(&qkv[tokenIdx * totalHeadsPerToken * head_dim + (fistHeadIdxPerTokenPerThread + i) * head_dim+ threadIdxPerWarp * elementNumPerHeadPerThread])[0];
+
+      // 对Head0的qkv进行异步预取
+      // qkv的双buffer需要存储2个Heads的数据
+      constexpr uint HeadsNumPerWarpSMEM {2};
+
+      // algorithm 1的dynamic SMEM会手动切成多段:QKV段按T_in存,cos/sin段按T_cache存。
+      // 因为sizeof(T_in)和sizeof(T_cache)可能不同,整块SMEM不能统一reinterpret_cast成T_in*
+      // 再用"元素下标"切分;那样所有offset都会被隐式乘sizeof(T_in),切到cos/sin段时容易算错字节位置,
+      // 也不方便给不同区域按各自cp.async/vector访问宽度做padding和对齐。
+      // 因此跨区域切分一律用char* dynamicSmem按"字节offset"计算;到某个具体区域内部后,
+      // 再把该区域起始地址reinterpret_cast成T_in*或T_cache*按真实元素类型访问。
+      // T_in* smem_base = reinterpret_cast<T_in*>(dynamicSmem);
+      // auto* smem_ptr {static_cast<void *>(&smem_base[warpIdxPerBlock  * 32  * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread +
+      //   0 * 32 * elementNumPerHeadPerThread +
+      //   threadIdxPerWarp * elementNumPerHeadPerThread])};
+      auto* smem_qkv_ptr {&dynamicSmem[(warpIdxPerBlock  * 32  * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread +
+      0 * 32 * elementNumPerHeadPerThread +
+      threadIdxPerWarp * elementNumPerHeadPerThread) * sizeof(T_in)]};
+      // HBM指针
+      // 可以直接按照元素偏移
+      auto* qkv_ptr {static_cast<void *>(&qkv[tokenIdx * totalHeadsPerToken * head_dim +
+        fistHeadIdxPerTokenPerThread * head_dim +
+        threadIdxPerWarp * elementNumPerHeadPerThread])};
+
+      // cp.async按elementBytesPerHeadPerThread选择4B/8B/16B拷贝宽度
+      // 提交qkv的异步获取
+      cp_async_shared_global_ca(qkv_ptr,smem_qkv_ptr,elementBytesPerHeadPerThread);
+      // group0
+      cp_async_commit_group();
+
+
+      // cos/sin的预取
+      uint half {static_cast<uint>(rotary_dim / 2)};
+      static_assert(elementNumPerHeadPerThread % 2 == 0,"每个warp的线程处处理的元素是2的倍数");
+
+      // 对SMEM指针进行手动划分找到cos和sin的起始位置
+      uint cosSinBytesInitialOffsetSMEM { warpNumPerBlock * 32 * elementNumPerHeadPerThread * HeadsNumPerWarpSMEM * static_cast<uint>(sizeof(T_in)) };
+      uint warpOffsetPerBlock {warpIdxPerBlock * 2 * half * static_cast<uint>(sizeof(T_cache))};
+      uint BytesInitialOffsetCosSin { tokenIdx * half * static_cast<uint>(sizeof(T_cache)) };
+      // 计算每个线程的负责搬运的cos和sin字节数
+      uint totalBytesCosPerWarp { half * static_cast<uint>(sizeof(T_cache)) };
+      uint totalBytesSinWarp { half * static_cast<uint>(sizeof(T_cache)) };
+      uint bytesCosPerThread { 16 };
+      uint threadNumNeededPerWarp { totalBytesCosPerWarp / bytesCosPerThread };
+
+      // cos/sin 是 warp 协作按 16B chunk 预取,不是每个lane只搬自己要用的T_cache元素。
+      // 这样可以避开half/bf16单元素只有2B、cp.async不支持2B copy的问题。
+      // 这里曾经容易写错的点:
+      //   1. global地址必须是token行首 + 16B * chunkId,不能写成16 + lane或对&cos取地址;
+      //   2. sin的SMEM起点是cos起点 + totalBytesCosPerWarp,不能再额外乘16;
+      //   3. 每个warp都要有自己的[cos][sin]区域,warpOffsetPerBlock必须包含2份cache行;
+      //   4. cp_async_shared_global_ca参数顺序是(global_ptr, smem_ptr, bytes),不能反过来。
+      // 不推荐旧的两段式结构:
+      //   if (totalBytesCosPerWarp / 16 < 32) { lane只处理一次 } else { while(...)多轮处理 }
+      // 这种写法功能上可以做成正确,但分支会重复两套几乎相同的地址计算,很容易出现历史错误:
+      //   · global offset写成16 + lane,而不是16 * chunkId,导致跳过首个16B且破坏16B对齐;
+      //   · 对const char*再static_cast<void*>会丢const;源指针应保持const void*或const char*;
+      //   · commit_group放在内层if里会导致部分lane不执行commit,group边界不统一;
+      //   · 少于32个chunk和多于32个chunk两套代码容易只修一边、另一边继续出错。
+      // 统一用for(chunkId = lane; chunkId < chunks; chunkId += 32)更简单:每个chunk的
+      // byteOffset恒等于16 * chunkId,所有lane走同一个commit_group位置。
+      for (uint i {threadIdxPerWarp}; i < threadNumNeededPerWarp; i+=32) {
+        auto* smem_cos_ptr {&dynamicSmem[cosSinBytesInitialOffsetSMEM + warpOffsetPerBlock + bytesCosPerThread * i]};
+        auto* smem_sin_ptr {&dynamicSmem[cosSinBytesInitialOffsetSMEM + warpOffsetPerBlock + totalBytesCosPerWarp + bytesCosPerThread * i]};
+        const auto* cos_ptr { static_cast<const void* >(reinterpret_cast<const char* >(cos) + BytesInitialOffsetCosSin + bytesCosPerThread *  i) };
+        const auto* sin_ptr { static_cast<const void* >(reinterpret_cast<const char* >(sin) + BytesInitialOffsetCosSin + bytesCosPerThread *  i) };
+        cp_async_shared_global_ca(cos_ptr,smem_cos_ptr,16);
+        cp_async_shared_global_ca(sin_ptr,smem_sin_ptr,16);
+      }
+      //group1
+      cp_async_commit_group();
+
+
+      // headNumInWarp是运行期变量，无法用#pragma unroll展开
+      // qkv的预取与计算重叠
+      for (uint i = 0; i < headNumInWarp; i++) {
+
+
+        // 等待header0的qkv的预取完成
+        cp_async_wait_group<1>();
+
+        // 因为现在1个warp处理多个heads,所以需要在循环里加入的isQ判断
+        // fistHeadIdx + i只是当前token内的QK扁平head编号:前num_heads_q个是Q,后num_heads_k个是K。
+        // 每次循环处理的head可能从Q跨到K,所以必须用isQ，区分当前head的语义,后续才能选择q_weight/k_weight
+        // 并在需要段内headIdx时，对K head减去num_heads_q。
+        uint currentHead = fistHeadIdxPerTokenPerThread + i;
+        bool currentIsQ = currentHead < static_cast<uint>(num_heads_q);
+
+        // 预取nextHead的qkv
+        if (i + 1 < headNumInWarp ) {
+          // SMEM指针
+          uint nextChannelSMEM {(i + 1) % 2 };
+          smem_qkv_ptr  = &dynamicSmem[(warpIdxPerBlock  * 32  * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread +
+          nextChannelSMEM * 32 * elementNumPerHeadPerThread +
+          threadIdxPerWarp * elementNumPerHeadPerThread) * sizeof(T_in)];
+          // HBM指针
+          // 可以直接按照元素偏移
+          auto* qkv_ptr {static_cast<void *>(&qkv[tokenIdx * totalHeadsPerToken * head_dim +
+            (fistHeadIdxPerTokenPerThread +i + 1) * head_dim +
+            threadIdxPerWarp * elementNumPerHeadPerThread])};
+
+          cp_async_shared_global_ca(qkv_ptr,smem_qkv_ptr,elementBytesPerHeadPerThread);
+          cp_async_commit_group();
+
+        }
+
+        // 计算RMSNorm
+        float sumSquares {0};
+        float elementPerHeadPerThread[elementNumPerHeadPerThread];
+        uint currentChannelSMEM {i % 2 };
+        auto* smem_qkv_base = reinterpret_cast<T_in*>(dynamicSmem);
+#pragma unroll elementNumPerHeadPerThread
+        for (uint j {}; j < elementNumPerHeadPerThread; j++) {
+          // 读取smem，不存在bank_conflict
+          elementPerHeadPerThread[j] = _typeConvert<scalar_t_in>::convert(smem_qkv_base[warpIdxPerBlock  * 32  * HeadsNumPerWarpSMEM * elementNumPerHeadPerThread +
+            currentChannelSMEM * 32 * elementNumPerHeadPerThread +
+            threadIdxPerWarp * elementNumPerHeadPerThread + j]);
+          sumSquares += elementPerHeadPerThread[j] * elementPerHeadPerThread[j];
+        }
+
+#pragma unroll
+        for (int j {16}; j > 0 ; j>>=1) {
+          sumSquares += __shfl_xor_sync(0xffffffff,sumSquares,j,32);
+        }
+
+        float sumSquaresRsqurt  = rsqrtf(sumSquares / static_cast<float>(head_dim) + static_cast<float>(eps));
+
+        const auto* elementQWeight_ptr = reinterpret_cast<const T_in*>(&elementQWeight);
+        const auto* elementKWeight_ptr = reinterpret_cast<const T_in*>(&elementKWeight);
+
+#pragma unroll elementNumPerHeadPerThread
+        for (uint j {}; j < elementNumPerHeadPerThread; j++) {
+          currentIsQ ? elementPerHeadPerThread[j] *= sumSquaresRsqurt * _typeConvert<scalar_t_in>::convert(elementQWeight_ptr[j])
+              : elementPerHeadPerThread[j] *= sumSquaresRsqurt * _typeConvert<scalar_t_in>::convert(elementKWeight_ptr[j]);
+        }
+
+        // 计算ROPE
+        // 等待cos/sin加载完成
+        // 直接wait_group<0>()也正确,但会把已经发出的next QKV也等完,少掉next QKV与当前RoPE/写回的重叠。
+        // 因此有next QKV时用wait_group<1>()只等待更老的cos/sin;没有next QKV时必须用wait_group<0>()。
+        if (i + 1 < headNumInWarp) {
+          // 已经发出了 next QKV，允许最新的 next QKV 继续在途，只等待更老的 cos/sin。
+          cp_async_wait_group<1>();
+        } else {
+          // 没有 next QKV，cos/sin 就是最新 group，必须等到 0 个未完成。
+          cp_async_wait_group<0>();
+        }
+        __syncwarp();
+        auto* smem_cosSin_base = reinterpret_cast<T_cache*>(&dynamicSmem[cosSinBytesInitialOffsetSMEM + warpOffsetPerBlock]);
+        if (elementNumPerHeadPerThread / 2 * threadIdxPerWarp < half) {
+#pragma unroll elementNumPerHeadPerThread / 2
+          for (uint j {}; j < elementNumPerHeadPerThread / 2; j++) {
+            float element1 = elementPerHeadPerThread[2 * j];
+            float element2 = elementPerHeadPerThread[2 * j + 1];
+            float element_cos = _typeConvert<scalar_t_cache>::convert(smem_cosSin_base[elementNumPerHeadPerThread / 2 * threadIdxPerWarp + j]);
+            float element_sin = _typeConvert<scalar_t_cache>::convert(smem_cosSin_base[half + elementNumPerHeadPerThread / 2 * threadIdxPerWarp + j]);
+
+            elementPerHeadPerThread[2 * j] = element_cos * element1 - element_sin* element2;
+            elementPerHeadPerThread[2 * j + 1] = element_sin * element1 + element_cos * element2;
+          }
+        }
+
+        // 写回到HBM
+        T_in_tran elementT_tranPerThreadStore;
+        for (uint j {}; j < elementNumPerHeadPerThread / 2; j++) {
+          T_in2  elementT_in2PerThreadStore = _typeConvert<scalar_t_in>::convert(make_float2(elementPerHeadPerThread[2 * j],elementPerHeadPerThread[2 * j + 1]));
+          // reinterpret_cast不能把普通数值直接"转换"成另一个数值类型;这里是先对packed局部变量取地址,
+          // 再把该地址重解释为T_in2*，按T_in2粒度填充elementT_tranPerThreadStore内部字节。
+          // 当前ptxas -v证据同上:0 spill stores/loads且0 bytes stack frame,说明当前写回组包也没有落到local memory。
+          *(reinterpret_cast<T_in2*>(&elementT_tranPerThreadStore) + j) = elementT_in2PerThreadStore;
+        }
+        // 合并访问事务
+        reinterpret_cast<T_in_tran* >(&qkv[tokenIdx * totalHeadsPerToken * head_dim +
+        (fistHeadIdxPerTokenPerThread + i) * head_dim +
+        threadIdxPerWarp * elementNumPerHeadPerThread])[0] = elementT_tranPerThreadStore;
+      }
     }
     else if constexpr (algorithm == 2) {
+
     }
 #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && (!defined(USE_ROCM))
   }
