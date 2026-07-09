@@ -377,6 +377,76 @@
     · RoPE 前的 wait_group 需要根据是否已经发出 next QKV 分支处理；无条件
       wait_group<0> 更简单但会等待 next QKV，减少重叠。
 
+  和 vLLM NTokenHeads 的对比：
+
+    vLLM 的 fusedQKNormRopeKernelNTokenHeads 与方案 1 使用相同的大方向：
+
+      QKV               global -> SMEM -> register
+      cos/sin           global -> SMEM -> register
+      q_weight/k_weight global -> register
+
+    它也把 cos/sin 当成当前 token 的一整行，按 16B chunk 由 warp 协作搬到 per-warp
+    SMEM，从而解决 half/bf16 单个元素只有 2B、不能直接 cp.async ..., 2 的问题。
+    但它和本文方案 1 的 QKV 流水不同：
+
+      vLLM NTokenHeads:
+        for k in 本 warp 负责的所有 heads:
+          cp.async qkv[k] -> smem_qkv[k]
+        commit_group;                 // group0: 所有 QKV
+
+        cp.async cos/sin row -> smem;  // group1: cos/sin
+        commit_group;
+
+        wait_group<1>;                 // 等 group0 QKV，允许 group1 cos/sin 继续在途
+
+        for k in 本 warp 负责的所有 heads:
+          从 smem_qkv[k] 读 QKV
+          compute RMSNorm
+          if k == 0:
+            wait_group<0>;             // 第一个 head RoPE 前等待 cos/sin
+          compute RoPE
+          store
+
+      本文方案 1 的理想双缓冲流水：
+        cp.async qkv[0] -> qkv_buf0
+        cp.async cos/sin row -> smem
+
+        for k in 本 warp 负责的所有 heads:
+          if k + 1 < headNumInWarp:
+            cp.async qkv[k + 1] -> qkv_buf[(k + 1) & 1]
+
+          wait current qkv
+          从当前 qkv_buf 读 QKV
+          compute RMSNorm
+          wait cos/sin
+          compute RoPE
+          store
+
+    因此二者的核心区别不是 cos/sin，而是 QKV：
+
+      · vLLM NTokenHeads 先批量预取本 warp 负责的所有 head 的 QKV，然后再进入 head
+        计算循环。它能用第一个 head 的 RMSNorm 覆盖一部分 cos/sin 延迟，但后续 head
+        的 QKV 已经提前搬完，没有形成 "current head 计算覆盖 next head QKV 加载"
+        的稳态流水。
+
+      · 本文方案 1 只保留两个 QKV buffer，目标是让 next head 的 QKV cp.async 和
+        current head 的 RMSNorm/RoPE 重叠。理论流水上，它比 vLLM 的批量 QKV 预取
+        更充分，SMEM 占用也从 HEADS_PER_WARP 个 QKV tile 降到 2 个 QKV tile。
+
+    理论性能判断：
+
+      · 如果 cp.async 和计算能有效重叠，本文方案 1 的上限通常高于 vLLM NTokenHeads
+        的批量 QKV 预取变体。
+      · vLLM 方式的优势是 group/wait 更少、控制逻辑更简单，QKV 全部到位后 head 循环
+        更直接；在某些 head_dim、HEADS_PER_WARP、SM 架构组合下，调度开销可能更低。
+      · QKV 没有跨 head 复用，所以两者都要承担 HBM -> SMEM -> register 的中转成本；
+        差异主要看本文方案 1 多出来的 per-head cp.async 管理成本，能否换来足够的
+        next-head QKV 延迟隐藏。
+      · 按当前本项目 benchmark 趋势，A1 相比 A0 在 hd=64/128 更好，说明更深流水方向
+        有收益；但 A1 和 one-head 整体接近，hd=256 仍可能输给 one-head，说明 SMEM
+        中转成本仍然敏感。vLLM 批量 QKV 预取因为缺少 next-head QKV 稳态流水，理论上
+        不应默认比 A1 更快，最终仍要用同一机器、同一构建下的 benchmark 验证。
+
 
 --------------------------------------------------------------------------------
   方案 2：QKV 双缓冲 + cos/sin 寄存器 + q_weight/k_weight 寄存器

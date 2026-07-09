@@ -19,6 +19,7 @@ num_tokens ∈ {128, 512, 2048, 8192}，head_dim ∈ {64, 128, 256}，(Hq,Hk,Hv)
 - [CUDA Kernel 实现](#cuda-kernel-实现)
 - [NHeads op 算法 0](#nheads-op-算法-0)
 - [NHeads op 算法 1](#nheads-op-算法-1)
+- [NHeads A1 与 vLLM NTokenHeads 对比](#nheads-a1-与-vllm-ntokenheads-对比)
 - [接入 PyTorch：torch.compile 子图替换](#接入-pytorchtorchcompile-子图替换)
 - [性能：自定义算子 vs eager](#性能自定义算子-vs-eager)
 - [为什么快](#为什么快)
@@ -196,6 +197,71 @@ __syncwarp();
 
 ---
 
+## NHeads A1 与 vLLM NTokenHeads 对比
+
+vLLM 的 `fusedQKNormRopeKernelNTokenHeads` 和本项目 NHeads A1 使用相同的数据放置方向：
+
+```text
+QKV:          HBM -> cp.async -> SMEM -> register
+cos/sin:      HBM -> cp.async -> SMEM -> register
+q/k weight:   HBM -> register
+```
+
+区别在 QKV 的流水粒度。vLLM 先把本 warp 负责的多个 head 的 QKV 一批预取到 SMEM，
+再预取当前 token 的 cos/sin，然后进入 head 循环：
+
+```text
+vLLM NTokenHeads:
+  预取本 warp 负责的所有 head QKV
+  预取当前 token 的 cos/sin
+  等 QKV 完成，允许 cos/sin 继续在途
+  for head:
+    读 SMEM QKV
+    RMSNorm
+    第一个 head RoPE 前等待 cos/sin
+    RoPE
+    写回
+```
+
+本项目 A1 则只保留两个 QKV buffer，按 current/next 做双缓冲：
+
+```text
+NHeads A1:
+  预取 head0 QKV
+  预取当前 token 的 cos/sin
+  for head:
+    预取 next head QKV
+    计算 current head RMSNorm/RoPE
+    写回
+```
+
+理论上，A1 的流水上限更高：它尝试让 `next head QKV` 的 HBM 延迟被 `current head` 的计算覆盖；
+vLLM NTokenHeads 的 QKV 加载集中在循环前，主要只利用了“第一个 head 的 RMSNorm 覆盖 cos/sin
+延迟”这一层重叠。另一方面，vLLM 的控制逻辑更简单、`commit/wait` 更少，实际性能仍可能在某些
+`head_dim`、`HEADS_PER_WARP`、GPU 架构组合下接近甚至超过具体实现不够成熟的 A1。
+
+当前仓库没有直接跑 vLLM kernel 的同机 benchmark，因此这里只给理论判断和本项目间接证据：
+
+| 对比对象 | QKV 加载方式 | cos/sin 加载方式 | 理论性能判断 |
+|----------|--------------|------------------|--------------|
+| vLLM NTokenHeads | 本 warp 多个 head 一次性批量进 SMEM | per-warp SMEM，16B chunk | 简单稳定，但缺少 next-head QKV 稳态流水 |
+| 本项目 NHeads A1 | current/next QKV 双缓冲 | per-warp SMEM，16B chunk | 流水更充分，理论上限更高，但控制和同步成本更大 |
+
+已有 benchmark 显示 A1 相比 A0 在 `head_dim=64/128` 更好，说明更深流水方向有效；但 A1 与 one-head
+整体接近，`head_dim=256` 仍偏弱，说明 QKV 的 `HBM -> SMEM -> register` 中转成本很敏感。
+因此更严格的结论应是：
+
+```text
+理论流水上：NHeads A1 >= vLLM NTokenHeads 批量 QKV 预取变体
+工程实测上：必须同一构建、同一机器状态下 benchmark，不能只凭结构下结论
+```
+
+参考源码：vLLM `csrc/libtorch_stable/fused_qknorm_rope_kernel.cu` 中
+`fusedQKNormRopeKernelNTokenHeads` 先提交 QKV group，再提交 cos/sin group，随后用
+`wait_group<1>` 进入逐 head 计算。
+
+---
+
 ## 接入 PyTorch：torch.compile 子图替换
 
 不直接手调算子，而是让 `torch.compile` **自动**把模型里的子图替换成融合 kernel（`src/app/`）：
@@ -219,6 +285,19 @@ torch.compile(model)  ──编译期──▶  子图被替换成 torch.ops.ROP
 - **基准(baseline) = eager**：`FusedQKVNormRope.forward`（未融合分步子图）；
 - **自定义算子 = `torch.compile(model)` 热路径**（子图已替换成一次融合 kernel）；
 - CUDA Event 计时，WARMUP=10 + REPEATS=100 取中位数；`speedup = eager_median / op_median`。
+
+**测试数据维度**：
+
+| 项 | 维度 / 取值 |
+|----|-------------|
+| dtype | `float16` / `bfloat16` / `float32` |
+| num_tokens | `128` / `512` / `2048` / `8192`；benchmark 中 `token_size=[[N]]`，所以 `num_tokens=N` |
+| head_dim | `64` / `128` / `256` |
+| rotary_dim | 默认全旋转，`rotary_dim=head_dim` |
+| heads | `(Hq,Hk,Hv)=(8,8,8)`，Q/K 共 16 个 head 参与 QK-Norm + RoPE，V 透传 |
+| qkv | `[num_tokens, (Hq+Hk+Hv) * head_dim] = [N, 24 * D]`；即 `D=64 -> [N,1536]`，`D=128 -> [N,3072]`，`D=256 -> [N,6144]` |
+| q_weight / k_weight | `[head_dim] = [D]` |
+| cos / sin | op 接收已按 position gather 后的 `[num_tokens, rotary_dim / 2] = [N, D/2]`；即 `D=64 -> [N,32]`，`D=128 -> [N,64]`，`D=256 -> [N,128]` |
 
 **head_dim=128，(Hq,Hk,Hv)=(8,8,8)**（GFLOPS 越高越好；数据：one-head op 基线，sm_86）：
 
@@ -262,6 +341,9 @@ torch.compile(model)  ──编译期──▶  子图被替换成 torch.ops.ROP
   这些额外成本不一定能被流水隐藏掉；
 - **A0 不占优的核心原因不是 HBM 合并访问或 SMEM bank conflict 没做好**，而是 QKV 没有跨线程复用。
   QKV 先进 SMEM 的收益只来自异步流水；如果隐藏掉的 HBM 延迟小于 SMEM 读回和控制逻辑成本，就会亏。
+- **和 vLLM NTokenHeads 的理论对比**：vLLM 批量预取本 warp 的多个 head QKV，控制逻辑更简单；
+  A1 使用 current/next 双缓冲，理论上更容易隐藏 next-head QKV 延迟。因此 A1 的理论上限更高，
+  但实际是否超过 vLLM 需要直接跑 vLLM kernel；当前仓库只实测了 one-head、A0、A1。
 
 > 注意：当前仓库里的 one-head 结果时间戳是 `2026-06-28`，NHeads A0 是 `2026-07-07`，
 > NHeads A1 是 `2026-07-08`。严格横向比较时，建议同一构建、同一机器状态下连续重跑三组 benchmark。
