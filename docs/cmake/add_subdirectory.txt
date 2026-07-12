@@ -1,0 +1,635 @@
+================================================================================
+add_subdirectory：参数、用法、执行时机与示例
+================================================================================
+
+背景
+--------------------------------------------------------------------------------
+add_subdirectory 是 CMake 中把子目录加入当前构建的核心命令。
+
+基本语法：
+
+    add_subdirectory(source_dir [binary_dir] [EXCLUDE_FROM_ALL] [SYSTEM])
+
+一句话理解：
+
+    让 CMake 进入 source_dir，读取其中的 CMakeLists.txt，
+    并把该子目录里定义的 target 加入当前项目的构建图。
+
+它常用于两类场景：
+
+    1. 项目内部子模块
+
+        add_subdirectory(src)
+        add_subdirectory(tests)
+
+    2. 外部依赖源码
+
+        add_subdirectory(${dep_SOURCE_DIR} ${dep_BINARY_DIR})
+
+FetchContent_MakeAvailable(...) 内部在很多情况下也会做类似事情：
+
+    add_subdirectory(<dependency_SOURCE_DIR> <dependency_BINARY_DIR>)
+
+
+================================================================================
+一、基本示例
+================================================================================
+
+目录结构：
+
+    project/
+      CMakeLists.txt
+      src/
+        CMakeLists.txt
+        main.cpp
+        rope.cpp
+
+根目录 CMakeLists.txt：
+
+    cmake_minimum_required(VERSION 3.20)
+    project(demo LANGUAGES CXX)
+
+    add_subdirectory(src)
+
+src/CMakeLists.txt：
+
+    add_executable(app
+        main.cpp
+        rope.cpp
+    )
+
+执行：
+
+    cmake -S . -B build
+    cmake --build build
+
+效果：
+
+    CMake 配置阶段读取根目录 CMakeLists.txt；
+    执行 add_subdirectory(src)；
+    立刻进入 src/ 并读取 src/CMakeLists.txt；
+    src 中定义的 app target 被加入整个项目 build graph；
+    build 阶段才真正编译 main.cpp / rope.cpp。
+
+
+================================================================================
+二、source_dir 参数
+================================================================================
+
+语法：
+
+    add_subdirectory(source_dir)
+
+source_dir 指定子项目源码目录。
+
+这个目录里必须有：
+
+    CMakeLists.txt
+
+否则配置阶段会报错。
+
+相对路径示例：
+
+    add_subdirectory(src)
+
+含义：
+
+    从当前 CMakeLists.txt 所在目录出发，寻找 src/CMakeLists.txt。
+
+绝对路径示例：
+
+    add_subdirectory(/home/liam/cpp_linux/some_lib)
+
+含义：
+
+    直接读取 /home/liam/cpp_linux/some_lib/CMakeLists.txt。
+
+注意：
+
+    如果 source_dir 是相对路径，它相对于当前 source directory，
+    也就是当前正在处理的 CMakeLists.txt 所在目录。
+
+
+================================================================================
+三、binary_dir 参数
+================================================================================
+
+语法：
+
+    add_subdirectory(source_dir binary_dir)
+
+binary_dir 指定该子目录的构建目录，也就是这个子项目的中间文件、生成文件、
+子 CMake cache 相关内容放在哪里。
+
+内部子目录通常不写 binary_dir：
+
+    add_subdirectory(src)
+
+此时 CMake 会按默认规则在当前 build tree 下生成对应目录。
+
+外部源码目录通常需要写 binary_dir：
+
+    add_subdirectory(
+        /home/liam/src/flash-attention
+        ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+为什么外部源码通常需要 binary_dir：
+
+    source_dir 在项目源码树外面；
+    如果不显式指定 binary_dir，CMake 很难把外部源码的构建文件放到合适位置；
+    显式指定 binary_dir 可以保证外部项目中间文件留在当前项目 build 目录下。
+
+示例：
+
+    project/
+      CMakeLists.txt
+      build/
+
+    external source:
+      /home/liam/src/some_lib/CMakeLists.txt
+
+根目录 CMakeLists.txt：
+
+    add_subdirectory(
+        /home/liam/src/some_lib
+        ${CMAKE_BINARY_DIR}/some_lib-build
+    )
+
+执行：
+
+    cmake -S . -B build
+
+结果：
+
+    source_dir:
+        /home/liam/src/some_lib
+
+    binary_dir:
+        project/build/some_lib-build
+
+注意：
+
+    binary_dir 不是最终 .so / 可执行文件输出目录。
+    它是该子项目的构建树目录。
+
+最终产物输出目录由 target 属性决定，例如：
+
+    RUNTIME_OUTPUT_DIRECTORY
+    LIBRARY_OUTPUT_DIRECTORY
+    ARCHIVE_OUTPUT_DIRECTORY
+
+
+================================================================================
+四、add_subdirectory 的执行时机
+================================================================================
+
+add_subdirectory 在 CMake 配置阶段执行。
+
+例如：
+
+    message(STATUS "before src")
+    add_subdirectory(src)
+    message(STATUS "after src")
+
+CMake 执行顺序是：
+
+    1. 打印 before src
+    2. 进入 src/CMakeLists.txt 并完整执行
+    3. 返回当前 CMakeLists.txt
+    4. 打印 after src
+
+也就是说：
+
+    add_subdirectory 不是简单登记一下；
+    它会立即处理子目录中的 CMakeLists.txt。
+
+因此，子目录里定义的 target 在 add_subdirectory 返回后通常已经存在：
+
+    add_subdirectory(third_party/some_lib)
+
+    target_link_libraries(app PRIVATE some_lib_target)
+
+前提是 some_lib_target 确实在 third_party/some_lib/CMakeLists.txt 中定义。
+
+
+================================================================================
+五、EXCLUDE_FROM_ALL 参数
+================================================================================
+
+语法：
+
+    add_subdirectory(source_dir [binary_dir] EXCLUDE_FROM_ALL)
+
+作用：
+
+    子目录里的 target 默认不加入父目录的 ALL target。
+
+普通情况下：
+
+    cmake --build build
+
+会构建默认 ALL target。
+没有 EXCLUDE_FROM_ALL 时，子目录里的普通 target 通常也会被一起构建。
+
+使用 EXCLUDE_FROM_ALL：
+
+    add_subdirectory(examples EXCLUDE_FROM_ALL)
+
+含义：
+
+    examples 子目录会被配置；
+    examples 里的 target 会存在；
+    但默认 cmake --build build 不会主动构建它们。
+
+如果想构建其中某个 target，需要显式指定：
+
+    cmake --build build --target example_app
+
+典型用途：
+
+    - examples
+    - benchmarks
+    - tools
+    - 可选 demo
+
+示例：
+
+    add_subdirectory(src)
+    add_subdirectory(examples EXCLUDE_FROM_ALL)
+
+    add_executable(main_app main.cpp)
+
+如果 examples/CMakeLists.txt 里有：
+
+    add_executable(example_app example.cpp)
+
+那么：
+
+    cmake --build build
+
+默认可能只构建主项目需要的 target，不构建 example_app。
+
+但：
+
+    cmake --build build --target example_app
+
+可以显式构建 example_app。
+
+注意：
+
+    如果父项目中的某个 target 依赖了子目录中的 target，
+    那么即使子目录 EXCLUDE_FROM_ALL，被依赖的 target 仍可能为了满足依赖而被构建。
+
+
+================================================================================
+六、SYSTEM 参数
+================================================================================
+
+语法：
+
+    add_subdirectory(source_dir [binary_dir] SYSTEM)
+
+或：
+
+    add_subdirectory(source_dir [binary_dir] EXCLUDE_FROM_ALL SYSTEM)
+
+SYSTEM 是 CMake 3.25+ 增加的参数。
+
+作用：
+
+    把该子目录的 SYSTEM directory property 设置为 true。
+    该属性会初始化子目录中创建的非 imported target 的 SYSTEM target property。
+
+直观理解：
+
+    这是告诉 CMake：
+        这个子目录更像第三方系统依赖；
+        它的 include 目录可以按 system include 处理；
+        外部依赖头文件 warning 不应像本项目代码一样严格处理。
+
+示例：
+
+    add_subdirectory(third_party/some_lib SYSTEM)
+
+适用场景：
+
+    当前项目开启了严格 warning；
+    third_party/some_lib 是第三方源码；
+    不希望第三方头文件 warning 干扰本项目构建。
+
+注意：
+
+    SYSTEM 不是所有 CMake 版本都有。
+    本项目 cmake_minimum_required 当前是 3.20，
+    如果要使用 add_subdirectory(... SYSTEM)，需要提高最低版本到 3.25+
+    或确保实际 CMake 版本满足要求。
+
+
+================================================================================
+七、内部子目录 vs 外部源码目录
+================================================================================
+
+内部子目录示例：
+
+    project/
+      CMakeLists.txt
+      src/
+        CMakeLists.txt
+
+写法：
+
+    add_subdirectory(src)
+
+特点：
+
+    source_dir 是项目源码树内部路径；
+    binary_dir 通常可以省略；
+    CMake 会自然映射到 build/src。
+
+
+外部源码目录示例：
+
+    project/
+      CMakeLists.txt
+      build/
+
+    /home/liam/src/third_party_lib/
+      CMakeLists.txt
+
+写法：
+
+    add_subdirectory(
+        /home/liam/src/third_party_lib
+        ${CMAKE_BINARY_DIR}/third_party_lib
+    )
+
+特点：
+
+    source_dir 在项目源码树外；
+    binary_dir 建议显式指定；
+    外部项目构建中间文件仍放在当前项目 build 目录下。
+
+
+================================================================================
+八、和 FetchContent 的关系
+================================================================================
+
+FetchContent_MakeAvailable(dep) 在很多情况下最终会做类似：
+
+    add_subdirectory(${dep_SOURCE_DIR} ${dep_BINARY_DIR})
+
+例如：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        some_lib
+        GIT_REPOSITORY https://example.com/some_lib.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_MakeAvailable(some_lib)
+
+可以近似理解为：
+
+    1. FetchContent 先把 some_lib 源码准备到某个 source dir；
+    2. 再准备一个 binary dir；
+    3. 如果 source dir 里有 CMakeLists.txt，
+       就 add_subdirectory(source dir, binary dir)；
+    4. some_lib 的 target 进入当前构建图。
+
+手写等价风格：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        some_lib
+        GIT_REPOSITORY https://example.com/some_lib.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_Populate(some_lib)
+
+    add_subdirectory(
+        ${some_lib_SOURCE_DIR}
+        ${some_lib_BINARY_DIR}
+    )
+
+现代 CMake 通常推荐：
+
+    FetchContent_MakeAvailable(some_lib)
+
+而不是手写 Populate + add_subdirectory。
+
+本项目 flash-attention 的关系：
+
+    FetchContent_Declare(flash_attention ...)
+        记录 flash-attention 源码来源。
+
+    FetchContent_MakeAvailable(flash_attention)
+        准备源码，并把 flash-attention 自己的 CMakeLists.txt 加入当前构建。
+
+    后续递归收集 flash-attention 创建的 target，
+    对 MODULE_LIBRARY / SHARED_LIBRARY 设置输出目录到项目根目录。
+
+
+================================================================================
+九、target 作用域与可见性
+================================================================================
+
+add_subdirectory 返回后，子目录中创建的 target 对父目录通常是可见的。
+
+示例：
+
+根目录 CMakeLists.txt：
+
+    add_subdirectory(lib)
+
+    add_executable(app main.cpp)
+    target_link_libraries(app PRIVATE mylib)
+
+lib/CMakeLists.txt：
+
+    add_library(mylib STATIC lib.cpp)
+
+这个例子中：
+
+    mylib 在 lib/CMakeLists.txt 中定义；
+    根目录 add_subdirectory(lib) 执行后；
+    父目录可以 target_link_libraries(app PRIVATE mylib)。
+
+注意：
+
+    target 名是全局唯一的。
+    如果两个子目录都 add_library(mylib ...)，会冲突。
+
+错误示例：
+
+    add_subdirectory(libA)
+    add_subdirectory(libB)
+
+如果 libA/CMakeLists.txt 和 libB/CMakeLists.txt 都写：
+
+    add_library(common STATIC ...)
+
+配置阶段会报 target 名重复。
+
+
+================================================================================
+十、变量作用域
+================================================================================
+
+add_subdirectory 会创建新的 directory scope。
+
+父目录变量可以被子目录读取：
+
+根目录：
+
+    set(USE_FAST_KERNEL ON)
+    add_subdirectory(src)
+
+src/CMakeLists.txt：
+
+    if(USE_FAST_KERNEL)
+        message(STATUS "fast kernel enabled")
+    endif()
+
+子目录中普通 set(...) 的变量，默认不会自动写回父目录：
+
+src/CMakeLists.txt：
+
+    set(CHILD_VALUE 123)
+
+根目录：
+
+    add_subdirectory(src)
+    message(STATUS "CHILD_VALUE=${CHILD_VALUE}")
+
+这里父目录通常拿不到 CHILD_VALUE。
+
+如果确实要写回父目录，可以用：
+
+    set(CHILD_VALUE 123 PARENT_SCOPE)
+
+但工程上更推荐通过 target 属性、target_link_libraries、
+target_include_directories 等 target-based 方式传递构建信息，
+而不是依赖跨目录变量回写。
+
+
+================================================================================
+十一、常见错误
+================================================================================
+
+1. source_dir 没有 CMakeLists.txt
+--------------------------------------------------------------------------------
+错误示例：
+
+    add_subdirectory(data)
+
+如果 data/ 目录没有 CMakeLists.txt，配置阶段会报错。
+
+解决：
+
+    - 给 data/ 添加 CMakeLists.txt；
+    - 或不要用 add_subdirectory 管理纯数据目录；
+    - 用 file(...) / install(...) / configure_file(...) 等更合适的命令。
+
+
+2. 外部源码目录没有指定 binary_dir
+--------------------------------------------------------------------------------
+不推荐：
+
+    add_subdirectory(/home/liam/src/some_lib)
+
+推荐：
+
+    add_subdirectory(
+        /home/liam/src/some_lib
+        ${CMAKE_BINARY_DIR}/some_lib-build
+    )
+
+原因：
+
+    外部源码不在当前项目源码树下；
+    显式 binary_dir 可以避免构建文件位置混乱。
+
+
+3. 以为 add_subdirectory 会立即编译
+--------------------------------------------------------------------------------
+不会。
+
+add_subdirectory 发生在 CMake 配置阶段，只是读取子目录 CMakeLists.txt，
+创建 target 和构建规则。
+
+真正编译发生在：
+
+    cmake --build build
+
+
+4. 以为 binary_dir 是最终产物目录
+--------------------------------------------------------------------------------
+不是。
+
+binary_dir 是子项目构建树。
+
+最终产物目录要设置 target 属性，例如：
+
+    set_target_properties(my_extension PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+    )
+
+
+5. EXCLUDE_FROM_ALL 后 target 永远不会构建
+--------------------------------------------------------------------------------
+不是。
+
+EXCLUDE_FROM_ALL 只是让 target 默认不进入 ALL。
+
+显式构建仍然可以：
+
+    cmake --build build --target example_app
+
+如果别的 target 依赖它，它也可能被构建。
+
+
+================================================================================
+十二、和本项目的关联
+================================================================================
+
+本项目没有直接在顶层 CMakeLists.txt 中手写：
+
+    add_subdirectory(flash-attention)
+
+而是通过：
+
+    include(cmake/extern_projects/flash_attention.cmake)
+
+在该 .cmake 文件里使用：
+
+    FetchContent_Declare(...)
+    FetchContent_MakeAvailable(...)
+
+让 FetchContent 处理源码获取，并在合适时机把 flash-attention 的 CMakeLists.txt
+加入当前构建。
+
+可以理解为：
+
+    FetchContent_MakeAvailable(flash_attention)
+        是更高层的封装；
+        内部在源码准备好后，通常会做 add_subdirectory。
+
+本项目额外做的一步是：
+
+    flash-attention 被 add_subdirectory 进来之后，
+    递归收集它创建的 target；
+    找出 MODULE_LIBRARY / SHARED_LIBRARY；
+    设置这些 target 的 LIBRARY_OUTPUT_DIRECTORY 到项目根目录。
+
+这也是为什么需要在配置阶段拿到 flash-attention target：
+
+    只有 add_subdirectory / MakeAvailable 执行后，
+    外部项目里的 target 才真正存在；
+    target 存在后，才能 set_target_properties(...)。
+
+================================================================================

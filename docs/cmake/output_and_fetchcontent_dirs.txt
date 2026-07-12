@@ -1,0 +1,736 @@
+================================================================================
+CMake 输出目录与 FetchContent 目录变量：作用、设置时机、设置方式、默认值
+================================================================================
+
+本文说明四个容易混淆的变量：
+
+    CMAKE_LIBRARY_OUTPUT_DIRECTORY
+    CMAKE_RUNTIME_OUTPUT_DIRECTORY
+    flash_attention_SOURCE_DIR
+    flash_attention_BINARY_DIR
+
+前两个是 CMake target 产物输出目录的默认值。
+后两个是 FetchContent 为名为 flash_attention 的外部内容生成的源码目录和构建目录。
+
+
+================================================================================
+一、总览对比
+================================================================================
+
+    CMAKE_LIBRARY_OUTPUT_DIRECTORY
+        类型：
+            CMake 普通变量。
+
+        作用：
+            初始化后续 target 的 LIBRARY_OUTPUT_DIRECTORY 属性。
+            主要影响 shared library / module library 的最终输出位置。
+
+        在本项目里：
+            临时设置为 ${PROJECT_SOURCE_DIR}，
+            让 flash-attention 的 .so 尽量输出到项目根目录。
+
+
+    CMAKE_RUNTIME_OUTPUT_DIRECTORY
+        类型：
+            CMake 普通变量。
+
+        作用：
+            初始化后续 target 的 RUNTIME_OUTPUT_DIRECTORY 属性。
+            主要影响 executable，Windows 上也影响 DLL 等 runtime artifact。
+
+        在本项目里：
+            临时设置为 ${PROJECT_SOURCE_DIR}，
+            与 library 输出目录保持一致。
+
+
+    flash_attention_SOURCE_DIR
+        类型：
+            FetchContent_MakeAvailable / Populate 后生成的 CMake 变量。
+
+        作用：
+            指向 flash_attention 这个外部内容的源码目录。
+
+        在本项目里：
+            指向 flash-attention 源码 checkout 位置，或用户提供的本地源码目录。
+
+
+    flash_attention_BINARY_DIR
+        类型：
+            FetchContent_MakeAvailable / Populate 后生成的 CMake 变量。
+
+        作用：
+            指向 flash_attention 这个外部内容的构建目录。
+
+        在本项目里：
+            通常是 ${CMAKE_BINARY_DIR}/flash-attention，
+            因为 FetchContent_Declare 中显式设置了 BINARY_DIR。
+
+
+================================================================================
+二、CMAKE_LIBRARY_OUTPUT_DIRECTORY
+================================================================================
+
+官方含义：
+
+    Where to put all LIBRARY target files when built.
+
+更具体地说：
+
+    CMAKE_LIBRARY_OUTPUT_DIRECTORY 用来初始化 target 的：
+
+        LIBRARY_OUTPUT_DIRECTORY
+
+它影响的是"后续创建的 target"。
+
+常见受影响产物：
+
+    - Linux/macOS 上的 SHARED_LIBRARY；
+    - Linux/macOS 上的 MODULE_LIBRARY；
+    - Python 扩展模块通常就是 MODULE_LIBRARY，例如：
+
+          ROPE_cuda.cpython-313-x86_64-linux-gnu.so
+          xxx.cpython-313-x86_64-linux-gnu.so
+
+
+什么时候设置
+--------------------------------------------------------------------------------
+必须在 target 创建之前设置，才会作为默认值初始化 target 属性。
+
+示例：
+
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+    add_library(my_extension MODULE extension.cpp)
+
+此时 my_extension 的 LIBRARY_OUTPUT_DIRECTORY 默认会被初始化为：
+
+    ${PROJECT_SOURCE_DIR}
+
+如果 target 已经创建了，再设置 CMAKE_LIBRARY_OUTPUT_DIRECTORY：
+
+    add_library(my_extension MODULE extension.cpp)
+
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+通常不会反向修改已经存在的 my_extension target。
+
+这时应该直接设置 target 属性：
+
+    set_target_properties(my_extension PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
+
+
+怎么设置
+--------------------------------------------------------------------------------
+方式 1：全局默认值，影响后续 target
+
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+方式 2：只设置某个 target，优先级更明确
+
+    set_target_properties(my_extension PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
+
+方式 3：按构建类型设置
+
+    set_target_properties(my_extension PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG "${PROJECT_SOURCE_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE "${PROJECT_SOURCE_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${PROJECT_SOURCE_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${PROJECT_SOURCE_DIR}"
+    )
+
+多配置生成器，例如 Visual Studio / Ninja Multi-Config，会读取带配置后缀的属性。
+
+
+默认是什么
+--------------------------------------------------------------------------------
+如果没有设置 CMAKE_LIBRARY_OUTPUT_DIRECTORY，也没有设置 target 的
+LIBRARY_OUTPUT_DIRECTORY，CMake 会按生成器和 target 所在 binary directory
+选择默认位置。
+
+常见情况下：
+
+    产物会落在对应 target 的构建目录中。
+
+例如：
+
+    cmake-build-release/CMakeFiles/...
+    cmake-build-release/<subdir>/...
+
+具体路径取决于生成器、平台、target 类型和目录结构。
+
+因此如果要求 .so 一定输出到项目根目录，就不应该依赖默认值，
+而应该显式设置：
+
+    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+
+
+本项目中的用法
+--------------------------------------------------------------------------------
+flash_attention.cmake 中临时设置：
+
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+目的：
+
+    在 FetchContent_MakeAvailable(flash_attention) 执行期间，
+    flash-attention 创建 MODULE_LIBRARY / SHARED_LIBRARY target 时，
+    让这些 target 默认把 .so 输出到项目根目录。
+
+但这只是默认值。
+如果 flash-attention 自己覆盖 target 输出属性，这个默认值可能无效。
+
+所以本项目后面又递归收集 target，并显式设置：
+
+    set_target_properties(${_target} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        ...
+    )
+
+这是兜底。
+
+
+================================================================================
+三、CMAKE_RUNTIME_OUTPUT_DIRECTORY
+================================================================================
+
+官方含义：
+
+    Where to put all RUNTIME target files when built.
+
+更具体地说：
+
+    CMAKE_RUNTIME_OUTPUT_DIRECTORY 用来初始化 target 的：
+
+        RUNTIME_OUTPUT_DIRECTORY
+
+常见受影响产物：
+
+    - add_executable 生成的可执行文件；
+    - Windows 上 DLL 等 runtime artifact；
+    - 某些平台 / 生成器下的 runtime 类型产物。
+
+
+什么时候设置
+--------------------------------------------------------------------------------
+同 CMAKE_LIBRARY_OUTPUT_DIRECTORY：
+
+    必须在 target 创建之前设置，才会作为默认值初始化 target 属性。
+
+示例：
+
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+    add_executable(validation src/validation.cu)
+
+此时 validation 的 RUNTIME_OUTPUT_DIRECTORY 默认会被初始化为：
+
+    ${PROJECT_SOURCE_DIR}
+
+如果 target 已经创建，应该直接设置：
+
+    set_target_properties(validation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
+
+
+怎么设置
+--------------------------------------------------------------------------------
+方式 1：全局默认值，影响后续 target
+
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+方式 2：只设置某个 target
+
+    set_target_properties(validation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
+
+方式 3：按构建类型设置
+
+    set_target_properties(validation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${PROJECT_SOURCE_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${PROJECT_SOURCE_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${PROJECT_SOURCE_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${PROJECT_SOURCE_DIR}"
+    )
+
+
+默认是什么
+--------------------------------------------------------------------------------
+如果没有设置 CMAKE_RUNTIME_OUTPUT_DIRECTORY，也没有设置 target 的
+RUNTIME_OUTPUT_DIRECTORY，CMake 会把 runtime 产物放到 target 对应的构建目录。
+
+常见情况下：
+
+    可执行文件会落在 build tree 的某个目录中。
+
+但这不是可移植保证，具体路径仍取决于生成器和目录结构。
+
+
+本项目中的用法
+--------------------------------------------------------------------------------
+顶层 CMakeLists.txt 对 validation 直接设置了 target 属性：
+
+    set_target_properties(validation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+    )
+
+flash_attention.cmake 中临时设置：
+
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+目的：
+
+    如果 flash-attention 在 MakeAvailable 期间创建可执行文件，
+    或在某些平台创建 runtime artifact，
+    默认输出到项目根目录。
+
+同时后续也会对 SHARED_LIBRARY / MODULE_LIBRARY target 设置
+RUNTIME_OUTPUT_DIRECTORY 作为跨平台兜底。
+
+
+================================================================================
+四、flash_attention_SOURCE_DIR
+================================================================================
+
+flash_attention_SOURCE_DIR 是 FetchContent 为内容名 flash_attention 生成的变量。
+
+它的命名规则是：
+
+    <lowercaseName>_SOURCE_DIR
+
+本项目内容名是：
+
+    flash_attention
+
+所以变量名是：
+
+    flash_attention_SOURCE_DIR
+
+
+作用是什么
+--------------------------------------------------------------------------------
+它指向 flash-attention 的源码目录。
+
+这个源码目录可能来自：
+
+    1. Git 下载 / checkout；
+    2. FetchContent 默认 _deps 目录；
+    3. FetchContent_Declare 中显式设置的 SOURCE_DIR；
+    4. FETCHCONTENT_SOURCE_DIR_FLASH_ATTENTION 命令行覆盖；
+    5. 本项目 FLASH_ATTENTION_SRC_DIR 变量转成 SOURCE_DIR 后传给 FetchContent_Declare。
+
+在本项目中，FetchContent_MakeAvailable 后会打印：
+
+    message(STATUS "flash-attention is available at ${flash_attention_SOURCE_DIR}")
+
+这就是源码目录。
+
+
+什么时候设置
+--------------------------------------------------------------------------------
+在执行以下命令之后设置：
+
+    FetchContent_MakeAvailable(flash_attention)
+
+或：
+
+    FetchContent_Populate(flash_attention)
+
+在此之前，flash_attention_SOURCE_DIR 可能还不存在或为空。
+
+示例：
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+    )
+
+    message(STATUS "before: ${flash_attention_SOURCE_DIR}")  # 不可靠
+
+    FetchContent_MakeAvailable(flash_attention)
+
+    message(STATUS "after: ${flash_attention_SOURCE_DIR}")   # 可用
+
+
+怎么设置
+--------------------------------------------------------------------------------
+方式 1：由 FetchContent 自动设置
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+此时源码目录默认在 FetchContent 的默认位置下。
+
+
+方式 2：在 FetchContent_Declare 中显式设置 SOURCE_DIR
+
+    FetchContent_Declare(
+        flash_attention
+        SOURCE_DIR /home/liam/src/flash-attention
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+此时：
+
+    flash_attention_SOURCE_DIR=/home/liam/src/flash-attention
+
+
+方式 3：用 FetchContent 官方命令行变量覆盖
+
+    cmake -S . -B cmake-build-release \
+      -DFETCHCONTENT_SOURCE_DIR_FLASH_ATTENTION=/home/liam/src/flash-attention
+
+此时 MakeAvailable 会使用这个本地源码目录。
+
+
+方式 4：使用本项目自定义变量
+
+    cmake -S . -B cmake-build-release \
+      -DFLASH_ATTENTION_SRC_DIR=/home/liam/src/flash-attention
+
+本项目 flash_attention.cmake 会把它传给：
+
+    FetchContent_Declare(... SOURCE_DIR ${FLASH_ATTENTION_SRC_DIR})
+
+
+默认是什么
+--------------------------------------------------------------------------------
+如果没有显式设置 SOURCE_DIR，也没有用 FETCHCONTENT_SOURCE_DIR_FLASH_ATTENTION 覆盖，
+FetchContent 默认会把源码放在：
+
+    ${FETCHCONTENT_BASE_DIR}/<lowercaseName>-src
+
+而 FETCHCONTENT_BASE_DIR 默认是：
+
+    ${CMAKE_BINARY_DIR}/_deps
+
+所以常见默认路径是：
+
+    ${CMAKE_BINARY_DIR}/_deps/flash_attention-src
+
+注意：
+
+    本项目当前在 FetchContent_Declare 中显式设置了 BINARY_DIR，
+    但没有在 Git 下载分支显式设置 SOURCE_DIR。
+    所以 Git 下载分支的 SOURCE_DIR 通常仍会使用 FetchContent 默认源码目录。
+
+
+================================================================================
+五、flash_attention_BINARY_DIR
+================================================================================
+
+flash_attention_BINARY_DIR 也是 FetchContent 为内容名 flash_attention 生成的变量。
+
+命名规则：
+
+    <lowercaseName>_BINARY_DIR
+
+本项目内容名是：
+
+    flash_attention
+
+所以变量名是：
+
+    flash_attention_BINARY_DIR
+
+
+作用是什么
+--------------------------------------------------------------------------------
+它指向 flash-attention 这个外部内容的构建目录。
+
+典型用途：
+
+    add_subdirectory(
+        ${flash_attention_SOURCE_DIR}
+        ${flash_attention_BINARY_DIR}
+    )
+
+FetchContent_MakeAvailable 在源码中有 CMakeLists.txt 时，会在内部做类似事情。
+
+注意：
+
+    flash_attention_BINARY_DIR 是外部项目构建中间目录；
+    不是最终 .so 输出目录。
+
+最终 .so 输出目录看：
+
+    LIBRARY_OUTPUT_DIRECTORY
+    RUNTIME_OUTPUT_DIRECTORY
+
+
+什么时候设置
+--------------------------------------------------------------------------------
+同 flash_attention_SOURCE_DIR。
+
+在执行以下命令后设置：
+
+    FetchContent_MakeAvailable(flash_attention)
+
+或：
+
+    FetchContent_Populate(flash_attention)
+
+在此之前不应该依赖它。
+
+
+怎么设置
+--------------------------------------------------------------------------------
+方式 1：由 FetchContent 默认设置
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+默认 BINARY_DIR 通常在：
+
+    ${FETCHCONTENT_BASE_DIR}/<lowercaseName>-build
+
+
+方式 2：在 FetchContent_Declare 中显式设置 BINARY_DIR
+
+本项目采用这个方式：
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY ${FLASH_ATTENTION_GIT_REPOSITORY}
+        GIT_TAG ${FLASH_ATTENTION_GIT_TAG}
+        GIT_PROGRESS TRUE
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+此时：
+
+    flash_attention_BINARY_DIR=${CMAKE_BINARY_DIR}/flash-attention
+
+如果主构建目录是：
+
+    cmake-build-release
+
+那么外部项目构建目录就是：
+
+    cmake-build-release/flash-attention
+
+
+默认是什么
+--------------------------------------------------------------------------------
+如果没有显式设置 BINARY_DIR，FetchContent 默认会使用：
+
+    ${FETCHCONTENT_BASE_DIR}/<lowercaseName>-build
+
+FETCHCONTENT_BASE_DIR 默认是：
+
+    ${CMAKE_BINARY_DIR}/_deps
+
+所以常见默认路径是：
+
+    ${CMAKE_BINARY_DIR}/_deps/flash_attention-build
+
+但本项目显式设置了：
+
+    BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+
+所以本项目中 flash_attention_BINARY_DIR 通常不是默认 _deps 位置，
+而是：
+
+    ${CMAKE_BINARY_DIR}/flash-attention
+
+
+================================================================================
+六、四者关系：源码目录、构建目录、最终产物目录
+================================================================================
+
+可以按三类目录理解：
+
+    1. 源码目录
+
+        flash_attention_SOURCE_DIR
+
+        放 flash-attention 的源码。
+        里面有 flash-attention 的 CMakeLists.txt、csrc、python 文件等。
+
+
+    2. 外部项目构建目录
+
+        flash_attention_BINARY_DIR
+
+        放 flash-attention 作为子项目时的 CMake 中间文件。
+        这是 add_subdirectory 的 binary_dir。
+
+
+    3. 最终产物输出目录
+
+        CMAKE_LIBRARY_OUTPUT_DIRECTORY
+        CMAKE_RUNTIME_OUTPUT_DIRECTORY
+        或 target 的 LIBRARY_OUTPUT_DIRECTORY / RUNTIME_OUTPUT_DIRECTORY 属性
+
+        控制 .so / executable 最终生成在哪里。
+
+
+示意：
+
+    源码：
+        flash_attention_SOURCE_DIR
+        = cmake-build-release/_deps/flash_attention-src
+        或 /home/liam/src/flash-attention
+
+    构建中间目录：
+        flash_attention_BINARY_DIR
+        = cmake-build-release/flash-attention
+
+    最终 .so 输出：
+        LIBRARY_OUTPUT_DIRECTORY
+        = ${PROJECT_SOURCE_DIR}
+        = /home/liam/cpp_linux/CUDA_ROPE
+
+这三个目录可以完全不同。
+
+
+================================================================================
+七、本项目 flash_attention.cmake 中的实际流程
+================================================================================
+
+当前流程：
+
+    1. 声明源码来源
+
+        FetchContent_Declare(
+            flash_attention
+            GIT_REPOSITORY ${FLASH_ATTENTION_GIT_REPOSITORY}
+            GIT_TAG ${FLASH_ATTENTION_GIT_TAG}
+            GIT_PROGRESS TRUE
+            BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+        )
+
+    2. 保存旧输出目录
+
+        if(DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+            ...
+        endif()
+
+        if(DEFINED CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+            ...
+        endif()
+
+    3. 临时设置后续 target 默认输出目录
+
+        set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}")
+
+    4. 让 FetchContent 生效
+
+        FetchContent_MakeAvailable(flash_attention)
+
+        这一步之后：
+
+            flash_attention_SOURCE_DIR 可用；
+            flash_attention_BINARY_DIR 可用；
+            flash-attention 的 CMake target 已创建。
+
+    5. 恢复旧输出目录
+
+        如果原本有值，恢复；
+        如果原本没值，unset。
+
+    6. 递归收集 flash-attention target
+
+        _flash_attention_collect_targets(...)
+
+    7. 对 MODULE_LIBRARY / SHARED_LIBRARY target 兜底设置输出目录
+
+        set_target_properties(${_target} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
+            ...
+        )
+
+为什么既设置 CMAKE_*_OUTPUT_DIRECTORY，又设置 target properties：
+
+    CMAKE_*_OUTPUT_DIRECTORY
+        在 target 创建时提供默认值。
+
+    set_target_properties(...)
+        在 target 创建后强制设置具体 target。
+
+两者组合：
+
+    先给默认值；
+    再对已创建的目标兜底修正；
+    尽量保证 flash-attention 的 .so 输出到项目根目录。
+
+
+================================================================================
+八、常见误解
+================================================================================
+
+1. CMAKE_LIBRARY_OUTPUT_DIRECTORY 是所有库永远的输出目录吗？
+--------------------------------------------------------------------------------
+不是。
+
+它只是初始化后续 target 的 LIBRARY_OUTPUT_DIRECTORY。
+
+如果 target 已经创建，它通常不会被后续 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ...)
+反向修改。
+
+如果 target 自己设置了 LIBRARY_OUTPUT_DIRECTORY，也可能覆盖这个默认值。
+
+
+2. CMAKE_RUNTIME_OUTPUT_DIRECTORY 会影响 .so 吗？
+--------------------------------------------------------------------------------
+通常 Linux 上的 .so 更主要看 LIBRARY_OUTPUT_DIRECTORY。
+
+RUNTIME_OUTPUT_DIRECTORY 主要影响 executable 和 Windows runtime artifact。
+
+但为了跨平台兜底，本项目对 flash-attention 的共享库 / 模块 target
+也同时设置了 RUNTIME_OUTPUT_DIRECTORY。
+
+
+3. flash_attention_BINARY_DIR 是 .so 输出目录吗？
+--------------------------------------------------------------------------------
+不是。
+
+它是 flash-attention 子项目的构建目录。
+
+.so 最终输出目录由 target 的 LIBRARY_OUTPUT_DIRECTORY 决定。
+
+
+4. flash_attention_SOURCE_DIR 是 build 目录吗？
+--------------------------------------------------------------------------------
+不是。
+
+它是源码目录。
+
+build 中间文件应该进入 flash_attention_BINARY_DIR。
+
+
+5. 设置 BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention 后，.so 会输出到那里吗？
+--------------------------------------------------------------------------------
+不一定。
+
+BINARY_DIR 只决定外部项目构建树。
+
+如果没有额外设置输出目录，某些产物可能会落在 binary dir 下面；
+但如果显式设置 LIBRARY_OUTPUT_DIRECTORY，它们会输出到指定位置。
+
+本项目显式希望 .so 到项目根目录：
+
+    ${PROJECT_SOURCE_DIR}
+
+
+================================================================================

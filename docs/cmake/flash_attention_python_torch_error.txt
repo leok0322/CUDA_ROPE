@@ -1,0 +1,402 @@
+================================================================================
+flash-attention 配置报错：ModuleNotFoundError: No module named 'torch'
+================================================================================
+
+报错现象
+--------------------------------------------------------------------------------
+配置 flash-attention 外部项目时出现：
+
+    -- GPU Compute Capability: 8.6 -> CMAKE_CUDA_ARCHITECTURES=86  TORCH_CUDA_ARCH_LIST=8.6
+    -- Kernel config: ROPE_VARIANT=1  BLOCK_SIZE=256
+    -- flash-attention target architectures: 86-real
+    -- Build type: Release
+    -- Target device: cuda
+    -- Found Python: /usr/bin/python3.10 (found version "3.10.12") found components: Interpreter Development.Module Development.SABIModule
+    CMake Error at cmake-build-release/_deps/flash_attention-src/cmake/utils.cmake:41 (message):
+      Failed to locate torch path: Traceback (most recent call last):
+
+        File "<string>", line 1, in <module>
+
+      ModuleNotFoundError: No module named 'torch'
+
+    Call Stack (most recent call first):
+      cmake-build-release/_deps/flash_attention-src/cmake/utils.cmake:49 (run_python)
+      cmake-build-release/_deps/flash_attention-src/CMakeLists.txt:51 (append_cmake_prefix_path)
+
+
+================================================================================
+一、直接原因
+================================================================================
+
+flash-attention 子项目重新找了一次 Python：
+
+    find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule)
+
+它找到的是系统 Python：
+
+    /usr/bin/python3.10
+
+而不是本项目顶层已经找到的 venv Python：
+
+    /home/liam/python_linux/python_venv/.venv/bin/python3
+
+系统 Python 里没有安装 torch。
+
+所以 flash-attention 执行下面这段 Python 时失败：
+
+    import torch
+    print(torch.utils.cmake_prefix_path)
+
+对应 flash-attention 的 CMake 调用链：
+
+    append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
+        -> run_python(...)
+            -> "${Python_EXECUTABLE}" -c "import torch; ..."
+
+最终报：
+
+    ModuleNotFoundError: No module named 'torch'
+
+
+================================================================================
+二、为什么顶层已经找到 Python3，子项目还会找错
+================================================================================
+
+本项目顶层 CMakeLists.txt 使用的是：
+
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+
+它找到的是：
+
+    Python3_EXECUTABLE=/home/liam/python_linux/python_venv/.venv/bin/python3
+
+但是 flash-attention 的 CMake 使用的是另一个 package：
+
+    find_package(Python ...)
+
+也就是变量名是：
+
+    Python_EXECUTABLE
+
+而不是：
+
+    Python3_EXECUTABLE
+
+这两个是 CMake 中不同的 FindPython 模块入口：
+
+    Python3_EXECUTABLE
+        来自 find_package(Python3 ...)
+
+    Python_EXECUTABLE
+        来自 find_package(Python ...)
+
+如果不显式告诉 flash-attention 使用哪个 Python，
+CMake 可能会重新搜索，并选到系统 Python。
+
+
+================================================================================
+三、如何定位
+================================================================================
+
+1. 看配置日志
+--------------------------------------------------------------------------------
+关键线索是：
+
+    -- Found Python: /usr/bin/python3.10
+
+而不是：
+
+    -- Found Python: /home/liam/python_linux/python_venv/.venv/bin/python3
+
+说明 flash-attention 子项目使用了错误 Python。
+
+
+2. 看 flash-attention 的 utils.cmake
+--------------------------------------------------------------------------------
+flash-attention 的：
+
+    cmake-build-release/_deps/flash_attention-src/cmake/utils.cmake
+
+里面有提示：
+
+    # To customize which python gets found, set the `Python_EXECUTABLE` variable.
+
+也就是：
+
+    要控制 flash-attention 使用哪个 Python，需要设置 Python_EXECUTABLE。
+
+
+3. 看失败位置
+--------------------------------------------------------------------------------
+utils.cmake 中：
+
+    function (run_python OUT EXPR ERR_MSG)
+      execute_process(
+        COMMAND
+        "${Python_EXECUTABLE}" "-c" "${EXPR}"
+        ...
+      )
+    endfunction()
+
+    macro (append_cmake_prefix_path PKG EXPR)
+      run_python(_PREFIX_PATH
+        "import ${PKG}; print(${EXPR})" "Failed to locate ${PKG} path")
+      list(APPEND CMAKE_PREFIX_PATH ${_PREFIX_PATH})
+    endmacro()
+
+所以失败不是 C++ 编译错误，也不是 TorchConfig.cmake 找不到。
+
+它是配置阶段执行 Python：
+
+    /usr/bin/python3.10 -c "import torch; print(torch.utils.cmake_prefix_path)"
+
+时失败。
+
+
+================================================================================
+四、本项目的修复方案
+================================================================================
+
+在：
+
+    cmake/extern_projects/flash_attention.cmake
+
+中，在：
+
+    FetchContent_MakeAvailable(flash_attention)
+
+之前增加：
+
+    get_cmake_property(_FLASH_ATTENTION_CACHE_VARS CACHE_VARIABLES)
+    foreach(_cache_var IN LISTS _FLASH_ATTENTION_CACHE_VARS)
+        if(_cache_var MATCHES "^_?Python_")
+            unset(${_cache_var} CACHE)
+        endif()
+    endforeach()
+
+    if(Python3_EXECUTABLE)
+        get_filename_component(_FLASH_ATTENTION_PYTHON_ROOT
+            "${Python3_EXECUTABLE}" DIRECTORY)
+        get_filename_component(_FLASH_ATTENTION_PYTHON_ROOT
+            "${_FLASH_ATTENTION_PYTHON_ROOT}" DIRECTORY)
+        set(Python_ROOT_DIR "${_FLASH_ATTENTION_PYTHON_ROOT}"
+            CACHE PATH "Python root used by flash-attention" FORCE)
+        set(Python_EXECUTABLE "${Python3_EXECUTABLE}"
+            CACHE FILEPATH "Python executable used by flash-attention" FORCE)
+        message(STATUS "flash-attention Python executable: ${Python_EXECUTABLE}")
+    endif()
+
+含义：
+
+    把顶层 find_package(Python3 ...) 已经确定的 venv Python，
+    转交给 flash-attention 的 find_package(Python ...) 使用。
+
+为什么用 CACHE：
+
+    flash-attention 的 find_package(Python ...) 会读取 CMake cache 中的
+    Python_EXECUTABLE。
+
+为什么用 FORCE：
+
+    如果这个 build 目录之前已经配置失败过，
+    CMakeCache.txt 里可能已经缓存了错误的系统 Python。
+
+    FORCE 可以覆盖旧值，强制改成 venv Python。
+
+为什么要清理 Python / _Python cache：
+
+    IDE reload 通常复用同一个 build 目录。
+
+    如果 flash-attention 曾经在这个 build 目录里找错过 Python，
+    CMakeCache.txt 里可能残留 FindPython 的内部缓存，例如：
+
+        _Python_EXECUTABLE=/usr/bin/python3.10
+        _Python_INCLUDE_DIR=_Python_INCLUDE_DIR-NOTFOUND
+
+    这时即使 Python_EXECUTABLE 已经改成：
+
+        /home/liam/python_linux/python_venv/.venv/bin/python3
+
+    find_package(Python ...) 仍可能复用旧的内部结果，导致新的报错：
+
+        Could NOT find Python ...
+        Unable to find python matching:
+        /home/liam/python_linux/python_venv/.venv/bin/python3
+
+    所以本项目在进入 flash-attention 之前清理：
+
+        Python_*
+        _Python_*
+
+    只清理 generic Python 包的 cache，不清理：
+
+        Python3_*
+        _Python3_*
+
+    因为 Python3_* 是本项目顶层 find_package(Python3 ...) 已经正确找到的结果。
+
+
+================================================================================
+五、IDE reload 中的另一种 Python 报错
+================================================================================
+
+报错现象
+--------------------------------------------------------------------------------
+IDE reload 项目时可能出现：
+
+    -- flash-attention Python executable: /home/liam/python_linux/python_venv/.venv/bin/python3
+    -- Could NOT find Python (missing: Python_INCLUDE_DIRS Interpreter Development.Module Development.SABIModule) (found version "3.10.12")
+    CMake Error at cmake-build-release/_deps/flash_attention-src/cmake/utils.cmake:12 (message):
+      Unable to find python matching:
+      /home/liam/python_linux/python_venv/.venv/bin/python3.
+
+这个报错和前面的：
+
+    ModuleNotFoundError: No module named 'torch'
+
+不是完全同一个阶段。
+
+区别是：
+
+    ModuleNotFoundError: No module named 'torch'
+        flash-attention 已经找到了某个 Python，但这个 Python 是系统 Python，
+        里面没有 torch。
+
+    Unable to find python matching: <venv>/bin/python3
+        已经把 Python_EXECUTABLE 指向 venv Python，
+        但同一个 build 目录里残留了旧的 FindPython 内部缓存，
+        导致 find_package(Python ...) 的 executable / include / development
+        信息不一致。
+
+典型残留 cache 形态：
+
+    Python_EXECUTABLE=/home/liam/python_linux/python_venv/.venv/bin/python3
+    _Python_EXECUTABLE=/home/liam/python_linux/python_venv/.venv/bin/python3
+    _Python_INCLUDE_DIR=_Python_INCLUDE_DIR-NOTFOUND
+
+或者：
+
+    Python_EXECUTABLE=<venv>/bin/python3
+    _Python_EXECUTABLE=/usr/bin/python3.10
+    _Python_INCLUDE_DIR=_Python_INCLUDE_DIR-NOTFOUND
+
+本项目当前的处理方式：
+
+    1. 在 FetchContent_MakeAvailable(flash_attention) 之前清理 Python / _Python cache；
+    2. 用顶层 Python3_EXECUTABLE 重新设置 Python_EXECUTABLE；
+    3. 同时设置 Python_ROOT_DIR 指向 venv 根目录；
+    4. 然后才让 flash-attention 执行 find_package(Python ...)。
+
+
+================================================================================
+六、验证结果
+================================================================================
+
+修复后，配置日志应该出现：
+
+    -- flash-attention Python executable: /home/liam/python_linux/python_venv/.venv/bin/python3
+    -- Found Python: /home/liam/python_linux/python_venv/.venv/bin/python3
+
+并且不再出现：
+
+    ModuleNotFoundError: No module named 'torch'
+
+一次验证日志示例：
+
+    -- flash-attention Python executable: /home/liam/python_linux/python_venv/.venv/bin/python3
+    -- Build type:
+    -- Target device: cuda
+    -- Found Python: /home/liam/python_linux/python_venv/.venv/bin/python3 (found version "3.13.5") found components: Interpreter Development.Module Development.SABIModule
+    -- flash-attention is available at /home/liam/cpp_linux/CUDA_ROPE/cmake-build-flash-python-check/_deps/flash_attention-src
+    -- flash-attention shared/module targets output to /home/liam/cpp_linux/CUDA_ROPE: _vllm_fa2_C;_vllm_fa3_C
+    -- Configuring done
+    -- Generating done
+
+在已有 cmake-build-release 目录重新配置后，还可以检查 cache：
+
+    Python_EXECUTABLE:FILEPATH=/home/liam/python_linux/python_venv/.venv/bin/python3
+    Python_ROOT_DIR:PATH=/home/liam/python_linux/python_venv/.venv
+    _Python_EXECUTABLE:INTERNAL=/home/liam/python_linux/python_venv/.venv/bin/python3
+    _Python_INCLUDE_DIR:INTERNAL=/home/liam/.local/share/uv/python/cpython-3.13.5-linux-x86_64-gnu/include/python3.13
+
+如果 _Python_INCLUDE_DIR 不再是 NOTFOUND，说明 FindPython 的旧缓存问题已经被清理。
+
+
+================================================================================
+七、剩余 warning：PyTorch 版本不匹配
+================================================================================
+
+修复 Python 后，可能仍会看到：
+
+    Pytorch version 2.4.0 expected for CUDA build, saw 2.12.0 instead.
+
+这是 flash-attention CMakeLists.txt 中的版本警告。
+
+它表示：
+
+    flash-attention 这个版本期望的 PyTorch CUDA 版本是 2.4.0；
+    当前环境里的 Torch_VERSION 是 2.12.0。
+
+这个 warning 和本次：
+
+    ModuleNotFoundError: No module named 'torch'
+
+不是同一个问题。
+
+区别：
+
+    ModuleNotFoundError
+        Python 解释器选错，连 import torch 都失败。
+        必须修复。
+
+    PyTorch version warning
+        已经成功 import torch，也成功找到 Torch。
+        只是版本不是 flash-attention CMake 里写的期望版本。
+        是否会影响最终编译 / 运行，需要结合 flash-attention 代码兼容性判断。
+
+
+================================================================================
+八、命令行侧的临时解决方式
+================================================================================
+
+如果不改 CMake 文件，也可以在配置命令里显式传：
+
+    cmake -S . -B cmake-build-release \
+      -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \
+      -DPython_EXECUTABLE=/home/liam/python_linux/python_venv/.venv/bin/python3 \
+      -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake
+
+关键是：
+
+    -DPython_EXECUTABLE=/home/liam/python_linux/python_venv/.venv/bin/python3
+
+但本项目已经在 flash_attention.cmake 中自动把 Python3_EXECUTABLE 转给
+Python_EXECUTABLE，因此正常不需要每次手动传这个参数。
+
+
+================================================================================
+九、清理旧 cache
+================================================================================
+
+如果之前配置失败过，CMakeCache.txt 里可能缓存了错误 Python。
+
+可以选择：
+
+    1. 删除整个构建目录后重新配置；
+
+        rm -rf cmake-build-release
+        cmake -S . -B cmake-build-release ...
+
+    2. 或显式覆盖 Python_EXECUTABLE；
+
+        cmake -S . -B cmake-build-release \
+          -DPython_EXECUTABLE=/home/liam/python_linux/python_venv/.venv/bin/python3
+
+本项目修复中使用了：
+
+    unset(... CACHE)
+    CACHE FILEPATH ... FORCE
+
+所以通常不需要手动删除 cache。
+
+================================================================================

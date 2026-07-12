@@ -1,0 +1,602 @@
+================================================================================
+CMake 接入 flash-attention：配置命令与 ROPE_BUILD_FLASH_ATTENTION 开关
+================================================================================
+
+背景
+--------------------------------------------------------------------------------
+本项目在 CMakeLists.txt 末尾新增了 flash-attention 外部项目开关：
+
+    option(ROPE_BUILD_FLASH_ATTENTION "Fetch and build flash-attention from source" ON)
+
+    if(ROPE_BUILD_FLASH_ATTENTION)
+        include(${CMAKE_CURRENT_LIST_DIR}/cmake/extern_projects/flash_attention.cmake)
+    endif()
+
+含义：
+    - 默认 ROPE_BUILD_FLASH_ATTENTION=ON
+      → 配置阶段会 include flash_attention.cmake
+      → flash_attention.cmake 内部通过 FetchContent 拉取 / 加载 flash-attention
+      → 生成 flash-attention 的构建目标
+      → 后续 cmake --build 时会编译对应 .so
+
+    - 如果显式传 -DROPE_BUILD_FLASH_ATTENTION=OFF
+      → if(ROPE_BUILD_FLASH_ATTENTION) 判断为假
+      → 不 include flash_attention.cmake
+      → 不 FetchContent，不下载源码，不生成 flash-attention 目标
+      → 后续 cmake --build 时自然不会编译 flash-attention
+
+
+================================================================================
+一、option(...) 这一行是什么意思
+================================================================================
+
+代码：
+
+    option(ROPE_BUILD_FLASH_ATTENTION "Fetch and build flash-attention from source" ON)
+
+这是 CMake 定义布尔开关的写法，格式是：
+
+    option(<变量名> "<说明文字>" <默认值>)
+
+对应到本项目：
+
+    ROPE_BUILD_FLASH_ATTENTION
+        变量名。后面可以在 if(...) 里使用：
+
+            if(ROPE_BUILD_FLASH_ATTENTION)
+                ...
+            endif()
+
+    "Fetch and build flash-attention from source"
+        说明文字。它不会影响构建逻辑，只用于 CMake GUI / ccmake /
+        CMakeCache.txt 等地方显示这个选项的含义。
+
+    ON
+        默认值。表示如果用户没有在命令行或 CMakeCache.txt 里设置过这个变量，
+        那么它默认是开启的。
+
+因此这行的含义是：
+
+    定义一个名为 ROPE_BUILD_FLASH_ATTENTION 的 CMake 布尔开关，
+    默认值为 ON，用来控制是否从源码拉取并构建 flash-attention。
+
+用户可以在配置阶段用 -D 覆盖默认值：
+
+    -DROPE_BUILD_FLASH_ATTENTION=OFF
+        关闭 flash-attention 外部项目
+
+    -DROPE_BUILD_FLASH_ATTENTION=ON
+        开启 flash-attention 外部项目
+
+注意：option(...) 的默认值只在该变量第一次进入 CMakeCache 时生效。
+如果某个构建目录已经配置过，并且 CMakeCache.txt 里已有：
+
+    ROPE_BUILD_FLASH_ATTENTION:BOOL=OFF
+
+那么即使 CMakeLists.txt 中 option(... ON) 写的是 ON，
+再次 cmake 配置时也会继续使用 cache 里的 OFF，除非显式传：
+
+    -DROPE_BUILD_FLASH_ATTENTION=ON
+
+或者删除该构建目录 / 删除 CMakeCache.txt 后重新配置。
+
+
+================================================================================
+二、CMakeLists.txt 和 flash_attention.cmake 的关系
+================================================================================
+
+本项目的入口仍然是项目根目录的 CMakeLists.txt。
+
+当执行：
+
+    cmake -S . -B build ...
+
+CMake 首先读取的是：
+
+    CMakeLists.txt
+
+在 CMakeLists.txt 末尾有：
+
+    option(ROPE_BUILD_FLASH_ATTENTION "Fetch and build flash-attention from source" ON)
+
+    if(ROPE_BUILD_FLASH_ATTENTION)
+        include(${CMAKE_CURRENT_LIST_DIR}/cmake/extern_projects/flash_attention.cmake)
+    endif()
+
+这里的关系可以理解为：
+
+    CMakeLists.txt
+        是主入口，负责定义本项目自己的 target：
+            ROPE_cuda
+            validation
+
+        同时定义开关：
+            ROPE_BUILD_FLASH_ATTENTION
+
+        当开关为 ON 时，再加载外部项目配置文件：
+            cmake/extern_projects/flash_attention.cmake
+
+    cmake/extern_projects/flash_attention.cmake
+        不是独立运行的脚本，也不是 build 阶段被编译器执行的文件。
+        它是被 CMakeLists.txt 用 include(...) 包进来的 CMake 配置片段。
+
+        它负责：
+            - 声明 flash-attention 的源码来源；
+            - 设置兼容 vLLM / flash-attention 的 CMake 变量；
+            - 调用 FetchContent_Declare；
+            - 调用 FetchContent_MakeAvailable；
+            - 把 flash-attention 产生的 .so target 输出目录改到项目根目录。
+
+include(...) 的含义
+--------------------------------------------------------------------------------
+这句：
+
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/extern_projects/flash_attention.cmake)
+
+含义是：
+
+    在当前 CMake 配置过程中，立刻读取并执行这个 .cmake 文件里的命令。
+
+它不是 C/C++ 的 #include，也不是链接阶段的 include。
+它发生在 CMake 配置阶段。
+
+可以把它近似理解为：
+
+    把 flash_attention.cmake 文件里的 CMake 代码，插入到 CMakeLists.txt
+    的 include(...) 位置执行。
+
+因此 flash_attention.cmake 可以访问前面已经定义好的变量，例如：
+
+    PROJECT_SOURCE_DIR
+    CMAKE_BINARY_DIR
+    TORCH_CUDA_ARCH_LIST
+    CMAKE_CUDA_ARCHITECTURES
+
+这些变量不是传给编译器的参数，而是 CMake 配置阶段用来生成构建图的变量。
+
+
+.cmake 文件如何起作用
+--------------------------------------------------------------------------------
+flash_attention.cmake 的核心作用链条是：
+
+    1. 声明外部项目来源
+
+        FetchContent_Declare(
+            flash_attention
+            GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+            GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+            BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+        )
+
+        这一步只是在 CMake 配置阶段告诉 CMake：
+
+            有一个外部项目叫 flash_attention；
+            它的源码来自这个 Git 仓库和这个 commit；
+            它自己的构建中间目录放在 ${CMAKE_BINARY_DIR}/flash-attention。
+
+    2. 让外部项目真正加入当前构建
+
+        FetchContent_MakeAvailable(flash_attention)
+
+        这一步会准备源码，并把 flash-attention 自己的 CMakeLists.txt
+        加入当前项目构建图。
+
+        执行完之后，flash-attention 里面 add_library(...) 创建的 target
+        才会成为本项目 build graph 的一部分。
+
+    3. 修改 flash-attention target 的输出目录
+
+        flash_attention.cmake 会递归收集 flash-attention 创建出的 CMake target，
+        找出 MODULE_LIBRARY / SHARED_LIBRARY 类型的目标，然后设置：
+
+            LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+            RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+
+        这样 build 阶段生成的 .so 会落到项目根目录，而不是只留在外部项目
+        自己的 build 子目录里。
+
+完整流程可以概括为：
+
+    cmake -S . -B build ...
+        → 读取 CMakeLists.txt
+        → 定义 ROPE_cuda / validation
+        → 读取 ROPE_BUILD_FLASH_ATTENTION 开关
+        → 如果 ON，则 include flash_attention.cmake
+        → flash_attention.cmake 用 FetchContent 加入 flash-attention
+        → CMake 生成完整 build graph
+        → cmake --build build 时，才真正调用 g++ / nvcc 编译
+
+所以：
+
+    CMakeLists.txt 决定是否接入 flash-attention；
+    flash_attention.cmake 定义如何接入 flash-attention；
+    编译器只在 cmake --build 阶段根据生成好的构建规则运行。
+
+
+================================================================================
+三、set(... CACHE ...) 是 CMake 变量，不是编译器宏
+================================================================================
+
+flash_attention.cmake 中有多处类似写法：
+
+    set(FLASH_ATTENTION_GIT_REPOSITORY
+        "https://github.com/vllm-project/flash-attention.git"
+        CACHE STRING "flash-attention Git repository")
+
+    set(FLASH_ATTENTION_GIT_TAG
+        "b3964b1d8b95d8e8447435668ab169a2700bab65"
+        CACHE STRING "flash-attention Git revision")
+
+    set(FLASH_ATTENTION_SRC_DIR
+        ""
+        CACHE PATH "Use an existing flash-attention source directory instead of downloading")
+
+这里的 CACHE 表示：
+
+    这些变量是 CMake cache 变量。
+
+它们会写入构建目录下的：
+
+    CMakeCache.txt
+
+作用是：
+
+    - 在 CMake 配置阶段保存变量值；
+    - 允许用户用 cmake -D... 覆盖；
+    - 下次在同一个 build 目录重新配置时继续复用旧值。
+
+例如：
+
+    cmake -S . -B cmake-build-release \
+      -DFLASH_ATTENTION_SRC_DIR=/path/to/flash-attention
+
+这里的 -D 是 CMake 命令行参数，含义是：
+
+    设置 CMake cache 变量 FLASH_ATTENTION_SRC_DIR。
+
+它不是传给 g++ / nvcc 的 -D 编译宏。
+
+
+CMake 的 -D 和编译器的 -D 不是一回事
+--------------------------------------------------------------------------------
+这两个写法很像，但发生在不同阶段：
+
+    cmake -DVAR=VALUE
+        CMake 配置阶段使用。
+        设置 CMake 变量 / CMake cache 变量。
+        写入 CMakeCache.txt。
+
+    g++ -DVAR=VALUE
+    nvcc -DVAR=VALUE
+        编译阶段使用。
+        定义 C/C++ 预处理宏。
+        源码里可以用 #ifdef VAR / #if VAR / VAR 访问。
+
+所以：
+
+    -DFLASH_ATTENTION_SRC_DIR=/path/to/flash-attention
+
+只是告诉 CMake：
+
+    flash-attention 源码目录在哪里。
+
+它不会自动变成：
+
+    g++ -DFLASH_ATTENTION_SRC_DIR=/path/to/flash-attention
+
+源码里也不会自动出现名为 FLASH_ATTENTION_SRC_DIR 的 C/C++ 宏。
+
+
+什么时候 CMake 变量会进入编译器宏
+--------------------------------------------------------------------------------
+CMake 变量只有被显式用于"生成编译命令"时，才会进入编译器。
+
+最典型的是：
+
+    target_compile_definitions(...)
+
+例如本项目 CMakeLists.txt 里有：
+
+    target_compile_definitions(ROPE_cuda PRIVATE
+        TORCH_EXTENSION_NAME=ROPE_cuda
+        ROPE_VARIANT=${ROPE_VARIANT}
+        BLOCK_SIZE=${BLOCK_SIZE}
+    )
+
+这里的含义是：
+
+    把 CMake 变量 ROPE_VARIANT / BLOCK_SIZE 的值，
+    转换成 ROPE_cuda target 的编译器宏。
+
+最终 build 阶段的编译命令里会出现类似：
+
+    -DROPE_VARIANT=1
+    -DBLOCK_SIZE=256
+    -DTORCH_EXTENSION_NAME=ROPE_cuda
+
+于是 C++ / CUDA 源码里才能使用：
+
+    #if ROPE_VARIANT == 1
+    #endif
+
+    #ifndef BLOCK_SIZE
+    #endif
+
+也就是说：
+
+    set(ROPE_VARIANT 1 CACHE STRING "...")
+        只是定义并缓存一个 CMake 变量；
+
+    target_compile_definitions(... ROPE_VARIANT=${ROPE_VARIANT})
+        才把这个 CMake 变量变成编译器宏。
+
+
+其他会影响编译器的 CMake 用法
+--------------------------------------------------------------------------------
+除了 target_compile_definitions，CMake 变量还可能通过这些命令影响编译 / 链接：
+
+    target_compile_options(...)
+        生成编译选项，例如 -O3 / --use_fast_math。
+
+    target_include_directories(...)
+        生成头文件搜索路径，例如 -I/path/to/include。
+
+    target_link_libraries(...)
+        生成链接库依赖，例如 -lcudart / libtorch.so。
+
+    set_target_properties(... CUDA_ARCHITECTURES ...)
+        影响 nvcc 的 GPU 架构参数。
+
+    add_library(...) / add_executable(...)
+        如果 CMake 变量被用进 source list，它会决定哪些源文件参与编译。
+
+因此 CACHE 变量和编译器之间的关系可以概括为：
+
+    CACHE 变量本身不会自动传给编译器；
+    只有当它被 CMakeLists.txt / .cmake 文件显式用于 target 的编译定义、
+    编译选项、include 路径、链接库、源文件列表或 target 属性时，
+    它才会间接影响 build 阶段的 g++ / nvcc 命令。
+
+对本文件里的变量来说：
+
+    FLASH_ATTENTION_GIT_REPOSITORY
+    FLASH_ATTENTION_GIT_TAG
+    FLASH_ATTENTION_SRC_DIR
+
+主要用于 CMake 配置阶段决定 flash-attention 源码从哪里来。
+它们不会自动成为 C/C++ 宏。
+
+
+================================================================================
+四、这条 CMake 配置命令是什么意思
+================================================================================
+
+示例命令：
+
+    cmake -S . -B cmake-build-flash-check \
+      -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake \
+      -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \
+      -DROPE_BUILD_FLASH_ATTENTION=OFF
+
+逐项解释：
+
+    cmake
+        调用 CMake。这里做的是"配置 configure"，不是实际编译。
+        它会读取 CMakeLists.txt，检查编译器 / CUDA / Python / Torch，
+        然后在构建目录里生成 Makefile / Ninja 文件 / CMakeCache.txt 等。
+
+    -S .
+        指定源码目录为当前目录，也就是项目根目录。
+
+    -B cmake-build-flash-check
+        指定构建目录为 cmake-build-flash-check。
+        CMake 生成的中间文件都会放到这个目录，不直接写到源码目录。
+
+        CMake 没有固定的默认构建目录名。
+        cmake-build-flash-check 只是这里手动指定的临时检查目录，名字可以换成
+        build / cmake-build-release / cmake-build-debug 等任意目录。
+
+        cmake-build-release / cmake-build-debug 这类名字通常来自 IDE 配置，
+        例如 CLion / JetBrains 系列会按 CMake Profile 自动创建类似目录：
+
+            cmake-build-debug
+            cmake-build-release
+
+        但目录名本身不决定构建类型。
+        真正控制 Debug / Release 的是 CMake cache 变量：
+
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Debug
+
+        例如：
+
+            cmake -S . -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
+
+        这才表示"构建目录叫 cmake-build-release，且构建类型是 Release"。
+        如果只写 -B cmake-build-release，但没有设置 CMAKE_BUILD_TYPE，
+        那么是否真是 Release 要看该目录 CMakeCache.txt 里的实际值。
+
+        如果不写 -B，而是在项目根目录直接执行：
+
+            cmake .
+
+        CMake 会把 CMakeCache.txt / CMakeFiles / Makefile 等文件直接生成到源码目录，
+        这叫 in-source build，通常不推荐。
+
+        推荐写法是显式指定 -B，或者使用老式 out-of-source build：
+
+            mkdir build
+            cd build
+            cmake ..
+
+        此时构建目录就是当前所在的 build 目录。
+
+    -DCMAKE_PREFIX_PATH=.../torch/share/cmake
+        告诉 CMake 去哪里找 PyTorch / LibTorch 的 CMake 配置。
+        本项目里有：
+
+            find_package(Torch REQUIRED)
+
+        如果不提供正确的 CMAKE_PREFIX_PATH，CMake 可能找不到 TorchConfig.cmake。
+
+    -DPython3_ROOT_DIR=.../.venv
+        告诉 CMake 优先使用这个 Python 虚拟环境。
+        本项目里有：
+
+            find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+
+        这个参数用于避免 CMake 找到系统 Python，而不是当前 venv。
+
+    -DROPE_BUILD_FLASH_ATTENTION=OFF
+        覆盖 CMakeLists.txt 中 option(...) 的默认值，把 flash-attention 外部项目关掉。
+        这通常用于只检查本项目原有 CMake 配置是否正常，避免配置阶段访问 GitHub、
+        下载外部源码或引入 flash-attention 的额外构建逻辑。
+
+
+================================================================================
+五、为什么 OFF 就是不编译 flash-attention
+================================================================================
+
+CMake 的关键逻辑是：
+
+    option(ROPE_BUILD_FLASH_ATTENTION "Fetch and build flash-attention from source" ON)
+
+    if(ROPE_BUILD_FLASH_ATTENTION)
+        include(${CMAKE_CURRENT_LIST_DIR}/cmake/extern_projects/flash_attention.cmake)
+    endif()
+
+当命令行传入：
+
+    -DROPE_BUILD_FLASH_ATTENTION=OFF
+
+CMake cache 中的变量值会变成 OFF。
+
+于是：
+
+    if(ROPE_BUILD_FLASH_ATTENTION)
+
+判断失败，下面这句不会执行：
+
+    include(.../flash_attention.cmake)
+
+而 flash_attention.cmake 里面才有真正接入外部项目的逻辑：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+所以 OFF 的完整效果链条是：
+
+    -DROPE_BUILD_FLASH_ATTENTION=OFF
+        → if(...) 为假
+        → 不 include flash_attention.cmake
+        → 不执行 FetchContent_Declare / FetchContent_MakeAvailable
+        → 不下载 flash-attention 源码
+        → 不创建 flash-attention 的 CMake target
+        → cmake --build 时没有 flash-attention 目标可编译
+
+这就是"OFF 就是不编译"的原因。
+
+
+================================================================================
+六、ON 时会发生什么
+================================================================================
+
+如果不传这个参数，或者显式传：
+
+    -DROPE_BUILD_FLASH_ATTENTION=ON
+
+则使用默认开启逻辑：
+
+    ROPE_BUILD_FLASH_ATTENTION=ON
+        → include(cmake/extern_projects/flash_attention.cmake)
+        → FetchContent 拉取 / 加载 vllm-project/flash-attention
+        → flash-attention 自己的 CMakeLists.txt 被加入本项目构建
+        → 生成 flash-attention 的共享库 / Python 扩展目标
+        → cmake --build 时一起编译
+
+本项目的 flash_attention.cmake 还额外设置了输出路径：
+
+    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+
+并且递归收集 flash-attention 创建出来的 MODULE_LIBRARY / SHARED_LIBRARY target，
+把这些 target 的构建产物 .so 也设置到项目根目录。
+
+目标：与 ROPE_cuda 和 validation 一样，构建阶段的可加载产物直接落在项目根目录，
+方便 Python import 或 torch.ops.load_library 直接按路径加载。
+
+
+================================================================================
+七、常用命令
+================================================================================
+
+1. 只验证本项目 CMake 配置，不拉取 / 不编译 flash-attention：
+
+    cmake -S . -B cmake-build-flash-check \
+      -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake \
+      -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \
+      -DROPE_BUILD_FLASH_ATTENTION=OFF
+
+2. 配置并启用 flash-attention：
+
+    cmake -S . -B cmake-build-release \
+      -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake \
+      -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \
+      -DROPE_BUILD_FLASH_ATTENTION=ON
+
+3. 编译：
+
+    cmake --build cmake-build-release
+
+4. 使用本地 flash-attention 源码，而不是从 GitHub 下载：
+
+    cmake -S . -B cmake-build-release \
+      -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake \
+      -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \
+      -DROPE_BUILD_FLASH_ATTENTION=ON \
+      -DFLASH_ATTENTION_SRC_DIR=/path/to/flash-attention
+
+也可以用环境变量，适合临时覆盖：
+
+    FLASH_ATTENTION_SRC_DIR=/path/to/flash-attention \
+    cmake -S . -B cmake-build-release \
+      -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake \
+      -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv
+
+
+================================================================================
+八、配置阶段 vs 构建阶段
+================================================================================
+
+容易混淆的一点：
+
+    cmake -S . -B build ...
+        是配置阶段。
+        它读取 CMakeLists.txt，生成构建系统。
+
+    cmake --build build
+        是构建阶段。
+        它真正调用 g++ / nvcc 编译源码并链接 .so / 可执行文件。
+
+ROPE_BUILD_FLASH_ATTENTION 控制的是配置阶段是否把 flash-attention 加入构建图。
+
+    OFF：
+        配置阶段就不加入 flash-attention。
+        构建阶段也就没有它。
+
+    ON：
+        配置阶段加入 flash-attention。
+        构建阶段才会编译它。
+
+因此，"OFF 不编译"不是因为编译命令跳过了某个文件，
+而是因为配置阶段根本没有创建 flash-attention 的构建目标。
+
+================================================================================

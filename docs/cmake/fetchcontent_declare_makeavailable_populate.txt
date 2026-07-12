@@ -1,0 +1,1587 @@
+================================================================================
+FetchContent_Declare 与 FetchContent_MakeAvailable：参数、用法、关系、命令行
+================================================================================
+
+背景
+--------------------------------------------------------------------------------
+FetchContent 是 CMake 官方模块，用来在"配置阶段"准备外部依赖源码。
+
+本项目的 flash-attention 接入文件：
+
+    cmake/extern_projects/flash_attention.cmake
+
+使用了这两个核心命令：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+        GIT_PROGRESS TRUE
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+一句话理解：
+
+    FetchContent_Declare(...)
+        记录"这个外部依赖从哪里来、怎么取"。
+
+    FetchContent_MakeAvailable(...)
+        真正把这个外部依赖准备好，并尽量加入当前 CMake 构建图。
+
+
+================================================================================
+一、FetchContent_Declare 的作用
+================================================================================
+
+基本语法：
+
+    FetchContent_Declare(
+        <name>
+        <contentOptions>...
+        [SYSTEM]
+        [OVERRIDE_FIND_PACKAGE | FIND_PACKAGE_ARGS args...]
+    )
+
+它的作用不是下载，也不是编译。
+
+它只是告诉 CMake：
+
+    有一个外部内容叫 <name>；
+    它的源码在哪里；
+    应该用 Git / URL / SVN / 本地目录等哪种方式取得；
+    源码目录和构建目录应该放在哪里；
+    后续 MakeAvailable 时如何处理它。
+
+也就是说：
+
+    FetchContent_Declare = 声明依赖信息
+
+真正动作发生在后面的：
+
+    FetchContent_MakeAvailable(<name>)
+
+最小完整示例：
+
+    cmake_minimum_required(VERSION 3.20)
+    project(fetch_demo LANGUAGES CXX)
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        my_dep
+        GIT_REPOSITORY https://example.com/my_dep.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_MakeAvailable(my_dep)
+
+    add_executable(app main.cpp)
+    target_link_libraries(app PRIVATE my_dep_target)
+
+这个例子里：
+
+    FetchContent_Declare(my_dep ...)
+        只记录 my_dep 从哪里来。
+
+    FetchContent_MakeAvailable(my_dep)
+        才真正准备源码，并把 my_dep 的 CMakeLists.txt 加进当前项目。
+
+    target_link_libraries(app PRIVATE my_dep_target)
+        使用的是外部项目自己创建出来的 target。
+        这个 target 名不一定等于 FetchContent 的内容名，要看外部项目自己的 CMakeLists.txt。
+
+
+================================================================================
+二、FetchContent_Declare 的常用参数
+================================================================================
+
+1. <name>
+--------------------------------------------------------------------------------
+第一个参数是内容名，例如：
+
+    FetchContent_Declare(flash_attention ...)
+
+这里的内容名是：
+
+    flash_attention
+
+这个名字会被 CMake 用来生成相关变量，例如：
+
+    flash_attention_SOURCE_DIR
+    flash_attention_BINARY_DIR
+    flash_attention_POPULATED
+
+注意：
+
+    FetchContent 的内容名大小写不敏感。
+    实践中建议使用清晰、稳定、接近项目名的名字。
+
+对于本项目：
+
+    FetchContent_MakeAvailable(flash_attention)
+
+必须使用同一个内容名，表示让前面声明过的 flash_attention 变得可用。
+
+
+2. GIT_REPOSITORY
+--------------------------------------------------------------------------------
+指定 Git 仓库地址：
+
+    GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+
+含义：
+
+    如果没有本地源码覆盖，CMake 会在配置阶段从这个 Git 仓库获取源码。
+
+常见写法：
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG        b3964b1d8b95d8e8447435668ab169a2700bab65
+    )
+
+这个写法表示：
+
+    源码来自 vllm-project/flash-attention；
+    checkout 到指定 commit；
+    后续 MakeAvailable 时再真正准备它。
+
+
+3. GIT_TAG
+--------------------------------------------------------------------------------
+指定 Git revision：
+
+    GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+
+这里的 GIT_TAG 名字容易误解。
+它可以是：
+
+    - branch 名，例如 main
+    - tag 名，例如 v2.6.2
+    - commit SHA，例如 b3964b1d8b95d8e8447435668ab169a2700bab65
+
+本项目这里使用的是 commit SHA，不是 release tag。
+
+固定 commit 的好处：
+
+    - 构建输入可复现；
+    - 避免远端 main 分支更新后突然构建失败；
+    - 便于和 vLLM 示例保持一致。
+
+三种写法对比：
+
+    # 1. branch：每次可能跟随远端分支变化，不够可复现
+    FetchContent_Declare(
+        dep
+        GIT_REPOSITORY https://example.com/dep.git
+        GIT_TAG main
+    )
+
+    # 2. tag：固定到发布 tag，但 tag 理论上仍可能被远端重写
+    FetchContent_Declare(
+        dep
+        GIT_REPOSITORY https://example.com/dep.git
+        GIT_TAG v1.2.3
+    )
+
+    # 3. commit SHA：最可复现，推荐用于不受自己控制的远端仓库
+    FetchContent_Declare(
+        dep
+        GIT_REPOSITORY https://example.com/dep.git
+        GIT_TAG 0123456789abcdef0123456789abcdef01234567
+    )
+
+
+4. GIT_PROGRESS
+--------------------------------------------------------------------------------
+示例：
+
+    GIT_PROGRESS TRUE
+
+作用：
+
+    下载 Git 仓库时打印进度。
+
+如果网络慢或卡住，打开进度更容易判断当前是否还在下载。
+
+示例：
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG        b3964b1d8b95d8e8447435668ab169a2700bab65
+        GIT_PROGRESS   TRUE
+    )
+
+如果配置阶段卡住，打开 GIT_PROGRESS 后通常能看到 git clone / fetch 的进度。
+
+
+5. SOURCE_DIR
+--------------------------------------------------------------------------------
+示例：
+
+    SOURCE_DIR /path/to/flash-attention
+
+作用：
+
+    指定使用已有源码目录。
+
+如果设置了 SOURCE_DIR，通常就不需要 GIT_REPOSITORY / GIT_TAG 下载源码。
+本项目中本地源码分支是：
+
+    FetchContent_Declare(
+        flash_attention
+        SOURCE_DIR ${FLASH_ATTENTION_SRC_DIR}
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+含义：
+
+    使用用户提供的 ${FLASH_ATTENTION_SRC_DIR} 作为 flash-attention 源码目录。
+
+本地开发示例：
+
+    set(FLASH_ATTENTION_SRC_DIR
+        "/home/liam/src/flash-attention"
+        CACHE PATH "Use local flash-attention checkout")
+
+    FetchContent_Declare(
+        flash_attention
+        SOURCE_DIR ${FLASH_ATTENTION_SRC_DIR}
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+这种写法不会下载 GitHub 源码，而是直接使用：
+
+    /home/liam/src/flash-attention
+
+适合边改 flash-attention 源码边用本项目验证。
+
+
+6. BINARY_DIR
+--------------------------------------------------------------------------------
+示例：
+
+    BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+
+作用：
+
+    指定外部项目自己的构建目录。
+
+对于本项目，如果主构建目录是：
+
+    cmake-build-release
+
+那么：
+
+    ${CMAKE_BINARY_DIR}/flash-attention
+
+大致就是：
+
+    cmake-build-release/flash-attention
+
+注意：
+
+    BINARY_DIR 是外部项目的中间构建目录；
+    它不是最终 .so 的输出目录。
+
+本项目额外用 set_target_properties(...) 把 flash-attention 生成的 .so
+输出到项目根目录：
+
+    ${PROJECT_SOURCE_DIR}
+
+SOURCE_DIR / BINARY_DIR / 输出目录对比示例：
+
+    FetchContent_Declare(
+        flash_attention
+        SOURCE_DIR /home/liam/src/flash-attention
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+    set_target_properties(_vllm_fa2_C PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+    )
+
+含义分别是：
+
+    SOURCE_DIR
+        外部项目源码在哪里。
+
+    BINARY_DIR
+        外部项目自己的 CMake 中间构建目录在哪里。
+
+    LIBRARY_OUTPUT_DIRECTORY
+        某个具体 library target 的最终 .so 输出到哪里。
+
+三者不是同一个概念。
+
+
+7. URL / URL_HASH
+--------------------------------------------------------------------------------
+除了 Git，也可以从压缩包下载：
+
+    FetchContent_Declare(
+        dep
+        URL https://example.com/dep-1.2.3.tar.gz
+        URL_HASH SHA256=<hash>
+    )
+
+URL_HASH 用于校验下载内容，确保下载到的文件没有被篡改或损坏。
+
+本项目当前 flash-attention 使用的是 Git，不使用 URL。
+
+压缩包下载示例：
+
+    FetchContent_Declare(
+        dep_archive
+        URL      https://example.com/dep-1.2.3.tar.gz
+        URL_HASH SHA256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    )
+
+    FetchContent_MakeAvailable(dep_archive)
+
+本地压缩包示例：
+
+    FetchContent_Declare(
+        dep_archive
+        URL      file:///home/liam/packages/dep-1.2.3.tar.gz
+        URL_HASH SHA256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    )
+
+    FetchContent_MakeAvailable(dep_archive)
+
+URL 方式适合：
+
+    - 依赖方只发布源码压缩包；
+    - 不想让配置阶段执行 git clone；
+    - 希望通过 URL_HASH 严格校验下载内容。
+
+
+8. SOURCE_SUBDIR
+--------------------------------------------------------------------------------
+如果外部项目的 CMakeLists.txt 不在源码根目录，可以用：
+
+    SOURCE_SUBDIR cmake
+
+含义：
+
+    MakeAvailable 时不要从源码根目录 add_subdirectory，
+    而是从源码目录下的 cmake 子目录开始。
+
+例如：
+
+    FetchContent_Declare(
+        protobuf
+        GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
+        GIT_TAG <commit>
+        SOURCE_SUBDIR cmake
+    )
+
+本项目 flash-attention 当前没有使用 SOURCE_SUBDIR。
+
+更完整示例：
+
+    FetchContent_Declare(
+        dep_with_nested_cmake
+        GIT_REPOSITORY https://example.com/dep_with_nested_cmake.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+        SOURCE_SUBDIR  cmake
+    )
+
+    FetchContent_MakeAvailable(dep_with_nested_cmake)
+
+如果该仓库结构是：
+
+    dep_with_nested_cmake/
+      README.md
+      cmake/
+        CMakeLists.txt
+      src/
+        ...
+
+那么 SOURCE_SUBDIR cmake 表示：
+
+    add_subdirectory(<source>/cmake <binary>)
+
+而不是：
+
+    add_subdirectory(<source> <binary>)
+
+
+9. FIND_PACKAGE_ARGS / OVERRIDE_FIND_PACKAGE
+--------------------------------------------------------------------------------
+这两个是和 find_package 集成相关的高级选项。
+
+FIND_PACKAGE_ARGS：
+
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG <commit>
+        FIND_PACKAGE_ARGS
+    )
+
+含义：
+
+    MakeAvailable 时允许先尝试 find_package(Catch2)，找不到再拉源码。
+
+OVERRIDE_FIND_PACKAGE：
+
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG <commit>
+        OVERRIDE_FIND_PACKAGE
+    )
+
+含义：
+
+    后续 find_package(googletest) 会被重定向到 FetchContent 准备好的内容。
+
+本项目 flash-attention 当前没有使用这两个选项。
+
+FIND_PACKAGE_ARGS 带参数示例：
+
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        703bd9caab50b139428cea1aaff9974ebee5742e
+        FIND_PACKAGE_ARGS NAMES GTest
+    )
+
+    FetchContent_MakeAvailable(googletest)
+
+含义：
+
+    MakeAvailable 可以先尝试：
+
+        find_package(googletest NAMES GTest)
+
+    如果找到系统中已有的 GTest，就可以不下载源码；
+    如果找不到，再按 Git 信息拉取源码。
+
+OVERRIDE_FIND_PACKAGE 示例：
+
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        703bd9caab50b139428cea1aaff9974ebee5742e
+        OVERRIDE_FIND_PACKAGE
+    )
+
+    FetchContent_MakeAvailable(googletest)
+
+    find_package(googletest REQUIRED)
+
+含义：
+
+    后续 find_package(googletest) 会被重定向到 FetchContent 准备好的 googletest。
+
+注意：
+
+    FIND_PACKAGE_ARGS 和 OVERRIDE_FIND_PACKAGE 不能同时用于同一个 Declare。
+
+
+10. SYSTEM
+--------------------------------------------------------------------------------
+示例：
+
+    FetchContent_Declare(
+        dep
+        GIT_REPOSITORY ...
+        GIT_TAG ...
+        SYSTEM
+    )
+
+含义：
+
+    MakeAvailable 后，如果外部项目被 add_subdirectory 加进来，
+    对应 subdirectory 会带 SYSTEM 属性。
+
+这通常用于降低外部依赖头文件的 warning 干扰。
+
+本项目 flash-attention 当前没有使用 SYSTEM。
+
+示例：
+
+    FetchContent_Declare(
+        third_party_headers
+        GIT_REPOSITORY https://example.com/third_party_headers.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+        SYSTEM
+    )
+
+    FetchContent_MakeAvailable(third_party_headers)
+
+适用场景：
+
+    外部依赖头文件 warning 很多；
+    当前项目开启了 -Wall / -Wextra / -Werror；
+    不希望第三方 warning 破坏本项目构建。
+
+
+================================================================================
+三、FetchContent_MakeAvailable 的作用
+================================================================================
+
+基本语法：
+
+    FetchContent_MakeAvailable(<name1> [<name2>...])
+
+例如：
+
+    FetchContent_MakeAvailable(flash_attention)
+
+它的作用是：
+
+    确保指定依赖在当前 CMake 项目中可用。
+
+它会按大致顺序做这些事：
+
+    1. 检查这个依赖是否已经被处理过。
+       如果处理过，就复用结果，不重复下载。
+
+    2. 如果允许，可能先尝试 find_package(...)。
+       这取决于 FetchContent_Declare 里的 FIND_PACKAGE_ARGS
+       和 FETCHCONTENT_TRY_FIND_PACKAGE_MODE。
+
+    3. 如果还没有可用源码，就根据 Declare 记录的信息 populate：
+       Git clone / checkout、下载 URL、使用 SOURCE_DIR 等。
+
+    4. 设置相关变量，例如：
+
+           flash_attention_SOURCE_DIR
+           flash_attention_BINARY_DIR
+           flash_attention_POPULATED
+
+    5. 如果源码目录中存在 CMakeLists.txt，
+       就调用 add_subdirectory(...) 把外部项目加入当前构建。
+
+关键点：
+
+    MakeAvailable 发生在 CMake 配置阶段。
+    它不是 build 阶段的编译命令。
+
+执行完 MakeAvailable 后，外部项目里的 add_library(...) / add_executable(...)
+定义的 target 才会进入当前项目的构建图。
+
+后续执行：
+
+    cmake --build <build-dir>
+
+才会真正调用 g++ / nvcc 编译这些 target。
+
+单依赖示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG        b3964b1d8b95d8e8447435668ab169a2700bab65
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+多依赖示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        depA
+        GIT_REPOSITORY https://example.com/depA.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_Declare(
+        depB
+        GIT_REPOSITORY https://example.com/depB.git
+        GIT_TAG        fedcba9876543210fedcba9876543210fedcba98
+    )
+
+    FetchContent_MakeAvailable(depA depB)
+
+MakeAvailable 后使用外部 target 的示例：
+
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        703bd9caab50b139428cea1aaff9974ebee5742e
+    )
+
+    FetchContent_MakeAvailable(googletest)
+
+    add_executable(unit_tests test_main.cpp)
+    target_link_libraries(unit_tests PRIVATE gtest_main)
+
+这里的 gtest_main 是 googletest 外部项目自己定义的 target。
+FetchContent 的内容名 googletest 不等于一定存在一个叫 googletest 的库 target。
+
+查看 MakeAvailable 产生的源码 / 构建目录：
+
+    FetchContent_MakeAvailable(flash_attention)
+
+    message(STATUS "flash source: ${flash_attention_SOURCE_DIR}")
+    message(STATUS "flash binary: ${flash_attention_BINARY_DIR}")
+    message(STATUS "flash populated: ${flash_attention_POPULATED}")
+
+这些变量在配置阶段有用，适合调试外部依赖实际落在哪个目录。
+
+
+================================================================================
+四、FetchContent_Populate 的用法
+================================================================================
+
+基本语法：
+
+    FetchContent_Populate(<name>)
+
+典型前置条件：
+
+    前面已经用 FetchContent_Declare(<name> ...) 声明过这个依赖。
+
+示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        some_lib
+        GIT_REPOSITORY https://example.com/some_lib.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_Populate(some_lib)
+
+执行后，CMake 会设置这些变量：
+
+    some_lib_POPULATED
+    some_lib_SOURCE_DIR
+    some_lib_BINARY_DIR
+
+含义：
+
+    some_lib_POPULATED
+        是否已经 populate，通常为 TRUE。
+
+    some_lib_SOURCE_DIR
+        依赖源码目录。
+
+    some_lib_BINARY_DIR
+        依赖构建目录。
+
+可以打印确认：
+
+    message(STATUS "some_lib populated: ${some_lib_POPULATED}")
+    message(STATUS "some_lib source: ${some_lib_SOURCE_DIR}")
+    message(STATUS "some_lib binary: ${some_lib_BINARY_DIR}")
+
+注意：
+
+    FetchContent_Populate 只负责准备源码。
+    它不会自动 add_subdirectory。
+    它也不会自动把外部项目 target 加入当前 build graph。
+
+
+Populate 后手动 add_subdirectory 示例
+--------------------------------------------------------------------------------
+如果外部内容本身是 CMake 项目，并且你希望它的 target 进入当前项目，
+需要手动写：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        some_lib
+        GIT_REPOSITORY https://example.com/some_lib.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_Populate(some_lib)
+
+    add_subdirectory(
+        ${some_lib_SOURCE_DIR}
+        ${some_lib_BINARY_DIR}
+    )
+
+    add_executable(app main.cpp)
+    target_link_libraries(app PRIVATE some_lib_target)
+
+这个写法近似于手动展开：
+
+    FetchContent_MakeAvailable(some_lib)
+
+但 MakeAvailable 还会处理更多细节，例如：
+
+    - 避免重复 populate；
+    - 可选 find_package 集成；
+    - find_package redirect；
+    - SOURCE_SUBDIR；
+    - SYSTEM；
+    - 一些 CMake 新版本中的 provider 机制。
+
+因此普通项目里优先使用：
+
+    FetchContent_MakeAvailable(some_lib)
+
+
+只下载源码、不加入构建的示例
+--------------------------------------------------------------------------------
+有时只想拿到源码文件，不想让它参与编译。
+
+例如下载一个 header-only 代码生成模板、测试数据、脚本或资源文件：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        test_data
+        URL      https://example.com/test-data.tar.gz
+        URL_HASH SHA256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    )
+
+    FetchContent_Populate(test_data)
+
+    file(GLOB TEST_JSON_FILES
+        "${test_data_SOURCE_DIR}/*.json"
+    )
+
+这里没有 add_subdirectory。
+
+含义：
+
+    test_data 只是被下载 / 解压；
+    当前项目可以用 file(...) 读取其中的文件；
+    test_data 不会创建 CMake target；
+    build 阶段不会编译 test_data。
+
+
+add_subdirectory 前插入自定义设置的示例
+--------------------------------------------------------------------------------
+有些外部项目在 add_subdirectory 前需要设置选项。
+
+示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        some_lib
+        GIT_REPOSITORY https://example.com/some_lib.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_Populate(some_lib)
+
+    set(SOME_LIB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(SOME_LIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+    add_subdirectory(
+        ${some_lib_SOURCE_DIR}
+        ${some_lib_BINARY_DIR}
+    )
+
+这个模式适合：
+
+    需要在外部项目 CMakeLists.txt 执行前设置变量；
+    MakeAvailable 的默认流程不够灵活；
+    你明确知道外部项目读取哪些 cache option。
+
+现代 CMake 中，很多情况下也可以在 MakeAvailable 前直接 set 这些变量，
+不一定非要 Populate：
+
+    set(SOME_LIB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(some_lib)
+
+只有当你需要更细粒度地控制 populate 和 add_subdirectory 的时机时，
+才考虑手写 Populate。
+
+
+FetchContent_Populate 的直接参数形式
+--------------------------------------------------------------------------------
+FetchContent_Populate 也支持直接写下载参数：
+
+    FetchContent_Populate(
+        some_lib
+        GIT_REPOSITORY https://example.com/some_lib.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+这种写法不依赖前面的 FetchContent_Declare。
+
+但普通项目不推荐这样写。
+
+原因：
+
+    - 它绕过了 Declare / MakeAvailable 的更高层机制；
+    - 不方便顶层项目统一覆盖依赖版本；
+    - 不参与 first to declare wins 的正常模式；
+    - 更适合 CMake script mode 或特殊一次性脚本。
+
+推荐普通项目使用：
+
+    FetchContent_Declare(some_lib ...)
+    FetchContent_MakeAvailable(some_lib)
+
+或者在确实需要低层控制时使用：
+
+    FetchContent_Declare(some_lib ...)
+    FetchContent_Populate(some_lib)
+    add_subdirectory(${some_lib_SOURCE_DIR} ${some_lib_BINARY_DIR})
+
+
+Populate 重复调用注意事项
+--------------------------------------------------------------------------------
+同一个 configure run 中，不应该对同一个内容名重复调用 FetchContent_Populate。
+
+更稳妥的低层写法是先查询：
+
+    FetchContent_GetProperties(some_lib)
+
+    if(NOT some_lib_POPULATED)
+        FetchContent_Populate(some_lib)
+        add_subdirectory(
+            ${some_lib_SOURCE_DIR}
+            ${some_lib_BINARY_DIR}
+        )
+    endif()
+
+不过再次强调：
+
+    如果没有特殊控制需求，优先用 FetchContent_MakeAvailable。
+
+
+================================================================================
+五、FetchContent_MakeAvailable 和 FetchContent_Populate 的区别
+================================================================================
+
+核心区别：
+
+    FetchContent_MakeAvailable
+        是高层封装。
+        目标是"让依赖在当前项目中可用"。
+
+    FetchContent_Populate
+        是低层操作。
+        目标是"把依赖源码准备出来"。
+
+对比：
+
+    FetchContent_MakeAvailable(dep)
+        会使用 FetchContent_Declare 记录的信息；
+        会检查是否已处理过；
+        可能先尝试 find_package；
+        会 populate 源码；
+        如果源码中有 CMakeLists.txt，通常会自动 add_subdirectory；
+        外部项目 target 会进入当前 build graph；
+        普通项目推荐使用。
+
+    FetchContent_Populate(dep)
+        会使用 FetchContent_Declare 记录的信息；
+        主要只负责下载 / checkout / 解压 / 准备源码；
+        不会自动 add_subdirectory；
+        不会自动创建或暴露外部项目 target；
+        需要你手动决定后续如何使用源码；
+        适合特殊场景。
+
+近似关系：
+
+    FetchContent_MakeAvailable(dep)
+
+可以粗略理解为高层封装：
+
+    FetchContent_GetProperties(dep)
+    if(NOT dep_POPULATED)
+        FetchContent_Populate(dep)
+    endif()
+
+    if(EXISTS "${dep_SOURCE_DIR}/CMakeLists.txt")
+        add_subdirectory(${dep_SOURCE_DIR} ${dep_BINARY_DIR})
+    endif()
+
+但这只是帮助理解的近似伪代码。
+真实的 MakeAvailable 还会处理 find_package、redirect、SOURCE_SUBDIR、
+SYSTEM、dependency provider 等更多细节。
+
+
+什么时候用 MakeAvailable
+--------------------------------------------------------------------------------
+优先使用 MakeAvailable 的场景：
+
+    - 外部依赖是 CMake 项目；
+    - 希望它的 target 加入当前项目；
+    - 希望可以 target_link_libraries 到外部项目 target；
+    - 不需要手动控制 populate 和 add_subdirectory 的中间过程；
+    - 希望跟随现代 CMake 推荐路径。
+
+示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        703bd9caab50b139428cea1aaff9974ebee5742e
+    )
+
+    FetchContent_MakeAvailable(googletest)
+
+    add_executable(unit_tests test_main.cpp)
+    target_link_libraries(unit_tests PRIVATE gtest_main)
+
+
+什么时候用 Populate
+--------------------------------------------------------------------------------
+考虑 Populate 的场景：
+
+    - 只想下载 / 解压源码文件，不想加入构建；
+    - 外部内容不是 CMake 项目，没有 CMakeLists.txt；
+    - add_subdirectory 前需要做非常特殊的处理；
+    - 需要读取源码目录中的文件进行 configure_file / file(GLOB) 等操作；
+    - 写的是 CMake script mode 脚本，而不是普通项目构建。
+
+示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        assets
+        URL      https://example.com/assets.tar.gz
+        URL_HASH SHA256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    )
+
+    FetchContent_Populate(assets)
+
+    configure_file(
+        ${assets_SOURCE_DIR}/config_template.json
+        ${CMAKE_BINARY_DIR}/generated/config.json
+        COPYONLY
+    )
+
+这里 assets 不参与编译，只是作为配置阶段输入文件。
+
+
+本项目该用哪个
+--------------------------------------------------------------------------------
+本项目 flash-attention 接入应该用：
+
+    FetchContent_MakeAvailable(flash_attention)
+
+原因：
+
+    flash-attention 是 CMake 项目；
+    我们希望它创建的 MODULE_LIBRARY / SHARED_LIBRARY target 进入当前构建图；
+    后续还要递归收集这些 target 并设置 .so 输出目录；
+    这些都要求 flash-attention 的 CMakeLists.txt 已经被 add_subdirectory 处理。
+
+如果只用：
+
+    FetchContent_Populate(flash_attention)
+
+那么只会拿到：
+
+    flash_attention_SOURCE_DIR
+    flash_attention_BINARY_DIR
+
+但 flash-attention 的 CMake target 还不存在。
+后续递归收集 target 会收不到东西，除非再手动：
+
+    add_subdirectory(
+        ${flash_attention_SOURCE_DIR}
+        ${flash_attention_BINARY_DIR}
+    )
+
+
+================================================================================
+六、Declare 和 MakeAvailable 的关系
+================================================================================
+
+二者是"声明"和"执行"的关系：
+
+    FetchContent_Declare(...)
+        只记录依赖信息。
+        不下载，不 add_subdirectory，不产生 target。
+
+    FetchContent_MakeAvailable(...)
+        使用前面 Declare 记录的信息。
+        准备源码。
+        如有 CMakeLists.txt，就把外部项目加入主构建。
+
+典型写法：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+        GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+流程：
+
+    include(FetchContent)
+        → 引入 CMake 官方模块
+
+    FetchContent_Declare(flash_attention ...)
+        → 记录 flash_attention 的来源和目录参数
+
+    FetchContent_MakeAvailable(flash_attention)
+        → 下载 / 复用 / 准备源码
+        → add_subdirectory(flash_attention_SOURCE_DIR, flash_attention_BINARY_DIR)
+        → flash-attention 的 target 进入当前构建图
+
+错误示例：只有 Declare，没有 MakeAvailable
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        dep
+        GIT_REPOSITORY https://example.com/dep.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    add_executable(app main.cpp)
+    target_link_libraries(app PRIVATE dep_target)
+
+问题：
+
+    dep 只是被声明了，但没有被 MakeAvailable；
+    dep 的源码没有被准备；
+    dep 的 CMakeLists.txt 没有 add_subdirectory；
+    dep_target 大概率不存在。
+
+正确示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        dep
+        GIT_REPOSITORY https://example.com/dep.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_MakeAvailable(dep)
+
+    add_executable(app main.cpp)
+    target_link_libraries(app PRIVATE dep_target)
+
+
+================================================================================
+七、first to declare wins / first to populate wins
+================================================================================
+
+FetchContent 有两个重要规则：
+
+    1. first to declare wins
+       同一个内容名第一次 Declare 的信息生效。
+       后面对同名内容再次 Declare，通常会被忽略。
+
+    2. first to populate wins
+       同一个内容名第一次 MakeAvailable / Populate 的结果生效。
+       后续再请求同一个依赖，会复用第一次的结果。
+
+为什么这样设计：
+
+    在复杂项目里，顶层项目和子项目可能都想声明同一个依赖。
+    CMake 希望顶层项目可以优先控制依赖版本。
+
+因此建议：
+
+    在调用 FetchContent_MakeAvailable(...) 之前，
+    尽量先把所有依赖 FetchContent_Declare(...) 完。
+
+推荐：
+
+    FetchContent_Declare(depA ...)
+    FetchContent_Declare(depB ...)
+    FetchContent_MakeAvailable(depA depB)
+
+不推荐：
+
+    FetchContent_Declare(depA ...)
+    FetchContent_MakeAvailable(depA)
+
+    FetchContent_Declare(depB ...)
+    FetchContent_MakeAvailable(depB)
+
+如果 depA 内部也声明 depB，那么顶层项目后面对 depB 的声明可能已经太晚。
+
+具体场景示例：
+
+    # 顶层项目
+    FetchContent_Declare(
+        uses_other
+        GIT_REPOSITORY https://example.com/uses_other.git
+        GIT_TAG        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    )
+
+    FetchContent_MakeAvailable(uses_other)
+
+    # uses_other 内部已经先声明并 populate 了 other
+    # 这里再声明 other，可能已经太晚
+    FetchContent_Declare(
+        other
+        GIT_REPOSITORY https://example.com/other.git
+        GIT_TAG        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    )
+
+更稳妥写法：
+
+    # 顶层项目先声明所有自己关心的依赖版本
+    FetchContent_Declare(
+        uses_other
+        GIT_REPOSITORY https://example.com/uses_other.git
+        GIT_TAG        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    )
+
+    FetchContent_Declare(
+        other
+        GIT_REPOSITORY https://example.com/other.git
+        GIT_TAG        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    )
+
+    FetchContent_MakeAvailable(uses_other other)
+
+这样即使 uses_other 内部也想声明 other，顶层项目对 other 的声明已经先发生，
+顶层项目更容易控制 other 的版本。
+
+
+================================================================================
+八、FetchContent 和 ExternalProject_Add 的区别
+================================================================================
+
+FetchContent 和 ExternalProject_Add 都可以处理外部依赖，但时机不同。
+
+FetchContent：
+
+    - 配置阶段下载 / 准备源码；
+    - 可以立即 add_subdirectory；
+    - 外部项目 target 可以直接被当前项目 target_link_libraries 使用；
+    - 适合把外部 CMake 项目纳入同一个 build graph。
+
+ExternalProject_Add：
+
+    - 通常在 build 阶段下载 / 配置 / 编译外部项目；
+    - 外部项目更像单独的构建过程；
+    - 不会天然把外部项目的 target 暴露给当前 CMake target；
+    - 更适合独立构建、安装型依赖。
+
+本项目选择 FetchContent 的原因：
+
+    flash-attention 自己也是 CMake 项目；
+    我们希望它的 target 被加入当前项目构建图；
+    并且希望在配置阶段拿到它创建的 target，进一步设置 .so 输出目录。
+
+FetchContent 示例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        dep
+        GIT_REPOSITORY https://example.com/dep.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+    FetchContent_MakeAvailable(dep)
+
+    add_executable(app main.cpp)
+    target_link_libraries(app PRIVATE dep_target)
+
+特点：
+
+    dep_target 是同一个 CMake build graph 里的 target。
+    app 可以直接 target_link_libraries 到它。
+
+ExternalProject_Add 对照示例：
+
+    include(ExternalProject)
+
+    ExternalProject_Add(
+        dep_external
+        GIT_REPOSITORY https://example.com/dep.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+        CMAKE_ARGS     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dep-install
+    )
+
+    add_executable(app main.cpp)
+    add_dependencies(app dep_external)
+
+特点：
+
+    dep_external 更像一个单独构建过程；
+    add_dependencies(app dep_external) 只能保证先构建 dep_external；
+    它不会自动给 app 提供 dep 的 include 路径、库路径或 imported target。
+
+如果要让 app 链接 ExternalProject 构建出来的库，通常还要手动创建 imported target：
+
+    add_library(dep_imported STATIC IMPORTED)
+    set_target_properties(dep_imported PROPERTIES
+        IMPORTED_LOCATION ${CMAKE_BINARY_DIR}/dep-install/lib/libdep.a
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR}/dep-install/include
+    )
+
+    target_link_libraries(app PRIVATE dep_imported)
+
+这就是为什么如果外部依赖本身能作为 CMake 子项目加入，FetchContent 通常更直接。
+
+
+================================================================================
+九、对应的命令行：有没有 FetchContent_Declare 的 shell 命令？
+================================================================================
+
+没有。
+
+FetchContent_Declare 和 FetchContent_MakeAvailable 是 CMake 脚本命令，
+只能写在 CMakeLists.txt 或 .cmake 文件里。
+
+不存在这样的 shell 命令：
+
+    FetchContent_Declare ...
+    FetchContent_MakeAvailable ...
+
+命令行只能通过运行 CMake 配置阶段来触发它们：
+
+    cmake -S . -B cmake-build-release
+
+如果 CMakeLists.txt 中 include 了包含 FetchContent 的 .cmake 文件，
+那么这些 CMake 命令会在配置阶段被执行。
+
+后续编译命令是：
+
+    cmake --build cmake-build-release
+
+这时不会重新执行 FetchContent_Declare。
+除非 CMake 判断需要重新配置，否则 build 阶段主要执行已经生成好的编译规则。
+
+完整命令行流程示例：
+
+    cmake -S . -B cmake-build-release \
+      -DROPE_BUILD_FLASH_ATTENTION=ON
+
+    cmake --build cmake-build-release
+
+第一条命令：
+
+    执行 CMake 配置阶段；
+    读取 CMakeLists.txt；
+    include flash_attention.cmake；
+    执行 FetchContent_Declare / FetchContent_MakeAvailable；
+    生成 build graph。
+
+第二条命令：
+
+    根据 build graph 编译；
+    调用 g++ / nvcc；
+    生成 .so / 可执行文件。
+
+
+================================================================================
+十、常用命令行覆盖变量
+================================================================================
+
+虽然没有 FetchContent_Declare 的 shell 命令，但可以用 cmake -D...
+设置影响 FetchContent 的 CMake cache 变量。
+
+
+1. 启用本项目 flash-attention 外部项目
+--------------------------------------------------------------------------------
+本项目自己的开关：
+
+    cmake -S . -B cmake-build-release \
+      -DROPE_BUILD_FLASH_ATTENTION=ON
+
+含义：
+
+    让 CMakeLists.txt include cmake/extern_projects/flash_attention.cmake。
+
+如果设置为 OFF：
+
+    cmake -S . -B cmake-build-release \
+      -DROPE_BUILD_FLASH_ATTENTION=OFF
+
+则不会 include flash_attention.cmake，也就不会执行 FetchContent_Declare /
+FetchContent_MakeAvailable。
+
+
+2. 使用本项目自定义的本地源码变量
+--------------------------------------------------------------------------------
+本项目在 flash_attention.cmake 中定义了：
+
+    FLASH_ATTENTION_SRC_DIR
+
+可以这样使用：
+
+    cmake -S . -B cmake-build-release \
+      -DROPE_BUILD_FLASH_ATTENTION=ON \
+      -DFLASH_ATTENTION_SRC_DIR=/path/to/flash-attention
+
+含义：
+
+    使用 /path/to/flash-attention 作为源码目录，
+    不从 GitHub 下载 flash-attention。
+
+
+3. 使用 FetchContent 官方源码覆盖变量
+--------------------------------------------------------------------------------
+FetchContent 官方提供了通用覆盖变量：
+
+    FETCHCONTENT_SOURCE_DIR_<uppercaseName>
+
+本项目内容名是：
+
+    flash_attention
+
+对应 uppercaseName 是：
+
+    FLASH_ATTENTION
+
+所以可以写：
+
+    cmake -S . -B cmake-build-release \
+      -DROPE_BUILD_FLASH_ATTENTION=ON \
+      -DFETCHCONTENT_SOURCE_DIR_FLASH_ATTENTION=/path/to/flash-attention
+
+含义：
+
+    对名为 flash_attention 的 FetchContent 内容，
+    强制使用这个本地源码目录。
+
+这个变量是 FetchContent 官方机制；
+FLASH_ATTENTION_SRC_DIR 是本项目自己额外定义的便利变量。
+
+
+4. 指定 FetchContent 默认下载目录
+--------------------------------------------------------------------------------
+FetchContent 默认把依赖放到：
+
+    ${CMAKE_BINARY_DIR}/_deps
+
+可以用：
+
+    cmake -S . -B cmake-build-release \
+      -DFETCHCONTENT_BASE_DIR=/tmp/cmake-deps
+
+含义：
+
+    把 FetchContent 的默认依赖目录改到 /tmp/cmake-deps。
+
+注意：
+
+    如果 FetchContent_Declare 显式设置了 SOURCE_DIR / BINARY_DIR，
+    对应内容可能不使用默认 _deps 位置。
+
+
+5. 离线模式：不下载、不更新
+--------------------------------------------------------------------------------
+如果依赖源码已经准备好，可以开启：
+
+    cmake -S . -B cmake-build-release \
+      -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+
+含义：
+
+    FetchContent 不尝试下载或更新任何内容。
+
+适用场景：
+
+    - 已经提前 populate；
+    - 或者通过 FETCHCONTENT_SOURCE_DIR_<NAME> 指向了本地源码；
+    - 或者通过本项目 FLASH_ATTENTION_SRC_DIR 指向了本地源码。
+
+如果源码不存在，还开启 FULLY_DISCONNECTED，配置可能失败。
+
+
+6. 只禁止更新，允许首次下载
+--------------------------------------------------------------------------------
+可以用：
+
+    cmake -S . -B cmake-build-release \
+      -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+
+含义：
+
+    如果源码还没有下载，仍可下载；
+    如果已经下载，后续不再尝试更新远端。
+
+也可以对单个内容设置：
+
+    cmake -S . -B cmake-build-release \
+      -DFETCHCONTENT_UPDATES_DISCONNECTED_FLASH_ATTENTION=ON
+
+
+7. 打印 FetchContent 下载细节
+--------------------------------------------------------------------------------
+默认情况下，FetchContent 可能隐藏部分 populate 输出。
+
+排查下载卡住时可以用：
+
+    cmake -S . -B cmake-build-release \
+      -DFETCHCONTENT_QUIET=OFF
+
+含义：
+
+    让 FetchContent 在配置阶段打印更多下载 / populate 日志。
+
+
+8. 控制是否先尝试 find_package
+--------------------------------------------------------------------------------
+CMake 3.24+ 支持：
+
+    FETCHCONTENT_TRY_FIND_PACKAGE_MODE
+
+常见值：
+
+    OPT_IN
+        默认倾向。只有 Declare 中写了 FIND_PACKAGE_ARGS 才尝试 find_package。
+
+    ALWAYS
+        MakeAvailable 尽量先 find_package。
+
+    NEVER
+        MakeAvailable 不尝试 find_package。
+
+命令行示例：
+
+    cmake -S . -B cmake-build-release \
+      -DFETCHCONTENT_TRY_FIND_PACKAGE_MODE=NEVER
+
+本项目 flash-attention 当前没有使用 FIND_PACKAGE_ARGS，
+通常不需要设置这个变量。
+
+
+================================================================================
+十一、本项目 flash_attention.cmake 的完整作用链
+================================================================================
+
+以当前文件为例：
+
+    include(FetchContent)
+
+    FetchContent_Declare(
+        flash_attention
+        GIT_REPOSITORY ${FLASH_ATTENTION_GIT_REPOSITORY}
+        GIT_TAG ${FLASH_ATTENTION_GIT_TAG}
+        GIT_PROGRESS TRUE
+        BINARY_DIR ${CMAKE_BINARY_DIR}/flash-attention
+    )
+
+    FetchContent_MakeAvailable(flash_attention)
+
+作用链：
+
+    1. include(FetchContent)
+        加载 CMake 官方 FetchContent 模块。
+
+    2. set(FLASH_ATTENTION_GIT_REPOSITORY ... CACHE STRING ...)
+       set(FLASH_ATTENTION_GIT_TAG ... CACHE STRING ...)
+       set(FLASH_ATTENTION_SRC_DIR ... CACHE PATH ...)
+        定义本项目自己的 CMake cache 变量。
+
+    3. FetchContent_Declare(flash_attention ...)
+        记录 flash_attention 这个外部内容如何取得。
+
+    4. FetchContent_MakeAvailable(flash_attention)
+        真正准备源码，并把 flash-attention 的 CMakeLists.txt 加入当前构建图。
+
+    5. 递归收集 flash-attention target。
+
+    6. 找出 MODULE_LIBRARY / SHARED_LIBRARY target。
+
+    7. 设置这些 target 的输出目录为：
+
+           ${PROJECT_SOURCE_DIR}
+
+最终效果：
+
+    配置阶段：
+        flash-attention 被加入本项目 build graph。
+
+    构建阶段：
+        cmake --build cmake-build-release
+        会根据生成好的规则编译 flash-attention。
+
+    输出结果：
+        flash-attention 的 .so 产物会尽量输出到项目根目录。
+
+
+================================================================================
+十二、常见误解
+================================================================================
+
+1. FetchContent_Declare 会不会立刻下载？
+--------------------------------------------------------------------------------
+不会。
+
+Declare 只是记录信息。
+真正 populate 通常发生在 MakeAvailable。
+
+
+2. MakeAvailable 会不会编译？
+--------------------------------------------------------------------------------
+不会直接编译。
+
+MakeAvailable 发生在配置阶段，它把外部项目 target 加进 build graph。
+真正编译发生在：
+
+    cmake --build <build-dir>
+
+
+3. GIT_TAG 是否必须是 Git tag？
+--------------------------------------------------------------------------------
+不是。
+
+GIT_TAG 可以是 branch、tag，也可以是 commit SHA。
+本项目用的是 commit SHA。
+
+
+4. BINARY_DIR 是否等于最终 .so 输出目录？
+--------------------------------------------------------------------------------
+不是。
+
+BINARY_DIR 是外部项目的构建中间目录。
+最终 .so 输出目录由 target 的 LIBRARY_OUTPUT_DIRECTORY 等属性决定。
+
+
+5. cmake -D... 是否等于编译器 -D...？
+--------------------------------------------------------------------------------
+不是。
+
+cmake -DVAR=VALUE 设置 CMake 变量 / cache 变量。
+g++ -DVAR=VALUE 或 nvcc -DVAR=VALUE 才是 C/C++ 编译器宏。
+
+FetchContent 的命令行覆盖变量主要影响 CMake 配置阶段，
+不会自动变成源码里的宏。
+
+
+6. FetchContent_Populate 是否等于 MakeAvailable？
+--------------------------------------------------------------------------------
+不是。
+
+FetchContent_Populate 只负责准备源码。
+
+它不会自动：
+
+    - add_subdirectory；
+    - 创建外部项目 target；
+    - 让 target_link_libraries 可以直接链接外部 target。
+
+如果 Populate 后希望外部 CMake 项目进入当前构建图，需要手动：
+
+    add_subdirectory(
+        ${dep_SOURCE_DIR}
+        ${dep_BINARY_DIR}
+    )
+
+普通 CMake 项目优先用：
+
+    FetchContent_MakeAvailable(dep)
+
+================================================================================

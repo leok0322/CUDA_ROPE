@@ -326,3 +326,14 @@ set_target_properties(validation PROPERTIES
     # 输出到项目根目录，run.sh 中 EXEC="./validation" 可直接找到
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
 )
+
+# ── flash-attention 外部项目 ────────────────────────────────────────────────
+# 参考 vLLM 的 external_projects/vllm_flash_attn.cmake：
+#   · 通过 FetchContent 从 GitHub 拉取 vllm-project/flash-attention 源码
+#   · 默认参与本项目构建；如只想编译 ROPE/validation，可传
+#       -DROPE_BUILD_FLASH_ATTENTION=OFF
+#   · 构建阶段生成的 Python 扩展 .so 输出到项目根目录，便于直接 import / dlopen
+option(ROPE_BUILD_FLASH_ATTENTION "Fetch and build flash-attention from source" ON)
+if(ROPE_BUILD_FLASH_ATTENTION)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/extern_projects/flash_attention.cmake)
+endif()
