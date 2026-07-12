@@ -4,7 +4,7 @@
 #include <torch/extension.h>
 #include "dispatch.h"
 #include "validation.h"
-#include "kernels/common.cuh"
+#include "fused_RMSNorm_ROPE_kernels/common.cuh"
 #include <cstdint>  // std::uintptr_t: host侧检查data_ptr地址对齐
 
 
