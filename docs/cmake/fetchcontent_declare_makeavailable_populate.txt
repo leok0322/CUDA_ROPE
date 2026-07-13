@@ -678,6 +678,24 @@ FetchContent 的内容名 googletest 不等于一定存在一个叫 googletest �
     some_lib_BINARY_DIR
         依赖构建目录。
 
+        注意：
+
+            FetchContent_Populate 本身不会编译 some_lib。
+
+            这里仍然会设置 BINARY_DIR，是因为 CMake 需要给"这个依赖如果后续
+            被当作 CMake 子项目加入当前工程"预留一个构建目录。
+
+            也就是说，BINARY_DIR 是后续这一步要用的目录：
+
+                add_subdirectory(
+                    ${some_lib_SOURCE_DIR}
+                    ${some_lib_BINARY_DIR}
+                )
+
+            Populate 阶段只是把这个路径计算好、返回给调用者。
+            真正让外部项目 target 进入 build graph 的，是后续 add_subdirectory
+            或 FetchContent_MakeAvailable，而不是 Populate 本身。
+
 可以打印确认：
 
     message(STATUS "some_lib populated: ${some_lib_POPULATED}")
@@ -689,6 +707,17 @@ FetchContent 的内容名 googletest 不等于一定存在一个叫 googletest �
     FetchContent_Populate 只负责准备源码。
     它不会自动 add_subdirectory。
     它也不会自动把外部项目 target 加入当前 build graph。
+
+    更精确地说：
+
+        FetchContent_Populate 可能会在内部创建并构建一个很小的 sub-build，
+        这个 sub-build 用 ExternalProject_Add 执行 download / update / patch
+        等 populate 步骤。
+
+        但这不是在编译 some_lib 本身。
+
+        some_lib 本身只有在后续 add_subdirectory(...) 之后，才会在主工程
+        的 build 阶段被编译。
 
 
 Populate 后手动 add_subdirectory 示例
@@ -813,6 +842,59 @@ FetchContent_Populate 也支持直接写下载参数：
     )
 
 这种写法不依赖前面的 FetchContent_Declare。
+
+直接参数形式也可以显式指定目录：
+
+    FetchContent_Populate(
+        deepgemm
+        SUBBUILD_DIR "${_deepgemm_sub}"
+        SOURCE_DIR   "${_deepgemm_src}"
+        BINARY_DIR   "${_deepgemm_bin}"
+        GIT_REPOSITORY https://example.com/deepgemm.git
+        GIT_TAG        0123456789abcdef0123456789abcdef01234567
+    )
+
+三个目录的含义：
+
+    SUBBUILD_DIR
+        FetchContent 内部小工程的目录。
+
+        Populate 会在这里生成一个临时 CMakeLists.txt，并通过 ExternalProject_Add
+        执行下载 / checkout / patch 等步骤。
+
+        这个目录属于 FetchContent 的实现细节，通常不是你后续 add_subdirectory
+        要用的目录。
+
+    SOURCE_DIR
+        deepgemm 源码最终准备到哪里。
+
+        Populate 返回后可以通过：
+
+            ${deepgemm_SOURCE_DIR}
+
+        使用这个目录。
+
+    BINARY_DIR
+        为 deepgemm 作为 CMake 子项目时准备的构建目录。
+
+        Populate 本身不会在这个目录里编译 deepgemm。
+
+        只有后续执行：
+
+            add_subdirectory(
+                ${deepgemm_SOURCE_DIR}
+                ${deepgemm_BINARY_DIR}
+            )
+
+        deepgemm 的 target 才会进入当前项目的 build graph，之后
+        cmake --build <build-dir> 才会真正编译它。
+
+所以：
+
+    可以设置 BINARY_DIR，不代表 FetchContent_Populate 会编译依赖。
+
+    BINARY_DIR 只是把"以后如果要 add_subdirectory，该把该依赖的中间构建文件
+    放在哪里"这件事提前约定好。
 
 但普通项目不推荐这样写。
 

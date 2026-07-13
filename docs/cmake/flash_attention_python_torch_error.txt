@@ -400,3 +400,194 @@ Python_EXECUTABLE，因此正常不需要每次手动传这个参数。
 所以通常不需要手动删除 cache。
 
 ================================================================================
+十、构建阶段报错：Killed / Error 137
+================================================================================
+
+报错现象
+--------------------------------------------------------------------------------
+配置阶段已经通过，开始构建 _vllm_fa2_C 时出现：
+
+    cmake --build /home/liam/cpp_linux/CUDA_ROPE/cmake-build-release --target _vllm_fa2_C -- -j 18
+
+    [  9%] Building CUDA object flash-attention/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu.o
+    [ 14%] Building CUDA object flash-attention/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu.o
+    [ 23%] Building CUDA object flash-attention/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu.o
+    ...
+    Killed
+    gmake[3]: *** [flash-attention/CMakeFiles/_vllm_fa2_C.dir/build.make:179: flash-attention/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu.o] Error 137
+    gmake[3]: *** Waiting for unfinished jobs....
+    Killed
+    gmake[3]: *** [flash-attention/CMakeFiles/_vllm_fa2_C.dir/build.make:314: flash-attention/CMakeFiles/_vllm_fa2_C.dir/csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu.o] Error 137
+
+
+直接原因
+--------------------------------------------------------------------------------
+Error 137 通常表示进程收到 SIGKILL：
+
+    137 = 128 + 9
+    9   = SIGKILL
+
+这类日志里没有真正的 C++ / CUDA 语法错误，也没有 nvcc 报出的编译诊断。
+
+关键线索是：
+
+    Killed
+    Error 137
+    -j 18
+
+也就是编译进程被系统强制杀掉。对 flash-attention 这种模板重、CUTLASS 重、
+translation unit 多的 CUDA 项目，最常见原因是内存耗尽，被 Linux OOM killer
+杀掉。
+
+本项目这里尤其容易触发：
+
+    _vllm_fa2_C 会编译很多个 csrc/flash_attn/src/flash_fwd_*.cu
+    每个 .cu 都会实例化较重的 CUDA/CUTLASS 模板
+    CLion 当前构建命令传了 -- -j 18
+
+如果机器内存只有十几 GiB，同时启动十几个 nvcc，构建阶段很容易被 OOM killer
+终止。
+
+
+如何确认
+--------------------------------------------------------------------------------
+可以先看当前内存 / swap：
+
+    free -h
+
+如果构建失败后想确认是否 OOM，可以看内核日志：
+
+    journalctl -k -b | rg -i "out of memory|oom|killed process"
+
+或者：
+
+    dmesg -T | rg -i "out of memory|oom|killed process"
+
+如果看到 killed process、out of memory、oom-killer 等字样，就可以确认是内存
+问题，而不是 flash-attention 源码本身编译错误。
+
+
+解决方案 1：降低构建并行度
+--------------------------------------------------------------------------------
+优先把 _vllm_fa2_C 的构建并行度降下来：
+
+    cmake --build /home/liam/cpp_linux/CUDA_ROPE/cmake-build-release \
+      --target _vllm_fa2_C -- -j 2
+
+如果仍然被杀，再降到：
+
+    cmake --build /home/liam/cpp_linux/CUDA_ROPE/cmake-build-release \
+      --target _vllm_fa2_C -- -j 1
+
+CLion 里对应要改的是构建选项里的：
+
+    -- -j 18
+
+改成：
+
+    -- -j 2
+
+或者：
+
+    -- -j 1
+
+注意：
+
+    CMAKE_BUILD_PARALLEL_LEVEL 对 CLion 当前这条命令不一定有效，
+    因为日志里已经显式传了 -- -j 18。
+
+    显式传给底层 gmake 的 -j 18 优先级更直接，所以需要改 CLion 的 build options
+    或者手动用 -- -j 2 构建。
+
+
+解决方案 2：限制 nvcc 内部线程
+--------------------------------------------------------------------------------
+flash-attention 的 CMakeLists.txt 支持 NVCC_THREADS：
+
+    if (NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
+        list(APPEND VLLM_FA_GPU_FLAGS "--threads=${NVCC_THREADS}")
+    endif ()
+
+可以重新配置时加：
+
+    cmake -S . -B cmake-build-release \
+      -DNVCC_THREADS=1
+
+这个选项限制的是单个 nvcc 进程内部的并行线程数。
+
+它不能替代 gmake 的 -j 限制。更稳的组合是：
+
+    cmake -S . -B cmake-build-release \
+      -DNVCC_THREADS=1
+
+    cmake --build cmake-build-release \
+      --target _vllm_fa2_C -- -j 2
+
+
+解决方案 3：增加 swap
+--------------------------------------------------------------------------------
+如果必须保持较高并行度，或者 -j 2 仍然 OOM，可以增加 swap。
+
+例如增加 32 GiB swap：
+
+    sudo fallocate -l 32G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+    free -h
+
+这能降低被 OOM killer 杀掉的概率，但不会让编译更快。swap 只是兜底，首选仍然
+是降低 nvcc 并行度。
+
+
+解决方案 4：如果暂时不需要 flash-attention
+--------------------------------------------------------------------------------
+本项目有开关：
+
+    ROPE_BUILD_FLASH_ATTENTION
+
+如果当前只想编译本项目自己的 ROPE_cuda / validation，不需要 _vllm_fa2_C，可以
+重新配置时关闭 flash-attention：
+
+    cmake -S . -B cmake-build-release \
+      -DROPE_BUILD_FLASH_ATTENTION=OFF
+
+关闭后：
+
+    不会 FetchContent_MakeAvailable(flash_attention)
+    不会创建 _vllm_fa2_C / _vllm_fa3_C
+    构建本项目自己的 target 时也不会编译 flash-attention
+
+但如果目标就是要生成 _vllm_fa2_C，这个方案不适用。
+
+
+不是根因的 warning
+--------------------------------------------------------------------------------
+这次 Error 137 不是下面这些 warning 导致的：
+
+    library kineto not found.
+    Pytorch version 2.4.0 expected for CUDA build, saw 2.12.0 instead.
+
+这些是在配置阶段出现的 warning。当前日志已经进入：
+
+    Building CUDA object ...
+
+说明配置阶段已经过了。
+
+真正让构建失败的是后面的：
+
+    Killed
+    Error 137
+
+也就是构建阶段进程被 SIGKILL。
+
+另外：
+
+    FA2_ARCHS: 8.0+PTX
+
+也不是 Error 137 的直接原因。vLLM fork 的 flash-attention FA2 CMake 中会把
+FA2 源文件按自己的规则设置为 8.0+PTX；在 compute capability 8.6 的机器上，
+这会走兼容的 sm80/ptx 路径。它会影响生成代码路径和编译量，但不是这次
+Killed / Error 137 的直接报错原因。
+
+================================================================================
