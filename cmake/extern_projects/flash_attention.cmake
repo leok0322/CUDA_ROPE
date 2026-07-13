@@ -348,6 +348,12 @@ endif()
 #
 # 执行之后，flash-attention 内部定义的 CMake target 才会出现在本项目构建图里。
 #
+# 注意：
+#   进入构建图不等于 CMake 会自动给我们一个"flash-attention 所有 target"列表。
+#   FetchContent_MakeAvailable / add_subdirectory 会让这些 target 可构建、可链接，
+#   但如果要统一修改它们的属性，例如 .so 输出目录，就需要后面主动把 target
+#   名称收集出来，再对每个 target 调用 set_target_properties(...)。
+#
 # 对名为 flash_attention 的 FetchContent 内容，CMake 会生成变量：
 #   flash_attention_SOURCE_DIR
 #   flash_attention_BINARY_DIR
@@ -371,97 +377,130 @@ else()
     unset(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
 endif()
 
-# 递归收集某个 CMake directory 及其子目录里定义的 target。
+# 递归收集某个 CMake directory 及其 CMake 子目录里定义的 target。
+#
+# 函数目标：
+#   找出 flash-attention 通过 CMake 创建的全部 target 名称。后面会从这些
+#   target 中筛选 MODULE_LIBRARY / SHARED_LIBRARY，并把对应 .so 输出到项目根目录。
+#
+# 为什么不能只查 flash_attention_SOURCE_DIR 顶层：
+#   FetchContent_MakeAvailable(flash_attention) 通常等价于把
+#   flash_attention_SOURCE_DIR 交给 add_subdirectory(...)。
+#   这一步会执行 flash-attention 顶层 CMakeLists.txt。
+#
+#   如果 flash-attention 顶层 CMakeLists.txt 又继续写了：
+#
+#       add_subdirectory(csrc)
+#       add_subdirectory(hopper)
+#
+#   那么 csrc/、hopper/ 中的 CMakeLists.txt 也会被执行，其中定义的 target
+#   也会进入当前项目构建图。
+#
+#   但是 BUILDSYSTEM_TARGETS 是 directory property，只包含"当前 CMake
+#   directory 直接定义的 target"。也就是说：
+#
+#       查询 flash_attention_SOURCE_DIR 的 BUILDSYSTEM_TARGETS
+#           只能拿到顶层 CMakeLists.txt 直接创建的 target；
+#
+#       查询 csrc / hopper 这些子 CMake directory 的 BUILDSYSTEM_TARGETS
+#           才能拿到它们各自 CMakeLists.txt 中创建的 target。
+#
+#   所以如果要统一设置所有 flash-attention .so 的输出目录，就需要沿着
+#   SUBDIRECTORIES 递归遍历，把每一层 CMake directory 中直接定义的 target
+#   都收集起来。
+#
+# 这里的"子目录"特指 CMake 子目录：
+#   SUBDIRECTORIES 记录的是当前 CMakeLists.txt 通过 add_subdirectory(...)
+#   加入过的目录，不是文件系统里天然存在的所有文件夹。
+#
+#   例如源码树下存在：
+#
+#       csrc/
+#       hopper/
+#       tests/
+#
+#   但只有 flash-attention 的 CMakeLists.txt 中显式调用过
+#   add_subdirectory(csrc) / add_subdirectory(hopper)，这些目录才会出现在
+#   SUBDIRECTORIES 中。没有被 add_subdirectory(...) 加入的普通文件夹不会被
+#   这个函数遍历。
 #
 # 参数：
-#   _dir:
-#       要扫描的 CMake directory。这里传 flash_attention_SOURCE_DIR。
+#   _dir
+#       要扫描的 CMake directory。首次调用传 flash_attention_SOURCE_DIR。
 #
-#   _out:
-#       输出变量名。函数结束时用 PARENT_SCOPE 把结果写回调用者作用域。
+#   _out
+#       输出变量名。函数结束时用 PARENT_SCOPE 把收集到的 target 名称写回
+#       调用者作用域。
 #
-# 用到的 CMake directory properties：
-#   BUILDSYSTEM_TARGETS:
-#       当前 directory 里 add_library / add_executable 创建的 target 列表。
+# 返回结果：
+#   _out 指向一个 target 名称列表，例如：
 #
-#   SUBDIRECTORIES:
-#       当前 directory 通过 add_subdirectory 加入的子 directory 列表。
-#       注意这里说的是"CMake 子目录"，不是文件系统下所有子文件夹。
-#       只有某个已执行的 CMakeLists.txt 里调用了 add_subdirectory(xxx)，
-#       xxx 才会进入这个 SUBDIRECTORIES property。
+#       _vllm_fa2_C;_vllm_fa3_C;some_child_target
 #
-#       例如 flash-attention 源码树下可能有：
-#           csrc/
-#           hopper/
-#           flash_attn/
-#           tests/
-#       但这些目录只有在 CMakeLists.txt 中被 add_subdirectory(...) 加入后，
-#       才会被这里遍历到。
-#       如果 flash-attention 只是把 csrc/xxx.cpp、hopper/xxx.cu 当作 SOURCES
-#       传给顶层 add_library / Python_add_library，而没有 add_subdirectory(csrc)
-#       或 add_subdirectory(hopper)，它们就不是这里的 CMake 子目录。
-#
-# 为什么需要递归：
-#   flash-attention 的 target 不一定都定义在顶层 CMakeLists.txt。
-#   很多库目标可能在 csrc/、hopper/、flash_attn/ 等子目录中创建。
-#   当前 vLLM flash-attention 版本主要在顶层 CMakeLists.txt 通过
-#   define_gpu_extension_target(...) 创建 _vllm_fa2_C / _vllm_fa3_C；
-#   但递归保留在这里，可以兼容其他版本或未来版本把 target 放进子目录CMakeLists.txt 的情况。
+# 后续用法：
+#   调用者遍历 _FLASH_ATTENTION_TARGETS，按 target TYPE 筛选
+#   MODULE_LIBRARY / SHARED_LIBRARY，再设置 LIBRARY_OUTPUT_DIRECTORY /
+#   RUNTIME_OUTPUT_DIRECTORY。
 function(_flash_attention_collect_targets _dir _out)
-    # 获取当前目录直接定义的 target。
+    # 第一步：获取当前 CMake directory 直接定义的 target。
+    #
+    # 这一步不会包含子目录里的 target。
     get_property(_targets DIRECTORY "${_dir}" PROPERTY BUILDSYSTEM_TARGETS)
 
-    # 获取当前目录通过 add_subdirectory(...) 加入的 CMake 子目录。
+    # 第二步：获取当前 CMake directory 通过 add_subdirectory(...) 加入的
+    # 子 CMake directory。
     #
-    # 这里拿到的是 CMake 已经登记的 subdirectory 列表，不是对文件系统执行
-    # find / glob。也就是说，它不会自动扫描 flash-attention 源码树下所有目录。
+    # 这里不是文件系统扫描，不等价于 find / glob。只有已经被 CMake 执行过的
+    # add_subdirectory(...) 才会进入这个列表。
     get_property(_subdirs DIRECTORY "${_dir}" PROPERTY SUBDIRECTORIES)
 
-    # 深度优先遍历所有 CMake 子目录，把子目录里直接定义的 target 也合并进来。
+    # 第三步：深度优先遍历每个子 CMake directory。
     #
-    # 举例：
-    #   如果某个版本的 flash-attention 顶层 CMakeLists.txt 写了：
-    #
-    #       add_subdirectory(csrc)
-    #
-    #   而 csrc/CMakeLists.txt 里创建了：
-    #
-    #       add_library(flash_attn_core ...)
-    #
-    #   那么这一段递归会进入 csrc 这个 CMake directory，并把 flash_attn_core
-    #   合并进 _targets。
-    #
-    #   如果没有 add_subdirectory(csrc)，即使文件系统中存在 csrc/，
-    #   这里也不会遍历它。
+    # 每次递归都会收集该子目录直接定义的 target，以及它自己的子目录 target。
+    # 最后把子树中的 target 合并回当前 _targets。
     foreach(_subdir IN LISTS _subdirs)
         _flash_attention_collect_targets("${_subdir}" _subdir_targets)
         list(APPEND _targets ${_subdir_targets})
     endforeach()
 
-    # CMake function 有自己的作用域。
-    # PARENT_SCOPE 表示把结果写回调用者作用域，否则函数外拿不到 _targets。
+    # 第四步：把收集结果返回给调用者。
+    #
+    # CMake function 有自己的变量作用域；没有 PARENT_SCOPE 时，函数外拿不到
+    # 这里更新后的 _targets。
     set(${_out} ${_targets} PARENT_SCOPE)
 endfunction()
 
 # 从 flash-attention 源码根目录开始，收集它创建出来的全部 target。
 _flash_attention_collect_targets("${flash_attention_SOURCE_DIR}" _FLASH_ATTENTION_TARGETS)
 
-# 遍历上面收集到的所有 flash-attention CMake target。
+# 遍历 _flash_attention_collect_targets(...) 收集到的 target 名称。
 #
-# _FLASH_ATTENTION_TARGETS 的来源：
-#   - flash_attention_SOURCE_DIR 顶层 CMake directory 直接创建的 target；
-#   - 以及它通过 add_subdirectory(...) 加入的 CMake 子目录中创建的 target。
+# 循环目标：
+#   从 flash-attention 的全部 CMake target 中，找出会生成动态库 / Python 扩展
+#   的 target，并把这些产物的输出目录设置到项目根目录。
 #
-# 这里不是遍历源码文件，也不是遍历文件系统目录，而是遍历 CMake target 名称。
-# 当前 vLLM flash-attention 版本中，典型目标可能是：
-#   _vllm_fa2_C
-#   _vllm_fa3_C
+# 输入列表：
+#   _FLASH_ATTENTION_TARGETS 是 CMake target 名称列表，不是源码文件列表，也不是
+#   文件系统目录列表。它可能包含：
 #
-# 本循环只处理会产出动态库 / Python 扩展 .so 的目标。
+#       _vllm_fa2_C
+#       _vllm_fa3_C
+#       其他子目录中定义的 target
+#
+# 为什么还要逐个检查 target 类型：
+#   外部项目可能同时定义多种 target，例如静态库、接口库、工具程序、测试程序、
+#   Python 扩展模块等。只有会生成 .so / 动态可加载产物的 target，才需要放到
+#   项目根目录。
+#
+# 本循环的处理流程：
+#   1. 对每个 target 查询 TYPE；
+#   2. 只保留 MODULE_LIBRARY / SHARED_LIBRARY；
+#   3. 对这些 target 设置 LIBRARY_OUTPUT_DIRECTORY / RUNTIME_OUTPUT_DIRECTORY；
+#   4. 把实际处理过的 target 记录到 _FLASH_ATTENTION_SO_TARGETS，供日志确认。
 foreach(_target IN LISTS _FLASH_ATTENTION_TARGETS)
-    # 查询 target 类型。
+    # 第一步：查询当前 target 的类型。
     #
-    # 常见类型：
+    # 常见 CMake target 类型：
     #   STATIC_LIBRARY  静态库 .a
     #   SHARED_LIBRARY  共享库 .so
     #   MODULE_LIBRARY  Python 扩展 / dlopen 模块，通常也是 .so
@@ -469,42 +508,57 @@ foreach(_target IN LISTS _FLASH_ATTENTION_TARGETS)
     #   INTERFACE_LIBRARY 仅接口 target，无产物
     get_target_property(_target_type ${_target} TYPE)
 
-    # 只关心动态可加载产物。
+    # 第二步：只处理动态可加载产物。
     #
-    # 这些 target 才是我们希望输出到项目根目录的对象。
-    # 对于 flash-attention，Python/CUDA 扩展通常是 MODULE_LIBRARY，
-    # 普通动态库则是 SHARED_LIBRARY。
+    # 对 flash-attention 来说：
     #
-    # 其他类型 target 的处理原则：
-    #   STATIC_LIBRARY:
-    #       静态库 .a，通常只是链接中间产物，不需要放项目根目录。
+    #   MODULE_LIBRARY
+    #       Python 扩展模块 / dlopen 模块，Linux 下通常生成：
     #
-    #   EXECUTABLE:
-    #       可执行文件，不是本次需求关注的 flash-attention Python 扩展 .so。
+    #           xxx.cpython-313-x86_64-linux-gnu.so
+    #           xxx.so
     #
-    #   INTERFACE_LIBRARY:
-    #       没有实际产物，不能设置 .so 输出目录。
+    #       vLLM flash-attention 的 _vllm_fa2_C / _vllm_fa3_C 这类 Python 扩展
+    #       通常属于这一类。
     #
-    #   MODULE_LIBRARY:
-    #       Python 扩展模块常见类型，比如 xxx.cpython-313-x86_64-linux-gnu.so。
+    #   SHARED_LIBRARY
+    #       普通共享库，Linux 下通常生成 libxxx.so，也可能被 Python 扩展、
+    #       torch op 或其他动态加载逻辑使用。
     #
-    #   SHARED_LIBRARY:
-    #       普通共享库 .so，也可能被 Python 扩展或 torch op 加载。
+    # 其他类型不处理：
+    #
+    #   STATIC_LIBRARY
+    #       生成 .a，通常是链接中间产物，不是需要放到项目根目录的运行时模块。
+    #
+    #   EXECUTABLE
+    #       生成可执行文件，不是本次需求关注的 flash-attention .so。
+    #
+    #   INTERFACE_LIBRARY
+    #       没有真实构建产物，也没有 .so 输出目录可设置。
     if(_target_type STREQUAL "MODULE_LIBRARY" OR
        _target_type STREQUAL "SHARED_LIBRARY")
-        # 强制把该 target 的动态库输出目录设置到项目根目录。
+        # 第三步：强制设置该 target 的动态库输出目录。
         #
-        # 为什么这里还要设置一次：
+        # 为什么前面已经设置过 CMAKE_LIBRARY_OUTPUT_DIRECTORY，这里还要再设置：
         #   前面的 CMAKE_LIBRARY_OUTPUT_DIRECTORY 只是 target 创建时的默认值。
         #   如果外部项目自己覆盖了 target 属性，默认值可能不起作用。
         #   这里在 target 已经创建之后直接 set_target_properties，
-        #   优先级更明确。
+        #   目标更精确，也更适合作为兜底。
+        #
+        # LIBRARY_OUTPUT_DIRECTORY:
+        #   控制库产物输出目录。对 Linux 上的 MODULE_LIBRARY / SHARED_LIBRARY，
+        #   主要影响 .so 输出位置。
+        #
+        # RUNTIME_OUTPUT_DIRECTORY:
+        #   控制运行时产物输出目录。对 Linux 上的 .so 通常不是关键项；
+        #   但在 Windows 等平台上，DLL 可能被视为 runtime artifact。
+        #   这里一起设置，避免不同平台 / 生成器下输出目录不一致。
         #
         # 为什么同时设置 DEBUG / RELEASE / RELWITHDEBINFO / MINSIZEREL：
         #   单配置生成器（Makefile / Ninja）主要用 LIBRARY_OUTPUT_DIRECTORY。
         #   多配置生成器（Ninja Multi-Config / Visual Studio）会按配置读取
-        #   LIBRARY_OUTPUT_DIRECTORY_<CONFIG>。
-        #   全部设置可以避免不同生成器行为不一致。
+        #   LIBRARY_OUTPUT_DIRECTORY_<CONFIG> 和 RUNTIME_OUTPUT_DIRECTORY_<CONFIG>。
+        #   全部设置可以避免 Debug / Release 输出到不同目录。
         set_target_properties(${_target} PROPERTIES
             LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}"
             LIBRARY_OUTPUT_DIRECTORY_DEBUG "${PROJECT_SOURCE_DIR}"
@@ -518,11 +572,17 @@ foreach(_target IN LISTS _FLASH_ATTENTION_TARGETS)
             RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${PROJECT_SOURCE_DIR}"
         )
 
-        # 记录被设置过输出目录的 target 名称，最后 message 打印出来。
+        # 第四步：记录实际处理过的 target。
         #
-        # 这个列表可以用来确认第三个 foreach 实际筛选到了哪些目标。
-        # 如果配置日志里这里为空，说明当前配置没有收集到 MODULE_LIBRARY /
-        # SHARED_LIBRARY target，或者 flash-attention 配置阶段提前失败。
+        # 配置日志会打印 _FLASH_ATTENTION_SO_TARGETS。这样可以确认：
+        #   - 收集函数确实找到了 target；
+        #   - TYPE 筛选确实命中了 MODULE_LIBRARY / SHARED_LIBRARY；
+        #   - 哪些 flash-attention target 被设置为输出到项目根目录。
+        #
+        # 如果这个列表为空，通常说明：
+        #   - 当前配置没有创建 MODULE_LIBRARY / SHARED_LIBRARY；
+        #   - 或者 flash-attention 因配置条件跳过了相关扩展；
+        #   - 或者目标定义方式不在当前收集逻辑覆盖的 CMake directory 树里。
         list(APPEND _FLASH_ATTENTION_SO_TARGETS ${_target})
     endif()
 endforeach()

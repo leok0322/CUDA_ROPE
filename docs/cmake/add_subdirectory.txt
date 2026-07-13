@@ -109,6 +109,65 @@ source_dir 指定子项目源码目录。
     如果 source_dir 是相对路径，它相对于当前 source directory，
     也就是当前正在处理的 CMakeLists.txt 所在目录。
 
+source_dir 只直接读取顶层 CMakeLists.txt：
+
+    add_subdirectory(source_dir)
+
+    直接做的事情是读取：
+
+        source_dir/CMakeLists.txt
+
+    它不会自动递归扫描 source_dir 下面所有子目录，也不会自动读取：
+
+        source_dir/csrc/CMakeLists.txt
+        source_dir/hopper/CMakeLists.txt
+        source_dir/tests/CMakeLists.txt
+
+    除非 source_dir/CMakeLists.txt 里面继续显式写了：
+
+        add_subdirectory(csrc)
+        add_subdirectory(hopper)
+        add_subdirectory(tests)
+
+    CMake 才会继续进入这些目录，读取对应目录里的 CMakeLists.txt。
+
+示例：
+
+    project/
+      CMakeLists.txt
+      third_party/
+        flash-attention/
+          CMakeLists.txt
+          csrc/
+            CMakeLists.txt
+          hopper/
+            CMakeLists.txt
+
+根目录 CMakeLists.txt：
+
+    add_subdirectory(third_party/flash-attention)
+
+这条命令只会直接读取：
+
+    third_party/flash-attention/CMakeLists.txt
+
+如果 third_party/flash-attention/CMakeLists.txt 中没有：
+
+    add_subdirectory(csrc)
+    add_subdirectory(hopper)
+
+那么即使文件系统里存在：
+
+    third_party/flash-attention/csrc/CMakeLists.txt
+    third_party/flash-attention/hopper/CMakeLists.txt
+
+CMake 也不会自动读取它们。
+
+结论：
+
+    CMake 的“子目录”不是文件系统里天然存在的所有目录。
+    只有被 add_subdirectory(...) 显式加入的目录，才是 CMake 构建图里的子目录。
+
 
 ================================================================================
 三、binary_dir 参数
